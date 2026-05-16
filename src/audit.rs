@@ -56,6 +56,7 @@ pub struct UsageEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationEvent {
     pub id: Uuid,
+    pub request_id: Option<Uuid>,
     pub at: DateTime<Utc>,
     pub kind: String,
     pub model: String,

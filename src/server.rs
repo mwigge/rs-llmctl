@@ -1,5 +1,5 @@
 use crate::audit::{AuditEvent, UsageEvent};
-use crate::config::{Config, ModelConfig};
+use crate::config::{Config, Mode, ModelConfig};
 use crate::quota::{check_quota, Principal};
 use crate::storage::{QuotaDecisionRecord, Storage};
 use anyhow::{Context, Result};
@@ -106,7 +106,10 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
 
     Json(ModelList {
         object: "list",
-        data: state.cfg.models.iter().map(ModelObject::from).collect(),
+        data: routed_models(&state.cfg)
+            .into_iter()
+            .map(ModelObject::from)
+            .collect(),
     })
     .into_response()
 }
@@ -174,7 +177,39 @@ async fn chat_completions(
         }
     };
 
-    let model = request.model.clone();
+    let route = match resolve_model_route(&state.cfg, &request.model) {
+        Ok(route) => route,
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                request.model,
+                "rejected",
+                json!({ "reason": err.to_string() }),
+            )
+            .await;
+            return error_response(StatusCode::BAD_REQUEST, "unknown_model", err.to_string());
+        }
+    };
+    let body = match rewrite_chat_model(&body, &route) {
+        Ok(body) => body,
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                route.requested_alias,
+                "rejected",
+                json!({ "reason": err }),
+            )
+            .await;
+            return error_response(StatusCode::BAD_REQUEST, "bad_request", err);
+        }
+    };
+    let model = route.requested_alias.clone();
     let quota = match check_quota(&state.cfg.quotas, &principal, &model) {
         Ok(decision) => decision,
         Err(err) => {
@@ -230,7 +265,7 @@ async fn chat_completions(
         "chat.completions",
         model.clone(),
         "allowed",
-        json!({ "stream": request.stream }),
+        json!({ "stream": request.stream, "upstream_model": route.upstream_alias }),
     )
     .await;
 
@@ -436,6 +471,108 @@ async fn stream_upstream(
         .await;
     };
     build_response(status, headers, Body::from_stream(stream))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedModelRoute {
+    requested_alias: String,
+    upstream_alias: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelRouteError {
+    UnknownAlias(String),
+    NoConfiguredModels,
+}
+
+impl std::fmt::Display for ModelRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownAlias(alias) => write!(f, "unknown model alias: {alias}"),
+            Self::NoConfiguredModels => write!(f, "no models are configured"),
+        }
+    }
+}
+
+fn routed_models(cfg: &Config) -> Vec<&ModelConfig> {
+    let mut models: Vec<_> = cfg.models.iter().collect();
+    models.sort_by(|left, right| left.alias.cmp(&right.alias));
+    models
+}
+
+fn resolve_model_route(
+    cfg: &Config,
+    requested_alias: &str,
+) -> std::result::Result<ResolvedModelRoute, ModelRouteError> {
+    if cfg.models.is_empty() {
+        if requested_alias.trim().is_empty() {
+            return Err(ModelRouteError::NoConfiguredModels);
+        }
+        return Ok(ResolvedModelRoute {
+            requested_alias: requested_alias.to_string(),
+            upstream_alias: requested_alias.to_string(),
+        });
+    }
+
+    let requested = cfg
+        .models
+        .iter()
+        .find(|model| model.alias == requested_alias)
+        .ok_or_else(|| ModelRouteError::UnknownAlias(requested_alias.to_string()))?;
+
+    let upstream = match cfg.mode {
+        Mode::Single => routed_models(cfg)
+            .into_iter()
+            .next()
+            .ok_or(ModelRouteError::NoConfiguredModels)?,
+        Mode::ColdSwap | Mode::HotSwap => requested,
+        Mode::Weighted => preferred_weighted_model(cfg).unwrap_or(requested),
+        Mode::Fallback => {
+            if requested.weight > 0 {
+                requested
+            } else {
+                preferred_weighted_model(cfg).unwrap_or(requested)
+            }
+        }
+    };
+
+    Ok(ResolvedModelRoute {
+        requested_alias: requested_alias.to_string(),
+        upstream_alias: upstream.alias.clone(),
+    })
+}
+
+fn preferred_weighted_model(cfg: &Config) -> Option<&ModelConfig> {
+    cfg.models
+        .iter()
+        .filter(|model| model.weight > 0)
+        .max_by(|left, right| {
+            left.weight
+                .cmp(&right.weight)
+                .then_with(|| right.alias.cmp(&left.alias))
+        })
+}
+
+fn rewrite_chat_model(
+    body: &[u8],
+    route: &ResolvedModelRoute,
+) -> std::result::Result<Bytes, String> {
+    if route.requested_alias == route.upstream_alias {
+        return Ok(Bytes::copy_from_slice(body));
+    }
+
+    let mut value: Value =
+        serde_json::from_slice(body).map_err(|_| "request body must be valid JSON".to_string())?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("request body must be a JSON object".to_string());
+    };
+    object.insert(
+        "model".to_string(),
+        Value::String(route.upstream_alias.clone()),
+    );
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|err| err.to_string())
 }
 
 fn authenticate(cfg: &Config, headers: &HeaderMap) -> std::result::Result<Principal, String> {
@@ -706,5 +843,125 @@ mod tests {
         assert_eq!(principal.subject, "alice");
         assert_eq!(principal.team, "platform");
         assert!(principal.has_scope("chat"));
+    }
+
+    #[test]
+    fn lists_configured_models_in_deterministic_order() {
+        let cfg = config_with_models(
+            Mode::HotSwap,
+            vec![
+                model("zeta", 1, "chat"),
+                model("alpha", 1, "chat"),
+                model("middle", 1, "chat"),
+            ],
+        );
+
+        let aliases: Vec<_> = routed_models(&cfg)
+            .iter()
+            .map(|model| model.alias.as_str())
+            .collect();
+
+        assert_eq!(aliases, vec!["alpha", "middle", "zeta"]);
+    }
+
+    #[test]
+    fn single_mode_routes_to_the_only_configured_model() {
+        let cfg = config_with_models(Mode::Single, vec![model("llama", 0, "chat")]);
+
+        let resolved = resolve_model_route(&cfg, "llama").unwrap();
+
+        assert_eq!(resolved.requested_alias, "llama");
+        assert_eq!(resolved.upstream_alias, "llama");
+    }
+
+    #[test]
+    fn swap_modes_validate_requested_aliases() {
+        for mode in [Mode::ColdSwap, Mode::HotSwap] {
+            let cfg = config_with_models(
+                mode,
+                vec![model("alpha", 0, "chat"), model("beta", 0, "chat")],
+            );
+
+            assert_eq!(
+                resolve_model_route(&cfg, "beta").unwrap().upstream_alias,
+                "beta"
+            );
+            assert!(matches!(
+                resolve_model_route(&cfg, "missing"),
+                Err(ModelRouteError::UnknownAlias(alias)) if alias == "missing"
+            ));
+        }
+    }
+
+    #[test]
+    fn weighted_mode_selects_highest_weight_deterministically() {
+        let cfg = config_with_models(
+            Mode::Weighted,
+            vec![
+                model("light", 1, "chat"),
+                model("heavy-b", 50, "chat"),
+                model("heavy-a", 50, "chat"),
+            ],
+        );
+
+        let resolved = resolve_model_route(&cfg, "light").unwrap();
+
+        assert_eq!(resolved.requested_alias, "light");
+        assert_eq!(resolved.upstream_alias, "heavy-a");
+    }
+
+    #[test]
+    fn fallback_mode_routes_zero_weight_models_to_first_positive_weight_model() {
+        let cfg = config_with_models(
+            Mode::Fallback,
+            vec![
+                model("primary", 100, "chat"),
+                model("backup", 0, "chat"),
+                model("tertiary", 10, "chat"),
+            ],
+        );
+
+        assert_eq!(
+            resolve_model_route(&cfg, "backup").unwrap().upstream_alias,
+            "primary"
+        );
+        assert_eq!(
+            resolve_model_route(&cfg, "tertiary")
+                .unwrap()
+                .upstream_alias,
+            "tertiary"
+        );
+    }
+
+    #[test]
+    fn rewrites_chat_completion_model_for_upstream_route() {
+        let body = br#"{"model":"light","messages":[]}"#;
+        let route = ResolvedModelRoute {
+            requested_alias: "light".to_string(),
+            upstream_alias: "heavy".to_string(),
+        };
+
+        let rewritten = rewrite_chat_model(body, &route).unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["model"], "heavy");
+        assert_eq!(value["messages"], json!([]));
+    }
+
+    fn config_with_models(mode: Mode, models: Vec<ModelConfig>) -> Config {
+        Config {
+            mode,
+            models,
+            ..Default::default()
+        }
+    }
+
+    fn model(alias: &str, weight: u32, role: &str) -> ModelConfig {
+        ModelConfig {
+            alias: alias.to_string(),
+            path: format!("/models/{alias}.gguf").into(),
+            role: role.to_string(),
+            weight,
+        }
     }
 }

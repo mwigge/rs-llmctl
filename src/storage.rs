@@ -154,6 +154,7 @@ impl Storage {
             r#"
             CREATE TABLE IF NOT EXISTS observation_events (
                 id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT,
                 at TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 model TEXT NOT NULL,
@@ -166,8 +167,14 @@ impl Storage {
         )
         .execute(&self.pool)
         .await?;
+        add_column_if_missing(&self.pool, "observation_events", "request_id TEXT").await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_observation_events_at ON observation_events(at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_observation_events_request_id ON observation_events(request_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -332,11 +339,12 @@ impl Storage {
         sqlx::query(
             r#"
             INSERT INTO observation_events
-                (id, at, kind, model, source, value, unit, attributes_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, request_id, at, kind, model, source, value, unit, attributes_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(event.id.to_string())
+        .bind(event.request_id.map(|id| id.to_string()))
         .bind(encode_time(event.at))
         .bind(&event.kind)
         .bind(&event.model)
@@ -356,7 +364,7 @@ impl Storage {
     ) -> Result<Vec<ObservationEvent>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, at, kind, model, source, value, unit, attributes_json
+            SELECT id, request_id, at, kind, model, source, value, unit, attributes_json
             FROM observation_events
             WHERE at >= ? AND at < ?
             ORDER BY at ASC, id ASC
@@ -364,6 +372,24 @@ impl Storage {
         )
         .bind(encode_time(from))
         .bind(encode_time(to))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_observation_event).collect()
+    }
+
+    pub async fn observation_events_for_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<ObservationEvent>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, request_id, at, kind, model, source, value, unit, attributes_json
+            FROM observation_events
+            WHERE request_id = ?
+            ORDER BY at ASC, id ASC
+            "#,
+        )
+        .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(row_to_observation_event).collect()
@@ -538,6 +564,7 @@ fn row_to_usage_event(row: sqlx::sqlite::SqliteRow) -> Result<UsageEvent> {
 fn row_to_observation_event(row: sqlx::sqlite::SqliteRow) -> Result<ObservationEvent> {
     Ok(ObservationEvent {
         id: parse_uuid(&row.try_get::<String, _>("id")?)?,
+        request_id: parse_optional_uuid(row.try_get::<Option<String>, _>("request_id")?)?,
         at: parse_time(&row.try_get::<String, _>("at")?)?,
         kind: row.try_get("kind")?,
         model: row.try_get("model")?,
@@ -546,6 +573,24 @@ fn row_to_observation_event(row: sqlx::sqlite::SqliteRow) -> Result<ObservationE
         unit: row.try_get("unit")?,
         attributes_json: parse_json(row.try_get("attributes_json")?)?,
     })
+}
+
+async fn add_column_if_missing(pool: &SqlitePool, table: &str, column_sql: &str) -> Result<()> {
+    let column = column_sql
+        .split_whitespace()
+        .next()
+        .context("column definition must include a name")?;
+    let pragma = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(&pragma).fetch_all(pool).await?;
+    let exists = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == column)
+    });
+    if !exists {
+        let alter = format!("ALTER TABLE {table} ADD COLUMN {column_sql}");
+        sqlx::query(&alter).execute(pool).await?;
+    }
+    Ok(())
 }
 
 fn row_to_model_inventory_record(row: sqlx::sqlite::SqliteRow) -> Result<ModelInventoryRecord> {
@@ -610,6 +655,7 @@ mod tests {
 
         let observation = ObservationEvent {
             id: Uuid::new_v4(),
+            request_id: Some(request_id),
             at: Utc::now(),
             kind: "latency".to_string(),
             model: "llama".to_string(),
@@ -649,6 +695,13 @@ mod tests {
         assert_eq!(storage.usage_events_between(from, to).await?.len(), 1);
         assert_eq!(storage.usage_events_for_request(request_id).await?.len(), 1);
         assert_eq!(storage.observation_events_between(from, to).await?.len(), 1);
+        assert_eq!(
+            storage
+                .observation_events_for_request(request_id)
+                .await?
+                .len(),
+            1
+        );
         assert_eq!(storage.list_models().await?, vec![model]);
         assert_eq!(storage.quota_decisions_between(from, to).await?.len(), 1);
         assert_eq!(

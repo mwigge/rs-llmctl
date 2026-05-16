@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
-use rs_llmctl::config::{self, Config, ModelConfig, QuotaConfig, StorageConfig};
+use rs_llmctl::config::{self, Config, Mode, ModelConfig, QuotaConfig, StorageConfig};
 use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
 use rs_llmctl::reporting;
 use rs_llmctl::storage::Storage;
@@ -34,6 +34,10 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
+    Swap {
+        #[command(subcommand)]
+        command: SwapCommand,
+    },
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
@@ -49,6 +53,10 @@ enum Command {
     Usage {
         #[command(subcommand)]
         command: UsageCommand,
+    },
+    Data {
+        #[command(subcommand)]
+        command: DataCommand,
     },
 }
 
@@ -73,6 +81,25 @@ enum ServerCommand {
 enum ModelCommand {
     Install(ModelInstallArgs),
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum SwapCommand {
+    Set(SwapSetArgs),
+    Show,
+}
+
+#[derive(Debug, Args)]
+struct SwapSetArgs {
+    #[arg(long, value_enum)]
+    mode: SwapMode,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum SwapMode {
+    ColdSwap,
+    HotSwap,
 }
 
 #[derive(Debug, Args)]
@@ -145,8 +172,16 @@ enum AuditCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuditReportCommand {
-    Monthly,
+    Monthly(AuditReportMonthlyArgs),
     Request(AuditReportRequestArgs),
+}
+
+#[derive(Debug, Args)]
+struct AuditReportMonthlyArgs {
+    #[arg(long)]
+    year: Option<i32>,
+    #[arg(long)]
+    month: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -173,6 +208,11 @@ enum UsageCommand {
     Report(ObserveWindowArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum DataCommand {
+    Export(ObserveWindowArgs),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -182,10 +222,12 @@ async fn main() -> Result<()> {
         Command::Init(args) => init(&config_path, args, cli.json).await,
         Command::Server { command } => server_command(&config_path, command, cli.json).await,
         Command::Model { command } => model_command(&config_path, command, cli.json).await,
+        Command::Swap { command } => swap_command(&config_path, command, cli.json).await,
         Command::Quota { command } => quota_command(&config_path, command, cli.json).await,
         Command::Observe { command } => observe_command(&config_path, command, cli.json).await,
         Command::Audit { command } => audit_command(&config_path, command, cli.json).await,
         Command::Usage { command } => usage_command(&config_path, command, cli.json).await,
+        Command::Data { command } => data_command(&config_path, command, cli.json).await,
     }
 }
 
@@ -277,6 +319,24 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
     }
 }
 
+async fn swap_command(path: &Path, command: SwapCommand, as_json: bool) -> Result<()> {
+    let mut cfg = load_config(path).await?;
+    match command {
+        SwapCommand::Set(args) => {
+            cfg.mode = args.mode.into();
+            config::save(path, &cfg).await?;
+            emit(
+                as_json,
+                &json!({ "status": "set", "mode": cfg.mode, "models": cfg.models.len() }),
+            )
+        }
+        SwapCommand::Show => emit(
+            as_json,
+            &json!({ "mode": cfg.mode, "models": cfg.models.len(), "model_aliases": cfg.models.iter().map(|model| &model.alias).collect::<Vec<_>>() }),
+        ),
+    }
+}
+
 async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Result<()> {
     let mut cfg = load_config(path).await?;
     match command {
@@ -313,6 +373,7 @@ async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) ->
             };
             let event = ObservationEvent {
                 id: Uuid::new_v4(),
+                request_id: None,
                 at: Utc::now(),
                 kind: "resource.snapshot".to_string(),
                 model: "system".to_string(),
@@ -337,10 +398,14 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
     let storage = init_storage(&cfg.storage).await?;
     match command {
         AuditCommand::Report { command } => match command {
-            AuditReportCommand::Monthly => {
+            AuditReportCommand::Monthly(args) => {
                 let now = Utc::now();
-                let report =
-                    reporting::monthly_audit_report(&storage, now.year(), now.month()).await?;
+                let report = reporting::monthly_audit_report(
+                    &storage,
+                    args.year.unwrap_or_else(|| now.year()),
+                    args.month.unwrap_or_else(|| now.month()),
+                )
+                .await?;
                 emit(as_json, &report)
             }
             AuditReportCommand::Request(args) => {
@@ -369,6 +434,18 @@ async fn usage_command(path: &Path, command: UsageCommand, as_json: bool) -> Res
     let storage = init_storage(&cfg.storage).await?;
     match command {
         UsageCommand::Report(args) => report_usage(&storage, args.hours, as_json).await,
+    }
+}
+
+async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    let storage = init_storage(&cfg.storage).await?;
+    match command {
+        DataCommand::Export(args) => {
+            let (from, to) = window(args.hours);
+            let report = reporting::data_export(&storage, from, to).await?;
+            emit(as_json, &report)
+        }
     }
 }
 
@@ -422,6 +499,15 @@ fn model_source(source: &str) -> ModelSource {
     } else {
         ModelSource::LocalPath {
             path: PathBuf::from(source),
+        }
+    }
+}
+
+impl From<SwapMode> for Mode {
+    fn from(mode: SwapMode) -> Self {
+        match mode {
+            SwapMode::ColdSwap => Mode::ColdSwap,
+            SwapMode::HotSwap => Mode::HotSwap,
         }
     }
 }

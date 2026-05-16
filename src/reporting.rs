@@ -14,6 +14,7 @@ pub struct MonthlyAuditReport {
     pub to: DateTime<Utc>,
     pub generated_at: DateTime<Utc>,
     pub audit_events: Vec<AuditEvent>,
+    pub usage_events: Vec<UsageEvent>,
     pub usage_summary: UsageSummary,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
     pub observations: Vec<ObservationEvent>,
@@ -27,6 +28,19 @@ pub struct PerRequestAuditReport {
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
+    pub observations: Vec<ObservationEvent>,
+    pub usage_summary: UsageSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerRequestDataReport {
+    pub request_id: Uuid,
+    pub generated_at: DateTime<Utc>,
+    pub audit_events: Vec<AuditEvent>,
+    pub usage_events: Vec<UsageEvent>,
+    pub quota_decisions: Vec<QuotaDecisionRecord>,
+    pub observations: Vec<ObservationEvent>,
+    pub usage_summary: UsageSummary,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -60,6 +74,7 @@ pub struct DataExport {
     pub generated_at: DateTime<Utc>,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
+    pub usage_summary: UsageSummary,
     pub observation_events: Vec<ObservationEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
     pub models: Vec<ModelInventoryRecord>,
@@ -85,6 +100,7 @@ pub async fn monthly_audit_report(
         to,
         generated_at: Utc::now(),
         audit_events,
+        usage_events,
         usage_summary,
         quota_decisions,
         observations,
@@ -96,12 +112,31 @@ pub async fn per_request_audit_report(
     storage: &Storage,
     request_id: Uuid,
 ) -> Result<PerRequestAuditReport> {
+    let usage_events = storage.usage_events_for_request(request_id).await?;
     Ok(PerRequestAuditReport {
         request_id,
         generated_at: Utc::now(),
         audit_events: storage.audit_events_for_request(request_id).await?,
-        usage_events: storage.usage_events_for_request(request_id).await?,
+        usage_summary: summarize_usage(&usage_events),
+        usage_events,
         quota_decisions: storage.quota_decisions_for_request(request_id).await?,
+        observations: storage.observation_events_for_request(request_id).await?,
+    })
+}
+
+pub async fn per_request_data_report(
+    storage: &Storage,
+    request_id: Uuid,
+) -> Result<PerRequestDataReport> {
+    let usage_events = storage.usage_events_for_request(request_id).await?;
+    Ok(PerRequestDataReport {
+        request_id,
+        generated_at: Utc::now(),
+        audit_events: storage.audit_events_for_request(request_id).await?,
+        usage_summary: summarize_usage(&usage_events),
+        usage_events,
+        quota_decisions: storage.quota_decisions_for_request(request_id).await?,
+        observations: storage.observation_events_for_request(request_id).await?,
     })
 }
 
@@ -119,12 +154,14 @@ pub async fn data_export(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<DataExport> {
+    let usage_events = storage.usage_events_between(from, to).await?;
     Ok(DataExport {
         from,
         to,
         generated_at: Utc::now(),
         audit_events: storage.audit_events_between(from, to).await?,
-        usage_events: storage.usage_events_between(from, to).await?,
+        usage_summary: summarize_usage(&usage_events),
+        usage_events,
         observation_events: storage.observation_events_between(from, to).await?,
         quota_decisions: storage.quota_decisions_between(from, to).await?,
         models: storage.list_models().await?,
@@ -229,7 +266,7 @@ fn average(total: u64, count: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditEvent, UsageEvent};
+    use crate::audit::{AuditEvent, ObservationEvent, UsageEvent};
     use crate::storage::{ModelInventoryRecord, QuotaDecisionRecord};
     use chrono::TimeZone;
     use serde_json::json;
@@ -286,6 +323,19 @@ mod tests {
             ))
             .await?;
         storage
+            .insert_observation_event(&ObservationEvent {
+                id: Uuid::new_v4(),
+                request_id: Some(request_id),
+                at: Utc::now(),
+                kind: "latency".to_string(),
+                model: "llama".to_string(),
+                source: "worker".to_string(),
+                value: 100.0,
+                unit: "ms".to_string(),
+                attributes_json: json!({"trace": "abc"}),
+            })
+            .await?;
+        storage
             .upsert_model_record(&ModelInventoryRecord {
                 alias: "llama".to_string(),
                 path: "/models/llama.gguf".to_string(),
@@ -311,18 +361,31 @@ mod tests {
         let now = Utc::now();
         let report = monthly_audit_report(&storage, now.year(), now.month()).await?;
         assert_eq!(report.audit_events.len(), 1);
+        assert_eq!(report.usage_events.len(), 1);
         assert_eq!(report.usage_summary.request_count, 1);
         assert_eq!(report.quota_decisions.len(), 1);
+        assert_eq!(report.observations.len(), 1);
         assert_eq!(report.models.len(), 1);
 
         let request_report = per_request_audit_report(&storage, request_id).await?;
         assert_eq!(request_report.audit_events.len(), 1);
         assert_eq!(request_report.usage_events.len(), 1);
+        assert_eq!(request_report.usage_summary.total_tokens, 30);
+        assert_eq!(request_report.quota_decisions.len(), 1);
+        assert_eq!(request_report.observations.len(), 1);
+
+        let data_report = per_request_data_report(&storage, request_id).await?;
+        assert_eq!(data_report.request_id, request_id);
+        assert_eq!(data_report.usage_summary.average_latency_ms, Some(100.0));
+        assert_eq!(data_report.observations[0].request_id, Some(request_id));
 
         let (from, to) = current_month_bounds()?;
         let export = data_export(&storage, from, to).await?;
         assert_eq!(export.audit_events.len(), 1);
         assert_eq!(export.usage_events.len(), 1);
+        assert_eq!(export.usage_summary.request_count, 1);
+        assert_eq!(export.observation_events.len(), 1);
+        assert_eq!(export.quota_decisions.len(), 1);
         Ok(())
     }
 
