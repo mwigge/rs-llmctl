@@ -161,6 +161,78 @@ fn data_export_and_audit_monthly_are_scriptable_json_reports() {
 }
 
 #[test]
+fn report_envelopes_keep_payloads_and_include_metadata_hashes() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut audit = llmctl();
+    audit
+        .arg("--config")
+        .arg(&config)
+        .arg("audit")
+        .arg("request")
+        .arg("--actor")
+        .arg("operator")
+        .arg("--action")
+        .arg("model.swap.review")
+        .arg("--resource")
+        .arg("models");
+    let event = assert_success_json(audit);
+    let request_id = event["id"].as_str().expect("event id");
+
+    let mut monthly = llmctl();
+    monthly
+        .arg("--config")
+        .arg(&config)
+        .arg("audit")
+        .arg("report")
+        .arg("monthly")
+        .arg("--year")
+        .arg("2026")
+        .arg("--month")
+        .arg("5")
+        .arg("--envelope");
+    let monthly = assert_success_json(monthly);
+    assert_eq!(monthly["metadata"]["report_kind"], "monthly_audit");
+    assert!(
+        monthly["metadata"]["sha256"]
+            .as_str()
+            .expect("sha256")
+            .len()
+            == 64
+    );
+    assert!(monthly["payload"]["audit_events"].is_array());
+
+    let mut request = llmctl();
+    request
+        .arg("--config")
+        .arg(&config)
+        .arg("audit")
+        .arg("report")
+        .arg("request")
+        .arg(request_id)
+        .arg("--envelope");
+    let request = assert_success_json(request);
+    assert_eq!(request["metadata"]["report_kind"], "per_request_audit");
+    assert!(request["metadata"]["sha256"].is_string());
+    assert_eq!(request["payload"]["request_id"], request_id);
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--hours")
+        .arg("1")
+        .arg("--envelope");
+    let export = assert_success_json(export);
+    assert_eq!(export["metadata"]["report_kind"], "data_export");
+    assert!(export["metadata"]["sha256"].is_string());
+    assert!(export["payload"]["audit_events"].is_array());
+}
+
+#[test]
 fn model_import_manifest_registers_multiple_offline_models() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);

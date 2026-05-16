@@ -54,11 +54,43 @@ example production config. Package checks should fail if either binary name
 changes because downstream automation, systemd units, and air-gapped install
 runbooks address those names directly.
 
+Server packages should install the release binaries at stable paths:
+
+```bash
+install -D -m 0755 target/release/llmctl /usr/local/bin/llmctl
+install -D -m 0755 target/release/llmctld /usr/local/bin/llmctld
+install -D -m 0644 packaging/systemd/llmctld.service /etc/systemd/system/llmctld.service
+install -d -m 0750 -o llmctl -g llmctl /etc/rs-llmctl /var/lib/rs-llmctl/models /var/log/rs-llmctl
+```
+
+The production daemon template is `packaging/systemd/llmctld.service`. It
+starts `/usr/local/bin/llmctld --config ${LLMCTL_CONFIG}` with
+`LLMCTL_CONFIG=/etc/rs-llmctl/config.toml`, runs as the dedicated `llmctl`
+user/group, and grants write access only to `/var/lib/rs-llmctl` and
+`/var/log/rs-llmctl`.
+
+Dry-run validation for a staged server should run before enabling systemd:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml server check
+llmctl --config /etc/rs-llmctl/config.toml security check
+llmctl --config /etc/rs-llmctl/config.toml observe plan
+systemd-analyze verify /etc/systemd/system/llmctld.service
+```
+
+External bind is a release-blocking deployment control, not a packaging default.
+Before setting `server.host = "0.0.0.0"` or `security.bind-external = true`,
+the staged config must also set `security.production = true`,
+`security.require-auth = true`, at least one hashed `[[security.api-keys]]`
+entry with scopes, quota policy for served subjects, audit retention/reporting,
+and an approved `observability.exporter.endpoint`. Store model data under
+`/var/lib/rs-llmctl/models` and keep runtime secrets in `env:` references.
+
 Offline deployments should ship an offline install manifest next to the staged
 model files. Operators import it with:
 
 ```bash
-llmctl model import-manifest ./manifest.toml
+llmctl --config /etc/rs-llmctl/config.toml model import-manifest ./manifest.toml
 ```
 
 Minimal manifest shape:

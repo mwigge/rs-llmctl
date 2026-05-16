@@ -1,0 +1,23 @@
+[Unit]
+Description=rs-llmctl OpenAI-compatible model serving daemon
+Documentation=README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmctl
+Group=llmctl
+Environment=LLMCTL_CONFIG=/etc/rs-llmctl/config.toml
+ExecStart=/usr/local/bin/llmctld --config ${LLMCTL_CONFIG}
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rs-llmctl /var/log/rs-llmctl
+
+[Install]
+WantedBy=multi-user.target

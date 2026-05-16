@@ -14,6 +14,8 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     json_logs: bool,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[tokio::main]
@@ -39,6 +41,11 @@ async fn main() -> Result<()> {
             env = ?planned.command.env,
             "planned worker command"
         );
+    }
+
+    if cli.dry_run {
+        println!("{}", serde_json::to_string_pretty(&worker_startup_plan)?);
+        return Ok(());
     }
 
     tracing::info!(

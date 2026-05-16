@@ -212,11 +212,15 @@ struct AuditReportMonthlyArgs {
     year: Option<i32>,
     #[arg(long)]
     month: Option<u32>,
+    #[arg(long)]
+    envelope: bool,
 }
 
 #[derive(Debug, Args)]
 struct AuditReportRequestArgs {
     request_id: Uuid,
+    #[arg(long)]
+    envelope: bool,
 }
 
 #[derive(Debug, Args)]
@@ -240,7 +244,15 @@ enum UsageCommand {
 
 #[derive(Debug, Subcommand)]
 enum DataCommand {
-    Export(ObserveWindowArgs),
+    Export(DataExportArgs),
+}
+
+#[derive(Debug, Args)]
+struct DataExportArgs {
+    #[arg(long, default_value_t = 24)]
+    hours: i64,
+    #[arg(long)]
+    envelope: bool,
 }
 
 #[tokio::main]
@@ -536,17 +548,28 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
         AuditCommand::Report { command } => match command {
             AuditReportCommand::Monthly(args) => {
                 let now = Utc::now();
-                let report = reporting::monthly_audit_report(
-                    &storage,
-                    args.year.unwrap_or_else(|| now.year()),
-                    args.month.unwrap_or_else(|| now.month()),
-                )
-                .await?;
-                emit(as_json, &report)
+                let year = args.year.unwrap_or_else(|| now.year());
+                let month = args.month.unwrap_or_else(|| now.month());
+                if args.envelope {
+                    let report =
+                        reporting::monthly_audit_report_envelope(&storage, year, month).await?;
+                    emit(as_json, &report)
+                } else {
+                    let report = reporting::monthly_audit_report(&storage, year, month).await?;
+                    emit(as_json, &report)
+                }
             }
             AuditReportCommand::Request(args) => {
-                let report = reporting::per_request_audit_report(&storage, args.request_id).await?;
-                emit(as_json, &report)
+                if args.envelope {
+                    let report =
+                        reporting::per_request_audit_report_envelope(&storage, args.request_id)
+                            .await?;
+                    emit(as_json, &report)
+                } else {
+                    let report =
+                        reporting::per_request_audit_report(&storage, args.request_id).await?;
+                    emit(as_json, &report)
+                }
             }
         },
         AuditCommand::Request(args) => {
@@ -579,8 +602,13 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
     match command {
         DataCommand::Export(args) => {
             let (from, to) = window(args.hours);
-            let report = reporting::data_export(&storage, from, to).await?;
-            emit(as_json, &report)
+            if args.envelope {
+                let report = reporting::data_export_envelope(&storage, from, to).await?;
+                emit(as_json, &report)
+            } else {
+                let report = reporting::data_export(&storage, from, to).await?;
+                emit(as_json, &report)
+            }
         }
     }
 }

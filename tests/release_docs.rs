@@ -66,7 +66,45 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
         "usage report",
         "aqe",
         "openai_base_url",
+        "/usr/local/bin/llmctl",
+        "/usr/local/bin/llmctld",
+        "/etc/rs-llmctl/config.toml",
+        "/var/lib/rs-llmctl/models",
+        "llmctl --config /etc/rs-llmctl/config.toml server check",
+        "llmctl --config /etc/rs-llmctl/config.toml security check",
+        "llmctl --config /etc/rs-llmctl/config.toml observe plan",
+        "systemd",
+        "llmctld.service",
     ] {
         assert!(docs.contains(topic), "docs should cover `{topic}`");
+    }
+}
+
+#[test]
+fn systemd_template_documents_server_deployment_controls() {
+    let unit = read("packaging/systemd/llmctld.service").to_lowercase();
+
+    for required in [
+        "[unit]",
+        "after=network-online.target",
+        "[service]",
+        "type=simple",
+        "user=llmctl",
+        "group=llmctl",
+        "environment=llmctl_config=/etc/rs-llmctl/config.toml",
+        "execstart=/usr/local/bin/llmctld --config ${llmctl_config}",
+        "nonewprivileges=true",
+        "privatetmp=true",
+        "protectsystem=strict",
+        "protecthome=true",
+        "readwritepaths=/var/lib/rs-llmctl /var/log/rs-llmctl",
+        "restart=on-failure",
+        "[install]",
+        "wantedby=multi-user.target",
+    ] {
+        assert!(
+            unit.contains(required),
+            "systemd unit should include `{required}`"
+        );
     }
 }

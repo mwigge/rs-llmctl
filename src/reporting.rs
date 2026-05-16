@@ -24,12 +24,12 @@ pub struct ReportMetadata {
     pub report_kind: ReportKind,
     pub generated_at: DateTime<Utc>,
     pub schema_version: u32,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportEnvelope<T> {
     pub metadata: ReportMetadata,
-    pub sha256: String,
     pub payload: T,
 }
 
@@ -352,8 +352,8 @@ where
             report_kind,
             generated_at,
             schema_version: REPORT_SCHEMA_VERSION,
+            sha256: canonical_sha256(&payload)?,
         },
-        sha256: canonical_sha256(&payload)?,
         payload,
     })
 }
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(envelope.metadata.report_kind, ReportKind::MonthlyAudit);
         assert_eq!(envelope.metadata.generated_at, generated_at);
         assert_eq!(envelope.metadata.schema_version, 1);
-        assert_eq!(envelope.sha256, canonical_sha256(&payload)?);
+        assert_eq!(envelope.metadata.sha256, canonical_sha256(&payload)?);
         Ok(())
     }
 
@@ -461,7 +461,7 @@ mod tests {
         )?;
 
         assert_ne!(first.metadata.generated_at, second.metadata.generated_at);
-        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(first.metadata.sha256, second.metadata.sha256);
         Ok(())
     }
 
@@ -537,7 +537,7 @@ mod tests {
             ReportKind::MonthlyAudit
         );
         assert_eq!(
-            report_envelope.sha256,
+            report_envelope.metadata.sha256,
             canonical_sha256(&report_envelope.payload)?
         );
 
@@ -554,7 +554,7 @@ mod tests {
             ReportKind::PerRequestAudit
         );
         assert_eq!(
-            request_envelope.sha256,
+            request_envelope.metadata.sha256,
             canonical_sha256(&request_envelope.payload)?
         );
 
@@ -569,7 +569,7 @@ mod tests {
             ReportKind::PerRequestData
         );
         assert_eq!(
-            data_report_envelope.sha256,
+            data_report_envelope.metadata.sha256,
             canonical_sha256(&data_report_envelope.payload)?
         );
 
@@ -584,7 +584,7 @@ mod tests {
         let export_envelope = data_export_envelope(&storage, from, to).await?;
         assert_eq!(export_envelope.metadata.report_kind, ReportKind::DataExport);
         assert_eq!(
-            export_envelope.sha256,
+            export_envelope.metadata.sha256,
             canonical_sha256(&export_envelope.payload)?
         );
         Ok(())
