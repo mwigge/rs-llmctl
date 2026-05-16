@@ -3,6 +3,7 @@ use anyhow::Result;
 
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
     validate_api_keys_are_hashes(&cfg.security.api_keys)?;
+    validate_api_key_scopes(&cfg.security.api_keys)?;
     validate_no_plaintext_observability_secrets(cfg)?;
 
     if cfg.security.production || cfg.security.bind_external || cfg.server.host == "0.0.0.0" {
@@ -38,6 +39,33 @@ fn validate_api_keys_are_hashes(keys: &[ApiKeyConfig]) -> Result<()> {
     Ok(())
 }
 
+fn validate_api_key_scopes(keys: &[ApiKeyConfig]) -> Result<()> {
+    for key in keys {
+        anyhow::ensure!(
+            !key.scopes.is_empty(),
+            "api key `{}` must declare at least one scope",
+            key.id
+        );
+        for scope in &key.scopes {
+            anyhow::ensure!(
+                !scope.trim().is_empty(),
+                "api key `{}` has an empty scope",
+                key.id
+            );
+            anyhow::ensure!(
+                is_allowed_api_key_scope(scope),
+                "api key `{}` has unknown scope `{scope}`; allowed scopes are chat, models.read, models, admin",
+                key.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_allowed_api_key_scope(scope: &str) -> bool {
+    matches!(scope, "chat" | "models.read" | "models" | "admin")
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -53,7 +81,7 @@ fn is_sensitive_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sensitive_name, is_sha256_hex};
+    use super::{is_allowed_api_key_scope, is_sensitive_name, is_sha256_hex};
 
     #[test]
     fn recognizes_sha256_hex_digests() {
@@ -72,5 +100,15 @@ mod tests {
         assert!(is_sensitive_name("x-api-key"));
         assert!(is_sensitive_name("collector-token"));
         assert!(!is_sensitive_name("x-tenant"));
+    }
+
+    #[test]
+    fn recognizes_allowed_api_key_scopes() {
+        assert!(is_allowed_api_key_scope("chat"));
+        assert!(is_allowed_api_key_scope("models.read"));
+        assert!(is_allowed_api_key_scope("models"));
+        assert!(is_allowed_api_key_scope("admin"));
+        assert!(!is_allowed_api_key_scope(""));
+        assert!(!is_allowed_api_key_scope("models:read"));
     }
 }

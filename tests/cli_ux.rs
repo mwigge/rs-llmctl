@@ -1,6 +1,7 @@
 use chrono::{Duration, Utc};
-use rs_llmctl::audit::UsageEvent;
+use rs_llmctl::audit::{AuditEvent, UsageEvent};
 use rs_llmctl::storage::Storage;
+use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -139,6 +140,111 @@ fn swap_set_persists_hot_and_cold_modes_as_json() {
     let shown = assert_success_json(show);
     assert_eq!(shown["mode"], "cold-swap");
     assert_eq!(shown["models"], 0);
+}
+
+#[test]
+fn swap_plan_emits_cold_swap_lifecycle_from_config_mode() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut set_cold = llmctl();
+    set_cold
+        .arg("--config")
+        .arg(&config)
+        .arg("swap")
+        .arg("set")
+        .arg("--mode")
+        .arg("cold-swap");
+    assert_success_json(set_cold);
+
+    let mut plan = llmctl();
+    plan.arg("--config")
+        .arg(&config)
+        .arg("swap")
+        .arg("plan")
+        .arg("--active")
+        .arg("chat-v1")
+        .arg("--replacement")
+        .arg("chat-v2");
+    let plan = assert_success_json(plan);
+
+    assert_eq!(
+        plan["steps"],
+        serde_json::json!([
+            { "worker_id": "chat-v1", "target": "draining" },
+            { "worker_id": "chat-v1", "target": "stopping" },
+            { "worker_id": "chat-v1", "target": "stopped" },
+            { "worker_id": "chat-v2", "target": "starting" },
+            { "worker_id": "chat-v2", "target": "ready" }
+        ])
+    );
+}
+
+#[test]
+fn swap_plan_emits_hot_swap_lifecycle_from_config_mode() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut set_hot = llmctl();
+    set_hot
+        .arg("--config")
+        .arg(&config)
+        .arg("swap")
+        .arg("set")
+        .arg("--mode")
+        .arg("hot-swap");
+    assert_success_json(set_hot);
+
+    let mut plan = llmctl();
+    plan.arg("--config")
+        .arg(&config)
+        .arg("swap")
+        .arg("plan")
+        .arg("--active")
+        .arg("chat-v1")
+        .arg("--replacement")
+        .arg("chat-v2");
+    let plan = assert_success_json(plan);
+
+    assert_eq!(
+        plan["steps"],
+        serde_json::json!([
+            { "worker_id": "chat-v2", "target": "starting" },
+            { "worker_id": "chat-v2", "target": "warming" },
+            { "worker_id": "chat-v2", "target": "ready" },
+            { "worker_id": "chat-v1", "target": "draining" },
+            { "worker_id": "chat-v1", "target": "stopping" },
+            { "worker_id": "chat-v1", "target": "stopped" }
+        ])
+    );
+}
+
+#[test]
+fn swap_plan_rejects_unsupported_modes() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut plan = llmctl();
+    plan.arg("--config")
+        .arg(&config)
+        .arg("swap")
+        .arg("plan")
+        .arg("--active")
+        .arg("chat-v1")
+        .arg("--replacement")
+        .arg("chat-v2");
+    let output = plan.output().expect("run llmctl");
+
+    assert!(
+        !output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("swap plan is only supported for cold-swap or hot-swap modes"));
+    assert!(stderr.contains("current mode is single"));
 }
 
 #[test]
@@ -478,6 +584,122 @@ fn data_export_and_audit_monthly_are_scriptable_json_reports() {
     assert_eq!(report["month"], 5);
     assert!(report["audit_events"].is_array());
     assert!(report["usage_summary"].is_object());
+}
+
+#[test]
+fn audit_retention_plan_reports_counts_without_deleting_events() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "127.0.0.1:8080"
+context_size = 8192
+
+[security]
+production = false
+require_auth = false
+bind_external = false
+api_keys = []
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[observability]
+
+[audit]
+retention-days = 30
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let storage = Storage::connect(&db_path).await.expect("storage");
+        let mut old = AuditEvent::new(
+            None,
+            "operator",
+            "platform",
+            "old.audit",
+            "audit",
+            "ok",
+            json!({ "source": "test" }),
+        );
+        old.at = Utc::now() - Duration::days(45);
+        storage.insert_audit_event(&old).await.expect("insert old");
+
+        let mut current = AuditEvent::new(
+            None,
+            "operator",
+            "platform",
+            "current.audit",
+            "audit",
+            "ok",
+            json!({ "source": "test" }),
+        );
+        current.at = Utc::now() - Duration::days(7);
+        storage
+            .insert_audit_event(&current)
+            .await
+            .expect("insert current");
+    });
+
+    let mut plan = llmctl();
+    plan.arg("--config")
+        .arg(&config)
+        .arg("audit")
+        .arg("retention")
+        .arg("plan");
+    let plan = assert_success_json(plan);
+
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["operation"], "audit_retention");
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["deletes"], false);
+    assert_eq!(plan["retention"]["days"], 30);
+    assert!(plan["retention"]["cutoff"].is_string());
+    assert_eq!(plan["counts"]["total"], 2);
+    assert_eq!(plan["counts"]["in_retention_window"], 1);
+    assert_eq!(plan["counts"]["outside_retention_window"], 1);
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--hours")
+        .arg("2000");
+    let export = assert_success_json(export);
+    assert_eq!(
+        export["audit_events"]
+            .as_array()
+            .expect("audit_events")
+            .len(),
+        2
+    );
+
+    let raw = serde_json::to_string(&plan).expect("serialize plan");
+    assert!(!raw.contains("secret"));
+    assert!(!raw.contains("sha256"));
 }
 
 #[test]

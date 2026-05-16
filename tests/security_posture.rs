@@ -9,7 +9,7 @@ fn hashed_key() -> ApiKeyConfig {
         sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
         subject: "operator".to_string(),
         team: "platform".to_string(),
-        scopes: vec!["models:read".to_string()],
+        scopes: vec!["models.read".to_string()],
     }
 }
 
@@ -38,6 +38,69 @@ fn external_bind_requires_auth_and_hashed_api_keys() {
 
     cfg.security.api_keys = vec![hashed_key()];
     config::validate_production_security(&cfg).expect("valid production posture");
+}
+
+#[test]
+fn production_security_accepts_known_api_key_scopes() {
+    let mut cfg = Config::default();
+    cfg.security.production = true;
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        scopes: vec![
+            "chat".to_string(),
+            "models.read".to_string(),
+            "models".to_string(),
+            "admin".to_string(),
+        ],
+        ..hashed_key()
+    }];
+
+    config::validate_production_security(&cfg).expect("known scopes are allowed");
+}
+
+#[test]
+fn production_security_rejects_unknown_api_key_scopes() {
+    let mut cfg = Config::default();
+    cfg.security.production = true;
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        scopes: vec!["chat".to_string(), "models:read".to_string()],
+        ..hashed_key()
+    }];
+
+    let err = config::validate_production_security(&cfg).expect_err("unknown scope rejected");
+    assert!(
+        err.to_string().contains("unknown scope `models:read`"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn production_security_rejects_empty_api_key_scopes() {
+    let mut cfg = Config::default();
+    cfg.security.production = true;
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        scopes: vec!["chat".to_string(), "".to_string()],
+        ..hashed_key()
+    }];
+
+    let err = config::validate_production_security(&cfg).expect_err("empty scope rejected");
+    assert!(
+        err.to_string().contains("empty scope"),
+        "unexpected error: {err}"
+    );
+
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        scopes: vec![],
+        ..hashed_key()
+    }];
+
+    let err = config::validate_production_security(&cfg).expect_err("missing scope rejected");
+    assert!(
+        err.to_string().contains("at least one scope"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

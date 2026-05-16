@@ -37,6 +37,13 @@ pub struct QuotaDecisionRecord {
     pub policy_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditRetentionCounts {
+    pub total: u64,
+    pub in_retention_window: u64,
+    pub outside_retention_window: u64,
+}
+
 impl QuotaDecisionRecord {
     pub fn new(
         request_id: Option<Uuid>,
@@ -275,6 +282,37 @@ impl Storage {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(row_to_audit_event).collect()
+    }
+
+    pub async fn audit_retention_counts(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<AuditRetentionCounts> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END), 0) AS in_retention_window,
+                COALESCE(SUM(CASE WHEN at < ? THEN 1 ELSE 0 END), 0) AS outside_retention_window
+            FROM audit_events
+            "#,
+        )
+        .bind(encode_time(cutoff))
+        .bind(encode_time(cutoff))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(AuditRetentionCounts {
+            total: i64_to_u64(row.try_get("total")?, "total")?,
+            in_retention_window: i64_to_u64(
+                row.try_get("in_retention_window")?,
+                "in_retention_window",
+            )?,
+            outside_retention_window: i64_to_u64(
+                row.try_get("outside_retention_window")?,
+                "outside_retention_window",
+            )?,
+        })
     }
 
     pub async fn insert_usage_event(&self, event: &UsageEvent) -> Result<()> {
@@ -771,6 +809,42 @@ mod tests {
             storage.quota_decisions_for_request(request_id).await?.len(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn counts_audit_events_inside_and_outside_retention_cutoff() -> Result<()> {
+        let storage = Storage::in_memory().await?;
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+
+        let mut old = AuditEvent::new(
+            None,
+            "alice",
+            "platform",
+            "old.action",
+            "audit",
+            "ok",
+            json!({}),
+        );
+        old.at = cutoff - chrono::Duration::seconds(1);
+        storage.insert_audit_event(&old).await?;
+
+        let mut current = AuditEvent::new(
+            None,
+            "bob",
+            "platform",
+            "current.action",
+            "audit",
+            "ok",
+            json!({}),
+        );
+        current.at = cutoff;
+        storage.insert_audit_event(&current).await?;
+
+        let counts = storage.audit_retention_counts(cutoff).await?;
+        assert_eq!(counts.total, 2);
+        assert_eq!(counts.in_retention_window, 1);
+        assert_eq!(counts.outside_retention_window, 1);
         Ok(())
     }
 }

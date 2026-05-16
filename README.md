@@ -101,11 +101,12 @@ packaging/validate-install.sh
 ```
 
 The validation script is safe to run offline: it performs the daemon dry-run
-startup plan, runs `security check`, prints the `observe plan`, and verifies the
-systemd unit only when `systemd-analyze` is available. It does not start or
-enable services, install packages, download models, or contact remote
-endpoints. Override staged paths or binary locations with `CONFIG=...`,
-`UNIT=...`, `LLMCTL=...`, or `LLMCTLD=...` when validating a package root.
+startup plan, runs `security check`, prints `server status`, `server plan`,
+`audit retention plan`, and `observe plan`, and verifies the systemd unit only
+when `systemd-analyze` is available. It does not start or enable services,
+install packages, download models, or contact remote endpoints. Override staged
+paths or binary locations with `CONFIG=...`, `UNIT=...`, `LLMCTL=...`, or
+`LLMCTLD=...` when validating a package root.
 
 External bind is a release-blocking deployment control, not a packaging default.
 Before setting `server.host = "0.0.0.0"` or `security.bind-external = true`,
@@ -159,12 +160,15 @@ traffic reaches the daemon:
 
    ```bash
    llmctl --config /etc/rs-llmctl/config.toml server check
+   llmctl --config /etc/rs-llmctl/config.toml server status
+   llmctl --config /etc/rs-llmctl/config.toml server plan
    ```
 
 3. Run the security audit for production/external-bind controls:
 
    ```bash
    llmctl --config /etc/rs-llmctl/config.toml security check
+   llmctl --config /etc/rs-llmctl/config.toml audit retention plan
    ```
 
 4. Run readiness checks for observability and the systemd unit:

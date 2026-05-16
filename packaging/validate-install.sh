@@ -15,6 +15,9 @@ run() {
 
 run "${LLMCTLD}" --config "${CONFIG}" --dry-run
 run "${LLMCTL}" --config "${CONFIG}" security check
+run "${LLMCTL}" --config "${CONFIG}" server status
+run "${LLMCTL}" --config "${CONFIG}" server plan
+run "${LLMCTL}" --config "${CONFIG}" audit retention plan
 run "${LLMCTL}" --config "${CONFIG}" observe plan
 
 if command -v systemd-analyze >/dev/null 2>&1; then

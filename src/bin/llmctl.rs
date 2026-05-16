@@ -10,7 +10,7 @@ use rs_llmctl::observability::{Exporter, ObservabilityPlan};
 use rs_llmctl::quota::{self, Principal};
 use rs_llmctl::reporting;
 use rs_llmctl::storage::Storage;
-use rs_llmctl::worker::StartupPlan;
+use rs_llmctl::worker::{StartupPlan, SwapPlan, WorkerId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -101,6 +101,7 @@ enum ModelCommand {
 #[derive(Debug, Subcommand)]
 enum SwapCommand {
     Set(SwapSetArgs),
+    Plan(SwapPlanArgs),
     Show,
 }
 
@@ -108,6 +109,14 @@ enum SwapCommand {
 struct SwapSetArgs {
     #[arg(long, value_enum)]
     mode: SwapMode,
+}
+
+#[derive(Debug, Args)]
+struct SwapPlanArgs {
+    #[arg(long)]
+    active: String,
+    #[arg(long)]
+    replacement: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -240,6 +249,10 @@ enum AuditCommand {
         #[command(subcommand)]
         command: AuditReportCommand,
     },
+    Retention {
+        #[command(subcommand)]
+        command: AuditRetentionCommand,
+    },
     Request(AuditRequestArgs),
 }
 
@@ -247,6 +260,11 @@ enum AuditCommand {
 enum AuditReportCommand {
     Monthly(AuditReportMonthlyArgs),
     Request(AuditReportRequestArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditRetentionCommand {
+    Plan,
 }
 
 #[derive(Debug, Args)]
@@ -466,6 +484,21 @@ async fn swap_command(path: &Path, command: SwapCommand, as_json: bool) -> Resul
                 as_json,
                 &json!({ "status": "set", "mode": cfg.mode, "models": cfg.models.len() }),
             )
+        }
+        SwapCommand::Plan(args) => {
+            let active = WorkerId::new(args.active);
+            let replacement = WorkerId::new(args.replacement);
+            let plan = match cfg.mode {
+                Mode::ColdSwap => SwapPlan::cold(active, replacement),
+                Mode::HotSwap => SwapPlan::hot(active, replacement),
+                Mode::Single | Mode::Weighted | Mode::Fallback => {
+                    bail!(
+                        "swap plan is only supported for cold-swap or hot-swap modes; current mode is {}",
+                        mode_name(&cfg.mode)
+                    );
+                }
+            };
+            emit(as_json, &plan)
         }
         SwapCommand::Show => emit(
             as_json,
@@ -721,6 +754,12 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
                 }
             }
         },
+        AuditCommand::Retention { command } => match command {
+            AuditRetentionCommand::Plan => {
+                let report = audit_retention_plan(&cfg, &storage).await?;
+                emit(as_json, &report)
+            }
+        },
         AuditCommand::Request(args) => {
             let event = AuditEvent::new(
                 None,
@@ -735,6 +774,28 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
             emit(as_json, &event)
         }
     }
+}
+
+async fn audit_retention_plan(cfg: &Config, storage: &Storage) -> Result<serde_json::Value> {
+    let generated_at = Utc::now();
+    let cutoff = generated_at - Duration::days(i64::from(cfg.audit.retention_days));
+    let counts = storage.audit_retention_counts(cutoff).await?;
+
+    Ok(json!({
+        "status": "planned",
+        "operation": "audit_retention",
+        "dry_run": true,
+        "deletes": false,
+        "generated_at": generated_at,
+        "retention": {
+            "days": cfg.audit.retention_days,
+            "cutoff": cutoff,
+            "report_directory": cfg.audit.report_directory,
+            "report_formats": cfg.audit.report_formats,
+            "monthly_reports": cfg.audit.monthly_reports
+        },
+        "counts": counts
+    }))
 }
 
 async fn usage_command(path: &Path, command: UsageCommand, as_json: bool) -> Result<()> {
@@ -811,6 +872,16 @@ fn upsert_quota(quotas: &mut Vec<QuotaConfig>, quota: QuotaConfig) {
         *existing = quota;
     } else {
         quotas.push(quota);
+    }
+}
+
+fn mode_name(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Single => "single",
+        Mode::ColdSwap => "cold-swap",
+        Mode::HotSwap => "hot-swap",
+        Mode::Weighted => "weighted",
+        Mode::Fallback => "fallback",
     }
 }
 
