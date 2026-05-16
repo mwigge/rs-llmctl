@@ -162,56 +162,71 @@ pub async fn check_quota(
     principal: &Principal,
     model: &str,
 ) -> Result<QuotaDecision> {
-    let Some(q) = matching_quota_policy(quotas, principal) else {
+    let matching = matching_quota_policies(quotas, principal);
+    if matching.is_empty() {
         return Ok(QuotaDecision {
             allowed: true,
             reason: "no quota configured".to_string(),
         });
-    };
-    if !q.allowed_models.is_empty() && !q.allowed_models.iter().any(|m| m == model) {
-        return Ok(QuotaDecision {
-            allowed: false,
-            reason: format!("model {model} is not allowed for {}", principal.subject),
-        });
     }
 
-    let subject_scoped = q.subject == principal.subject;
-    let now = Utc::now();
-    if q.requests_per_minute > 0 {
-        let admitted = storage
-            .allowed_quota_decision_count(
-                principal,
-                subject_scoped,
-                now - Duration::minutes(1),
-                now,
-            )
-            .await?;
-        if admitted >= u64::from(q.requests_per_minute) {
+    for q in &matching {
+        if !q.allowed_models.is_empty() && !q.allowed_models.iter().any(|m| m == model) {
             return Ok(QuotaDecision {
                 allowed: false,
                 reason: format!(
-                    "requests_per_minute exhausted for {}: {admitted}/{}",
-                    quota_scope_label(q, principal),
-                    q.requests_per_minute
+                    "model {model} is not allowed for {}",
+                    quota_scope_label(q, principal)
                 ),
             });
         }
     }
 
-    if q.tokens_per_day > 0 {
-        let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
-        let used = storage
-            .usage_tokens_total(principal, subject_scoped, day_start, now)
-            .await?;
-        if used >= q.tokens_per_day {
-            return Ok(QuotaDecision {
-                allowed: false,
-                reason: format!(
-                    "tokens_per_day exhausted for {}: {used}/{}",
-                    quota_scope_label(q, principal),
-                    q.tokens_per_day
-                ),
-            });
+    let now = Utc::now();
+    for q in &matching {
+        if q.requests_per_minute > 0 {
+            let admitted = storage
+                .allowed_quota_decision_count(
+                    principal,
+                    quota_is_subject_scoped(q, principal),
+                    now - Duration::minutes(1),
+                    now,
+                )
+                .await?;
+            if admitted >= u64::from(q.requests_per_minute) {
+                return Ok(QuotaDecision {
+                    allowed: false,
+                    reason: format!(
+                        "requests_per_minute exhausted for {}: {admitted}/{}",
+                        quota_scope_label(q, principal),
+                        q.requests_per_minute
+                    ),
+                });
+            }
+        }
+    }
+
+    let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    for q in &matching {
+        if q.tokens_per_day > 0 {
+            let used = storage
+                .usage_tokens_total(
+                    principal,
+                    quota_is_subject_scoped(q, principal),
+                    day_start,
+                    now,
+                )
+                .await?;
+            if used >= q.tokens_per_day {
+                return Ok(QuotaDecision {
+                    allowed: false,
+                    reason: format!(
+                        "tokens_per_day exhausted for {}: {used}/{}",
+                        quota_scope_label(q, principal),
+                        q.tokens_per_day
+                    ),
+                });
+            }
         }
     }
 
@@ -225,18 +240,29 @@ pub fn matching_quota_policy<'a>(
     quotas: &'a [QuotaConfig],
     principal: &Principal,
 ) -> Option<&'a QuotaConfig> {
+    matching_quota_policies(quotas, principal)
+        .into_iter()
+        .next()
+}
+
+pub fn matching_quota_policies<'a>(
+    quotas: &'a [QuotaConfig],
+    principal: &Principal,
+) -> Vec<&'a QuotaConfig> {
     quotas
         .iter()
-        .find(|q| q.subject == principal.subject)
-        .or_else(|| {
-            quotas
-                .iter()
-                .find(|q| !q.team.is_empty() && q.team == principal.team)
+        .filter(|q| {
+            q.subject == principal.subject || (!q.team.is_empty() && q.team == principal.team)
         })
+        .collect()
+}
+
+pub fn quota_is_subject_scoped(q: &QuotaConfig, principal: &Principal) -> bool {
+    q.subject == principal.subject
 }
 
 fn quota_scope_label(q: &QuotaConfig, principal: &Principal) -> String {
-    if q.subject == principal.subject {
+    if quota_is_subject_scoped(q, principal) {
         format!("subject {}", principal.subject)
     } else {
         format!("team {}", principal.team)
@@ -265,6 +291,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allows_when_no_quota_matches() -> Result<()> {
+        let storage = Storage::in_memory().await?;
+        let principal = principal("alice", "platform");
+        let quotas = vec![quota("bob", "research", 1, 10, &["mistral"])];
+
+        let decision = check_quota(&storage, &quotas, &principal, "llama").await?;
+
+        assert!(decision.allowed, "{}", decision.reason);
+        assert_eq!(decision.reason, "no quota configured");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn denies_models_outside_policy() -> Result<()> {
         let storage = Storage::in_memory().await?;
         let principal = principal("alice", "platform");
@@ -274,6 +313,23 @@ mod tests {
 
         assert!(!decision.allowed);
         assert!(decision.reason.contains("model mistral is not allowed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn denies_when_overlapping_team_policy_disallows_subject_model() -> Result<()> {
+        let storage = Storage::in_memory().await?;
+        let principal = principal("alice", "platform");
+        let quotas = vec![
+            quota("alice", "platform", 10, 100, &["llama", "mistral"]),
+            quota("team-default", "platform", 10, 100, &["llama"]),
+        ];
+
+        let decision = check_quota(&storage, &quotas, &principal, "mistral").await?;
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("model mistral is not allowed"));
+        assert!(decision.reason.contains("team platform"));
         Ok(())
     }
 
@@ -300,6 +356,36 @@ mod tests {
 
         assert!(!decision.allowed);
         assert!(decision.reason.contains("requests_per_minute"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn denies_when_overlapping_team_request_limit_is_more_restrictive() -> Result<()> {
+        let storage = Storage::in_memory().await?;
+        let principal = principal("alice", "platform");
+        let quotas = vec![
+            quota("alice", "platform", 2, 100, &["llama"]),
+            quota("team-default", "platform", 1, 100, &["llama"]),
+        ];
+        let allowed = QuotaDecision {
+            allowed: true,
+            reason: "quota policy allowed".to_string(),
+        };
+        storage
+            .insert_quota_decision(&QuotaDecisionRecord::new(
+                Some(Uuid::new_v4()),
+                &principal,
+                "llama",
+                &allowed,
+                json!({}),
+            ))
+            .await?;
+
+        let decision = check_quota(&storage, &quotas, &principal, "llama").await?;
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("requests_per_minute"));
+        assert!(decision.reason.contains("team platform"));
         Ok(())
     }
 

@@ -135,7 +135,6 @@ fn fields_for(dataset: DatasetKind) -> Vec<FieldContract> {
         DatasetKind::Models => vec![
             field("alias", "utf8", false, "model alias"),
             field("role", "utf8", false, "serving role"),
-            field("path", "utf8", false, "configured model path"),
             field("weight", "uint32", false, "routing weight"),
             field(
                 "updated_at",

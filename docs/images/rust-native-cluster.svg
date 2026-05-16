@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">rs-llmctl rust native cluster</title>
+  <desc id="desc">Two rs-llmctl nodes running native Candle engines with heartbeat and OpenTelemetry signals.</desc>
+  <rect width="1280" height="720" fill="#f6f7f9"/>
+  <rect x="80" y="70" width="1120" height="580" rx="10" fill="#ffffff" stroke="#c7ccd4"/>
+  <text x="110" y="125" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="700" fill="#17202a">Rust-native model serving cluster</text>
+  <text x="110" y="165" font-family="Inter, Arial, sans-serif" font-size="18" fill="#4a5563">One llmctl binary, in-process Candle engines, path-safe telemetry, and explicit heartbeats.</text>
+
+  <rect x="120" y="230" width="420" height="260" rx="8" fill="#edf7f3" stroke="#6abf8f"/>
+  <text x="150" y="275" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700" fill="#123b2a">Node A</text>
+  <text x="150" y="310" font-family="Inter, Arial, sans-serif" font-size="18" fill="#24523d">roles: thinking, recommendation</text>
+  <rect x="150" y="340" width="160" height="58" rx="6" fill="#ffffff" stroke="#6abf8f"/>
+  <text x="178" y="376" font-family="Inter, Arial, sans-serif" font-size="17" fill="#123b2a">Qwen3 engine</text>
+  <rect x="330" y="340" width="160" height="58" rx="6" fill="#ffffff" stroke="#6abf8f"/>
+  <text x="356" y="376" font-family="Inter, Arial, sans-serif" font-size="17" fill="#123b2a">Gemma engine</text>
+  <text x="150" y="440" font-family="Inter, Arial, sans-serif" font-size="16" fill="#24523d">80% CPU/RAM service guard</text>
+
+  <rect x="740" y="230" width="420" height="260" rx="8" fill="#eef3fb" stroke="#6f95d8"/>
+  <text x="770" y="275" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700" fill="#183866">Node B</text>
+  <text x="770" y="310" font-family="Inter, Arial, sans-serif" font-size="18" fill="#31527f">roles: coding, EU fallback</text>
+  <rect x="770" y="340" width="160" height="58" rx="6" fill="#ffffff" stroke="#6f95d8"/>
+  <text x="802" y="376" font-family="Inter, Arial, sans-serif" font-size="17" fill="#183866">Qwen3 code</text>
+  <rect x="950" y="340" width="160" height="58" rx="6" fill="#ffffff" stroke="#6f95d8"/>
+  <text x="988" y="376" font-family="Inter, Arial, sans-serif" font-size="17" fill="#183866">Mistral EU</text>
+  <text x="770" y="440" font-family="Inter, Arial, sans-serif" font-size="16" fill="#31527f">80% GPU VRAM planning evidence</text>
+
+  <path d="M550 360 C610 320 650 320 710 360" fill="none" stroke="#424b57" stroke-width="4"/>
+  <polygon points="710,360 690,348 692,373" fill="#424b57"/>
+  <text x="572" y="312" font-family="Inter, Arial, sans-serif" font-size="18" fill="#2e3742">route by role/model</text>
+
+  <path d="M740 505 C620 590 420 590 300 505" fill="none" stroke="#b35b1f" stroke-width="4" stroke-dasharray="10 8"/>
+  <polygon points="300,505 324,505 312,526" fill="#b35b1f"/>
+  <text x="470" y="605" font-family="Inter, Arial, sans-serif" font-size="18" fill="#8b4317">llmctl.runtime.heartbeat every 30s</text>
+
+  <rect x="455" y="510" width="370" height="62" rx="8" fill="#fff7ed" stroke="#d88b43"/>
+  <text x="488" y="548" font-family="Inter, Arial, sans-serif" font-size="18" fill="#7a3a12">OpenTelemetry, audit, quota, usage</text>
+</svg>

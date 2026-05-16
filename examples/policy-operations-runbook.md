@@ -87,7 +87,7 @@ the operator secret manager and distribute it through the approved channel.
 Capture a server plan export before any production service activation change:
 
 ```bash
-llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
+llmctl --config /etc/rs-llmctl/config.toml server plan > server-plan.json
 ```
 
 Review `server-plan.json` for the planned worker count, model aliases, ports,
@@ -97,8 +97,8 @@ For policy-only changes, keep before/after plan artifacts and review the diff
 before approving the change record:
 
 ```bash
-llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.before.json
-llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.after.json
+llmctl --config /etc/rs-llmctl/config.toml server plan > server-plan.before.json
+llmctl --config /etc/rs-llmctl/config.toml server plan > server-plan.after.json
 llmctl server plan-diff server-plan.before.json server-plan.after.json
 ```
 

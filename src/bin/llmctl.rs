@@ -13,9 +13,14 @@ use rs_llmctl::config::{
 use rs_llmctl::contracts::{self, DatasetKind};
 use rs_llmctl::integrations;
 use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
-use rs_llmctl::observability::{Exporter, ObservabilityPlan};
+use rs_llmctl::native;
+use rs_llmctl::observability::{
+    emit_runtime_telemetry, Exporter, ObservabilityPlan, RuntimeTelemetryEvent, TelemetryEventName,
+    TelemetryRuntime, TelemetrySignal,
+};
 use rs_llmctl::quota::{self, Principal};
 use rs_llmctl::reporting;
+use rs_llmctl::runtime;
 use rs_llmctl::storage::Storage;
 use rs_llmctl::worker::{StartupPlan, SwapPlan, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -28,7 +33,10 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
+
+const DEFAULT_SERVICE_NAME: &str = "llmctld.service";
 
 #[derive(Debug, Parser)]
 #[command(name = "llmctl", version, about = "Control rs-llmctl model serving")]
@@ -51,6 +59,14 @@ enum Command {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
     },
     Swap {
         #[command(subcommand)]
@@ -186,6 +202,13 @@ struct ServerPlanDiffArgs {
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
     Install(ModelInstallArgs),
+    Status(ModelStatusArgs),
+    Start(ModelStartArgs),
+    Stop(ModelStopArgs),
+    Update(ModelReplaceArgs),
+    Upgrade(ModelReplaceArgs),
+    Downgrade(ModelReplaceArgs),
+    Drift(ObserveWindowArgs),
     ImportManifest(ModelImportManifestArgs),
     Inventory,
     List,
@@ -219,6 +242,45 @@ enum SwapMode {
     HotSwap,
 }
 
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Status(ServiceLifecycleArgs),
+    Start(ServiceLifecycleArgs),
+    Stop(ServiceLifecycleArgs),
+    Restart(ServiceLifecycleArgs),
+    Upgrade(ServiceLifecycleArgs),
+    Downgrade(ServiceLifecycleArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    Status,
+    Heartbeat,
+    Placement,
+    Route(RuntimeRouteArgs),
+    Validate,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeRouteArgs {
+    #[arg(long, conflicts_with = "role")]
+    model: Option<String>,
+    #[arg(long, conflicts_with = "model")]
+    role: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ServiceLifecycleArgs {
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME)]
+    service_name: String,
+    #[arg(long, conflicts_with = "system")]
+    user: bool,
+    #[arg(long, conflicts_with = "user")]
+    system: bool,
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[derive(Debug, Args)]
 struct ModelInstallArgs {
     source: String,
@@ -232,6 +294,46 @@ struct ModelInstallArgs {
     copy: bool,
     #[arg(long)]
     sha256: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ModelStatusArgs {
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelStartArgs {
+    alias: String,
+    #[arg(long)]
+    weight: Option<u32>,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ModelStopArgs {
+    alias: String,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ModelReplaceArgs {
+    source: String,
+    #[arg(long)]
+    alias: String,
+    #[arg(long)]
+    new_alias: Option<String>,
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long)]
+    weight: Option<u32>,
+    #[arg(long)]
+    copy: bool,
+    #[arg(long)]
+    sha256: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -739,6 +841,8 @@ async fn main() -> Result<()> {
         Command::Init(args) => init(&config_path, args, cli.json).await,
         Command::Server { command } => server_command(&config_path, command, cli.json).await,
         Command::Model { command } => model_command(&config_path, command, cli.json).await,
+        Command::Service { command } => service_command(command, cli.json).await,
+        Command::Runtime { command } => runtime_command(&config_path, command, cli.json).await,
         Command::Swap { command } => swap_command(&config_path, command, cli.json).await,
         Command::Quota { command } => quota_command(&config_path, command, cli.json).await,
         Command::Security { command } => security_command(&config_path, command, cli.json).await,
@@ -846,16 +950,32 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
     match command {
         ServerCommand::Run => {
             config::validate_production_security(&cfg)?;
-            init_storage(&cfg.storage).await?;
+            let storage = init_storage(&cfg.storage).await?;
+            let telemetry = TelemetryRuntime::install(&cfg, cfg.log.format == LogFormat::Json)?;
             emit(
                 as_json,
                 &json!({ "status": "ready", "bind": format!("{}:{}", cfg.server.host, cfg.server.port) }),
             )?;
-            rs_llmctl::server::serve(cfg).await
+            let result = if cfg.runtime.backend == runtime::RuntimeBackend::CandleNative {
+                let engines = load_native_engines_from_config(&cfg)?;
+                rs_llmctl::server::serve_with_storage_and_native_engines(
+                    cfg,
+                    storage,
+                    engines,
+                    rs_llmctl::server::shutdown_signal(),
+                )
+                .await
+            } else {
+                rs_llmctl::server::serve_with_storage(cfg, storage).await
+            };
+            let shutdown = telemetry.shutdown();
+            result.and(shutdown)
         }
         ServerCommand::Check => {
             create_storage_dirs(&cfg.storage).await?;
             init_storage(&cfg.storage).await?;
+            let placement = native::placement_plan_from_config(&cfg);
+            native::validate_placement_plan(&placement)?;
             emit(
                 as_json,
                 &json!({ "status": "ok", "config": path, "models": cfg.models.len(), "quotas": cfg.quotas.len() }),
@@ -879,6 +999,43 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
                 &json!({ "status": "ok", "production": cfg.security.production, "require_auth": cfg.security.require_auth }),
             )
         }
+    }
+}
+
+fn load_native_engines_from_config(
+    cfg: &Config,
+) -> Result<rs_llmctl::server::NativeEngineRegistry> {
+    let models = cfg
+        .models
+        .iter()
+        .filter(|model| model.weight > 0)
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        bail!("candle-native runtime requires at least one configured model with weight > 0");
+    }
+
+    let factory = native::NativeCandleEngineFactory::default();
+    let mut engines = rs_llmctl::server::NativeEngineRegistry::new();
+    for model in models {
+        let family = infer_candle_family(model);
+        let plan = factory.plan(family, model, &cfg.resources)?;
+        let engine = factory.load(&plan)?;
+        engines.insert(model.alias.clone(), std::sync::Arc::from(engine));
+    }
+    Ok(engines)
+}
+
+fn infer_candle_family(model: &ModelConfig) -> native::CandleModelFamily {
+    let haystack =
+        format!("{} {} {}", model.alias, model.role, model.path.display()).to_ascii_lowercase();
+    if haystack.contains("gemma") {
+        native::CandleModelFamily::Gemma4
+    } else if haystack.contains("kimi") {
+        native::CandleModelFamily::Kimi
+    } else if haystack.contains("mistral") {
+        native::CandleModelFamily::Mistral
+    } else {
+        native::CandleModelFamily::Qwen3
     }
 }
 
@@ -911,6 +1068,142 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
                 &json!({ "status": "installed", "model": installed, "models": cfg.models }),
             )
         }
+        ModelCommand::Status(args) => {
+            let model = cfg
+                .models
+                .iter()
+                .find(|model| model.alias == args.alias)
+                .with_context(|| format!("model alias '{}' is not configured", args.alias))?;
+            let status = if model.weight == 0 {
+                "stopped"
+            } else {
+                "running"
+            };
+
+            emit(
+                as_json,
+                &json!({
+                    "status": status,
+                    "alias": &model.alias,
+                    "weight": model.weight,
+                    "restart_required": false,
+                    "restart_hint": default_restart_hint(),
+                    "runtime_backend": &cfg.runtime.backend,
+                    "one_binary": true,
+                    "entrypoint": one_binary_entrypoint(),
+                    "model": model,
+                }),
+            )
+        }
+        ModelCommand::Start(args) => {
+            let model = cfg
+                .models
+                .iter_mut()
+                .find(|model| model.alias == args.alias)
+                .with_context(|| format!("model alias '{}' is not configured", args.alias))?;
+            let previous_weight = model.weight;
+            let weight = args.weight.unwrap_or_else(|| previous_weight.max(1));
+            if args.dry_run {
+                return emit(
+                    as_json,
+                    &json!({
+                        "status": "planned",
+                        "action": "start",
+                        "alias": &model.alias,
+                        "previous_weight": previous_weight,
+                        "weight": weight,
+                        "restart_required": true,
+                        "restart_hint": default_restart_hint(),
+                        "runtime_backend": &cfg.runtime.backend,
+                        "one_binary": true,
+                        "entrypoint": one_binary_entrypoint(),
+                        "model": model,
+                    }),
+                );
+            }
+            model.weight = weight;
+            let model_config = model.clone();
+            persist_models(path, &cfg).await?;
+
+            emit(
+                as_json,
+                &json!({
+                    "status": "started",
+                    "action": "start",
+                    "alias": &model_config.alias,
+                    "previous_weight": previous_weight,
+                    "weight": model_config.weight,
+                    "restart_required": true,
+                    "restart_hint": default_restart_hint(),
+                    "runtime_backend": &cfg.runtime.backend,
+                    "one_binary": true,
+                    "entrypoint": one_binary_entrypoint(),
+                    "model": &model_config,
+                    "models": &cfg.models,
+                }),
+            )
+        }
+        ModelCommand::Stop(args) => {
+            let model = cfg
+                .models
+                .iter_mut()
+                .find(|model| model.alias == args.alias)
+                .with_context(|| format!("model alias '{}' is not configured", args.alias))?;
+            let previous_weight = model.weight;
+            if args.dry_run {
+                return emit(
+                    as_json,
+                    &json!({
+                        "status": "planned",
+                        "action": "stop",
+                        "alias": &model.alias,
+                        "previous_weight": previous_weight,
+                        "weight": 0,
+                        "restart_required": true,
+                        "restart_hint": default_restart_hint(),
+                        "runtime_backend": &cfg.runtime.backend,
+                        "one_binary": true,
+                        "entrypoint": one_binary_entrypoint(),
+                        "model": model,
+                    }),
+                );
+            }
+            model.weight = 0;
+            let model_config = model.clone();
+            persist_models(path, &cfg).await?;
+
+            emit(
+                as_json,
+                &json!({
+                    "status": "stopped",
+                    "action": "stop",
+                    "alias": &model_config.alias,
+                    "previous_weight": previous_weight,
+                    "weight": model_config.weight,
+                    "restart_required": true,
+                    "restart_hint": default_restart_hint(),
+                    "runtime_backend": &cfg.runtime.backend,
+                    "one_binary": true,
+                    "entrypoint": one_binary_entrypoint(),
+                    "model": &model_config,
+                    "models": &cfg.models,
+                }),
+            )
+        }
+        ModelCommand::Update(args) => {
+            replace_model(path, &mut cfg, args, "update", "updated", as_json).await
+        }
+        ModelCommand::Upgrade(args) => {
+            replace_model(path, &mut cfg, args, "upgrade", "upgraded", as_json).await
+        }
+        ModelCommand::Downgrade(args) => {
+            replace_model(path, &mut cfg, args, "downgrade", "downgraded", as_json).await
+        }
+        ModelCommand::Drift(args) => {
+            let storage = init_storage(&cfg.storage).await?;
+            record_latency_drift_observations(&storage, args.hours).await?;
+            report_observations(&storage, "drift", args.hours, as_json).await
+        }
         ModelCommand::ImportManifest(args) => {
             create_storage_dirs(&cfg.storage).await?;
             let installed = model::import_offline_manifest(&args.manifest).await?;
@@ -918,12 +1211,7 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             for model in &installed {
                 upsert_model(&mut cfg.models, model.config.clone());
             }
-            config::save(path, &cfg).await?;
-
-            let storage = init_storage(&cfg.storage).await?;
-            for model in &cfg.models {
-                storage.upsert_model(model).await?;
-            }
+            persist_models(path, &cfg).await?;
 
             emit(
                 as_json,
@@ -936,6 +1224,87 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             emit(as_json, &inventory)
         }
         ModelCommand::List => emit(as_json, &cfg.models),
+    }
+}
+
+async fn service_command(command: ServiceCommand, as_json: bool) -> Result<()> {
+    let (action, args) = match command {
+        ServiceCommand::Status(args) => (ServiceLifecycleAction::Status, args),
+        ServiceCommand::Start(args) => (ServiceLifecycleAction::Start, args),
+        ServiceCommand::Stop(args) => (ServiceLifecycleAction::Stop, args),
+        ServiceCommand::Restart(args) => (ServiceLifecycleAction::Restart, args),
+        ServiceCommand::Upgrade(args) => (ServiceLifecycleAction::Upgrade, args),
+        ServiceCommand::Downgrade(args) => (ServiceLifecycleAction::Downgrade, args),
+    };
+    if args.service_name.trim().is_empty() {
+        bail!("--service-name must not be empty");
+    }
+    let plan = plan_service_lifecycle(action, &args);
+    if args.dry_run {
+        return emit(as_json, &plan);
+    }
+
+    let result = execute_service_lifecycle(plan).await?;
+    emit(as_json, &result)
+}
+
+async fn runtime_command(path: &Path, command: RuntimeCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    match command {
+        RuntimeCommand::Status => {
+            let status = runtime::status_from_config(&cfg);
+            let mut attributes = BTreeMap::new();
+            attributes.insert("runtime.backend".to_string(), json!(status.backend));
+            attributes.insert("runtime.engine".to_string(), json!(status.engine));
+            attributes.insert("runtime.primary".to_string(), json!(status.primary));
+            attributes.insert("runtime.implemented".to_string(), json!(status.implemented));
+            attributes.insert(
+                "runtime.resource.budget_fraction".to_string(),
+                json!(status.resource_policy.budget_fraction),
+            );
+            emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+                TelemetrySignal::Log,
+                TelemetryEventName::NativeRuntimeStatus,
+                Utc::now(),
+                attributes,
+            ));
+            emit(as_json, &status)
+        }
+        RuntimeCommand::Heartbeat => {
+            let heartbeat = native::heartbeat_from_config(&cfg);
+            emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+                TelemetrySignal::Metric,
+                TelemetryEventName::RuntimeHeartbeat,
+                Utc::now(),
+                heartbeat.safe_telemetry_attributes(),
+            ));
+            emit(as_json, &heartbeat)
+        }
+        RuntimeCommand::Placement => emit(as_json, &native::placement_plan_from_config(&cfg)),
+        RuntimeCommand::Route(args) => {
+            let placement = native::placement_plan_from_config(&cfg);
+            native::validate_placement_plan(&placement)?;
+            let selection = match (args.model.as_deref(), args.role.as_deref()) {
+                (Some(model), None) => native::route_selection_for_model(&placement, model)?,
+                (None, Some(role)) => native::route_selection_for_role(&placement, role)?,
+                (None, None) => bail!("runtime route requires --model or --role"),
+                (Some(_), Some(_)) => unreachable!("clap enforces conflicts_with"),
+            };
+            emit(as_json, &selection)
+        }
+        RuntimeCommand::Validate => {
+            let placement = native::placement_plan_from_config(&cfg);
+            native::validate_placement_plan(&placement)?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "ok",
+                    "routing_mode": placement.routing_mode,
+                    "nodes": placement.nodes.len(),
+                    "unassigned_models": placement.unassigned_models,
+                }),
+            )
+        }
     }
 }
 
@@ -1209,6 +1578,74 @@ async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) ->
             show_observations(&storage, args, as_json).await
         }
     }
+}
+
+async fn record_latency_drift_observations(storage: &Storage, hours: i64) -> Result<usize> {
+    let hours = hours.max(1);
+    let now = Utc::now();
+    let current_from = now - Duration::hours(hours);
+    let previous_from = current_from - Duration::hours(hours);
+    let current = storage.usage_events_between(current_from, now).await?;
+    let previous = storage
+        .usage_events_between(previous_from, current_from)
+        .await?;
+    let current_avg = average_latency_by_model(&current);
+    let previous_avg = average_latency_by_model(&previous);
+    let mut inserted = 0usize;
+    for (model, current_ms) in current_avg {
+        let Some(previous_ms) = previous_avg.get(&model).copied() else {
+            continue;
+        };
+        if previous_ms <= 0.0 {
+            continue;
+        }
+        let ratio = (current_ms - previous_ms) / previous_ms;
+        if ratio.abs() >= 0.25 {
+            let event = ObservationEvent {
+                id: Uuid::new_v4(),
+                request_id: None,
+                at: now,
+                kind: "model.drift.latency".to_string(),
+                model: model.clone(),
+                source: "llmctl-model-drift".to_string(),
+                value: ratio,
+                unit: "ratio".to_string(),
+                attributes_json: json!({
+                    "current_avg_latency_ms": current_ms,
+                    "previous_avg_latency_ms": previous_ms,
+                    "window_hours": hours
+                }),
+            };
+            storage.insert_observation_event(&event).await?;
+            emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+                TelemetrySignal::Metric,
+                TelemetryEventName::DriftObservation,
+                Utc::now(),
+                BTreeMap::from([
+                    ("llmctl.model".to_string(), json!(model)),
+                    ("llmctl.drift.kind".to_string(), json!("latency")),
+                    ("llmctl.drift.value".to_string(), json!(ratio)),
+                ]),
+            ));
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
+}
+
+fn average_latency_by_model(events: &[rs_llmctl::audit::UsageEvent]) -> BTreeMap<String, f64> {
+    let mut totals = BTreeMap::<String, (u64, u64)>::new();
+    for event in events {
+        let entry = totals.entry(event.model.clone()).or_default();
+        entry.0 = entry.0.saturating_add(event.latency_ms);
+        entry.1 = entry.1.saturating_add(1);
+    }
+    totals
+        .into_iter()
+        .filter_map(|(model, (latency, count))| {
+            (count > 0).then_some((model, latency as f64 / count as f64))
+        })
+        .collect()
 }
 
 async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Result<()> {
@@ -1585,8 +2022,15 @@ fn dataset_rows(
         DataDataset::Models => Ok(report
             .models
             .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()?),
+            .map(|model| {
+                json!({
+                    "alias": model.alias,
+                    "role": model.role,
+                    "weight": model.weight,
+                    "updated_at": model.updated_at
+                })
+            })
+            .collect()),
         DataDataset::Drift => Ok(report
             .observation_events
             .iter()
@@ -1641,9 +2085,20 @@ fn aiops_gaps_report() -> serde_json::Value {
             "manifest-driven eval suites that execute golden prompts against OpenAI-compatible endpoints",
             "runtime request-to-lineage joins for chat, local search, and recommendations",
             "Prometheus/Alertmanager rules and Grafana dashboard renderers for SLOs",
-            "HMAC policy bundles plus Ed25519 policy signatures and hash-chained transparency logs"
+            "HMAC policy bundles plus Ed25519 policy signatures and hash-chained transparency logs",
+            "Candle-native greedy autoregressive decoding for Qwen3, Gemma-family, and Mistral safetensors/GGUF paths where Candle exposes model support"
         ],
         "gaps": [
+            {
+                "area": "native-inference",
+                "gap": "Kimi remains a tracked native backend gap because Candle 0.10.2 does not expose a Kimi architecture module to instantiate",
+                "next_control": "upgrade Candle when Kimi lands upstream or vendor a reviewed Kimi model implementation behind the NativeCandleDecoder"
+            },
+            {
+                "area": "observability",
+                "gap": "RED metrics, upstream circuit-breaker state metrics, heartbeat, admission rejection metrics, and worker lifecycle telemetry are emitted; deeper burn-rate deployment sync remains operator-managed",
+                "next_control": "add optional push/apply helpers for Prometheus and Grafana provisioning"
+            },
             {
                 "area": "model-quality",
                 "gap": "eval suites execute configured prompts, but advanced judges and rubric scoring are not bundled",
@@ -2772,6 +3227,286 @@ async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
     Storage::connect_config(storage).await
 }
 
+async fn persist_models(path: &Path, cfg: &Config) -> Result<()> {
+    config::save(path, cfg).await?;
+
+    let storage = init_storage(&cfg.storage).await?;
+    for model in &cfg.models {
+        storage.upsert_model(model).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServiceLifecycleAction {
+    Status,
+    Start,
+    Stop,
+    Restart,
+    Upgrade,
+    Downgrade,
+}
+
+impl ServiceLifecycleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Upgrade => "upgrade",
+            Self::Downgrade => "downgrade",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServiceCommandPlan {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OneBinaryEntrypoint {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServiceLifecyclePlan {
+    status: String,
+    action: String,
+    service_name: String,
+    scope: String,
+    dry_run: bool,
+    one_binary: bool,
+    runtime_backend: rs_llmctl::runtime::RuntimeBackend,
+    entrypoint: OneBinaryEntrypoint,
+    commands: Vec<ServiceCommandPlan>,
+    restart_hint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceCommandResult {
+    command: ServiceCommandPlan,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceLifecycleResult {
+    status: String,
+    action: String,
+    service_name: String,
+    scope: String,
+    dry_run: bool,
+    one_binary: bool,
+    runtime_backend: rs_llmctl::runtime::RuntimeBackend,
+    entrypoint: OneBinaryEntrypoint,
+    commands: Vec<ServiceCommandPlan>,
+    restart_hint: String,
+    results: Vec<ServiceCommandResult>,
+}
+
+fn plan_service_lifecycle(
+    action: ServiceLifecycleAction,
+    args: &ServiceLifecycleArgs,
+) -> ServiceLifecyclePlan {
+    let scope = if args.system { "system" } else { "user" };
+    let service_name = normalize_service_name(&args.service_name);
+    let systemctl_scope = if args.system { None } else { Some("--user") };
+    let commands = service_systemctl_verbs(action)
+        .into_iter()
+        .map(|verb| {
+            let mut command_args = Vec::new();
+            if let Some(scope_arg) = systemctl_scope {
+                command_args.push(scope_arg.to_string());
+            }
+            command_args.push(verb.to_string());
+            if verb != "daemon-reload" {
+                command_args.push(service_name.clone());
+            }
+            ServiceCommandPlan {
+                program: "systemctl".to_string(),
+                args: command_args,
+            }
+        })
+        .collect();
+
+    ServiceLifecyclePlan {
+        status: "planned".to_string(),
+        action: action.as_str().to_string(),
+        service_name: service_name.clone(),
+        scope: scope.to_string(),
+        dry_run: args.dry_run,
+        one_binary: true,
+        runtime_backend: rs_llmctl::runtime::RuntimeBackend::CandleNative,
+        entrypoint: one_binary_entrypoint(),
+        commands,
+        restart_hint: restart_hint(scope, &service_name),
+    }
+}
+
+fn service_systemctl_verbs(action: ServiceLifecycleAction) -> Vec<&'static str> {
+    match action {
+        ServiceLifecycleAction::Status => vec!["status"],
+        ServiceLifecycleAction::Start => vec!["start"],
+        ServiceLifecycleAction::Stop => vec!["stop"],
+        ServiceLifecycleAction::Restart => vec!["restart"],
+        ServiceLifecycleAction::Upgrade | ServiceLifecycleAction::Downgrade => {
+            vec!["daemon-reload", "restart"]
+        }
+    }
+}
+
+async fn execute_service_lifecycle(plan: ServiceLifecyclePlan) -> Result<ServiceLifecycleResult> {
+    let mut results = Vec::new();
+    for command in &plan.commands {
+        let output = TokioCommand::new(&command.program)
+            .args(&command.args)
+            .output()
+            .await
+            .with_context(|| format!("run {}", shell_words(command)))?;
+        results.push(ServiceCommandResult {
+            command: command.clone(),
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+
+    let success = results.iter().all(|result| result.success);
+    Ok(ServiceLifecycleResult {
+        status: if success { "ok" } else { "failed" }.to_string(),
+        action: plan.action,
+        service_name: plan.service_name,
+        scope: plan.scope,
+        dry_run: false,
+        one_binary: plan.one_binary,
+        runtime_backend: plan.runtime_backend,
+        entrypoint: plan.entrypoint,
+        commands: plan.commands,
+        restart_hint: plan.restart_hint,
+        results,
+    })
+}
+
+fn normalize_service_name(service_name: &str) -> String {
+    let trimmed = service_name.trim();
+    if trimmed.ends_with(".service") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.service")
+    }
+}
+
+fn default_restart_hint() -> String {
+    restart_hint("user", DEFAULT_SERVICE_NAME)
+}
+
+fn one_binary_entrypoint() -> OneBinaryEntrypoint {
+    OneBinaryEntrypoint {
+        program: "llmctl".to_string(),
+        args: vec!["server".to_string(), "run".to_string()],
+    }
+}
+
+fn restart_hint(scope: &str, service_name: &str) -> String {
+    match scope {
+        "system" => format!("systemctl restart {service_name}"),
+        _ => format!("systemctl --user restart {service_name}"),
+    }
+}
+
+fn shell_words(command: &ServiceCommandPlan) -> String {
+    std::iter::once(command.program.as_str())
+        .chain(command.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn replace_model(
+    path: &Path,
+    cfg: &mut Config,
+    args: ModelReplaceArgs,
+    action: &str,
+    status: &str,
+    as_json: bool,
+) -> Result<()> {
+    let previous = cfg
+        .models
+        .iter()
+        .find(|model| model.alias == args.alias)
+        .cloned()
+        .with_context(|| format!("model alias '{}' is not configured", args.alias))?;
+    let target_alias = args.new_alias.unwrap_or_else(|| previous.alias.clone());
+    let role = args.role.unwrap_or_else(|| previous.role.clone());
+    let weight = args.weight.unwrap_or(previous.weight);
+
+    if args.dry_run {
+        return emit(
+            as_json,
+            &json!({
+                "status": "planned",
+                "action": action,
+                "alias": &previous.alias,
+                "new_alias": &target_alias,
+                "previous_weight": previous.weight,
+                "weight": weight,
+                "role": role,
+                "source": &args.source,
+                "copy": args.copy,
+                "sha256": args.sha256,
+                "restart_required": true,
+                "restart_hint": default_restart_hint(),
+                "runtime_backend": &cfg.runtime.backend,
+                "one_binary": true,
+                "entrypoint": one_binary_entrypoint(),
+                "previous_model": &previous,
+            }),
+        );
+    }
+
+    create_storage_dirs(&cfg.storage).await?;
+    let installed = model::install_model(&ModelInstallRequest {
+        alias: target_alias.clone(),
+        source: model_source(&args.source),
+        cache_dir: cfg.storage.model_dir.clone(),
+        copy_to_cache: args.copy,
+        expected_sha256: args.sha256,
+        role,
+        weight,
+    })
+    .await?;
+
+    if target_alias != previous.alias {
+        cfg.models.retain(|model| model.alias != previous.alias);
+    }
+    upsert_model(&mut cfg.models, installed.config.clone());
+    persist_models(path, cfg).await?;
+
+    emit(
+        as_json,
+        &json!({
+            "status": status,
+            "action": action,
+            "alias": &previous.alias,
+            "new_alias": &target_alias,
+            "previous_model": &previous,
+            "model": &installed,
+            "restart_required": true,
+            "restart_hint": default_restart_hint(),
+            "runtime_backend": &cfg.runtime.backend,
+            "one_binary": true,
+            "entrypoint": one_binary_entrypoint(),
+            "models": &cfg.models,
+        }),
+    )
+}
+
 fn upsert_model(models: &mut Vec<ModelConfig>, model: ModelConfig) {
     if let Some(existing) = models.iter_mut().find(|m| m.alias == model.alias) {
         *existing = model;
@@ -3353,11 +4088,11 @@ async fn report_observations(
 ) -> Result<()> {
     let (from, to) = window(hours);
     let events = storage.observation_events_between(from, to).await?;
-    let values: Vec<f64> = events
-        .iter()
+    let matching_events = events
+        .into_iter()
         .filter(|event| event.kind.contains(kind))
-        .map(|event| event.value)
-        .collect();
+        .collect::<Vec<_>>();
+    let values: Vec<f64> = matching_events.iter().map(|event| event.value).collect();
     let count = values.len();
     let avg_value = if count == 0 {
         None
@@ -3367,7 +4102,7 @@ async fn report_observations(
     let max_value = values.iter().copied().reduce(f64::max);
     emit(
         as_json,
-        &json!({ "hours": hours, "count": count, "avg_value": avg_value, "max_value": max_value }),
+        &json!({ "kind": kind, "hours": hours, "count": count, "avg_value": avg_value, "max_value": max_value, "events": matching_events }),
     )
 }
 

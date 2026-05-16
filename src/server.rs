@@ -1,10 +1,12 @@
 use crate::audit::{AuditEvent, UsageEvent};
 use crate::config::{Config, Mode, ModelConfig};
+use crate::native;
 use crate::observability::{
     emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
 };
-use crate::quota::{check_quota, matching_quota_policy, Principal};
+use crate::quota::{check_quota, matching_quota_policies, quota_is_subject_scoped, Principal};
 use crate::rag::{lexical_search, SearchDocument};
+use crate::runtime::RuntimeBackend;
 use crate::storage::{QuotaDecisionRecord, RequestLineageJoinRecord, Storage};
 use crate::worker::{
     PlannedWorker, StartupPlan, SwapExecution, SwapMode, TokioWorkerRunner, WorkerId,
@@ -12,6 +14,7 @@ use crate::worker::{
 };
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
+use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -27,16 +30,24 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use uuid::Uuid;
 
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
+#[cfg(test)]
 const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_SLO_LATENCY_MS: u64 = 10_000;
+const MAX_SSE_USAGE_BUFFER_BYTES: usize = 1024 * 1024;
+
+pub type NativeEngineRegistry = BTreeMap<String, Arc<dyn native::NativeEngine>>;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -46,7 +57,11 @@ pub struct ServerState {
     upstreams: BTreeMap<String, String>,
     admission: AdmissionController,
     serving_limits: ServingLimits,
+    native_engines: NativeEngineRegistry,
     worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    draining: Arc<AtomicBool>,
+    circuit_breakers: CircuitBreakers,
+    auth_failures: AuthFailureLimiter,
 }
 
 pub fn router(cfg: Config, storage: Storage) -> Router {
@@ -59,7 +74,33 @@ pub fn router_with_serving_limits(
     storage: Storage,
     serving_limits: ServingLimits,
 ) -> Router {
-    router_with_worker_control(cfg, storage, serving_limits, None)
+    router_with_worker_control_and_native_engines(
+        cfg,
+        storage,
+        serving_limits,
+        None,
+        NativeEngineRegistry::new(),
+    )
+}
+
+pub fn router_with_native_engine(
+    cfg: Config,
+    storage: Storage,
+    native_engine: Arc<dyn native::NativeEngine>,
+) -> Router {
+    let limits = ServingLimits::from_config(&cfg);
+    let mut native_engines = NativeEngineRegistry::new();
+    native_engines.insert(native_engine.model_alias().to_string(), native_engine);
+    router_with_worker_control_and_native_engines(cfg, storage, limits, None, native_engines)
+}
+
+pub fn router_with_native_engines(
+    cfg: Config,
+    storage: Storage,
+    native_engines: NativeEngineRegistry,
+) -> Router {
+    let limits = ServingLimits::from_config(&cfg);
+    router_with_worker_control_and_native_engines(cfg, storage, limits, None, native_engines)
 }
 
 pub fn router_with_worker_control(
@@ -68,17 +109,60 @@ pub fn router_with_worker_control(
     serving_limits: ServingLimits,
     worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
 ) -> Router {
+    router_with_worker_control_and_native_engines(
+        cfg,
+        storage,
+        serving_limits,
+        worker_control,
+        NativeEngineRegistry::new(),
+    )
+}
+
+fn router_with_worker_control_and_native_engines(
+    cfg: Config,
+    storage: Storage,
+    serving_limits: ServingLimits,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    native_engines: NativeEngineRegistry,
+) -> Router {
+    router_with_worker_control_native_engine_and_drain(
+        cfg,
+        storage,
+        serving_limits,
+        worker_control,
+        native_engines,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn router_with_worker_control_native_engine_and_drain(
+    cfg: Config,
+    storage: Storage,
+    serving_limits: ServingLimits,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    native_engines: NativeEngineRegistry,
+    draining: Arc<AtomicBool>,
+) -> Router {
     let upstreams = serving_upstreams(&cfg);
     let admission = AdmissionController::new(serving_limits.max_in_flight);
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(serving_limits.max_in_flight.min(128))
+        .build()
+        .expect("reqwest client configuration is valid");
     let cors = cors_layer(&cfg);
     let state = ServerState {
         cfg: Arc::new(cfg),
         storage,
-        client: reqwest::Client::new(),
+        client,
         upstreams,
         admission,
         serving_limits,
+        native_engines,
         worker_control,
+        draining,
+        circuit_breakers: CircuitBreakers::default(),
+        auth_failures: AuthFailureLimiter::default(),
     };
 
     Router::new()
@@ -92,8 +176,29 @@ pub fn router_with_worker_control(
         .route("/v1/local/recommendations", post(local_recommendations))
         .route("/v1/admin/swap", post(admin_swap))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(trace_layer())
         .with_state(Arc::new(state))
+}
+
+fn trace_layer() -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    impl Fn(&axum::http::Request<Body>) -> tracing::Span + Clone,
+> {
+    TraceLayer::new_for_http()
+        .make_span_with(|request: &axum::http::Request<Body>| {
+            let request_id = request
+                .headers()
+                .get(request_id_header_name())
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("generated");
+            tracing::info_span!(
+                "http.request",
+                http.method = %request.method(),
+                http.route = %request.uri().path(),
+                llmctl.request_id = %request_id
+            )
+        })
+        .on_response(DefaultOnResponse::new())
 }
 
 fn cors_layer(cfg: &Config) -> CorsLayer {
@@ -158,7 +263,10 @@ impl ServingLimits {
             DEFAULT_MAX_IN_FLIGHT
         };
 
-        Self::new(max_in_flight, DEFAULT_UPSTREAM_TIMEOUT)
+        Self::new(
+            max_in_flight,
+            Duration::from_secs(cfg.server.upstream_timeout_seconds),
+        )
     }
 
     fn upstream_timeout(&self) -> Duration {
@@ -180,9 +288,17 @@ impl AdmissionController {
         }
     }
 
+    #[cfg(test)]
     fn try_acquire_for(
         &self,
         scope: Option<(String, usize)>,
+    ) -> std::result::Result<AdmissionPermit, AdmissionError> {
+        self.try_acquire_for_all(scope.into_iter().collect())
+    }
+
+    fn try_acquire_for_all(
+        &self,
+        scopes: Vec<(String, usize)>,
     ) -> std::result::Result<AdmissionPermit, AdmissionError> {
         let global = self
             .global
@@ -190,8 +306,9 @@ impl AdmissionController {
             .try_acquire_owned()
             .map_err(|_| AdmissionError::Busy)?;
 
-        let scoped = match scope {
-            Some((scope, limit)) => {
+        let mut scoped_permits = Vec::with_capacity(scopes.len());
+        for (scope, limit) in scopes {
+            let permit = {
                 let semaphore = {
                     let mut scoped = self.scoped.lock().map_err(|_| AdmissionError::Busy)?;
                     scoped
@@ -199,25 +316,23 @@ impl AdmissionController {
                         .or_insert_with(|| Arc::new(Semaphore::new(limit.max(1))))
                         .clone()
                 };
-                Some(
-                    semaphore
-                        .try_acquire_owned()
-                        .map_err(|_| AdmissionError::Busy)?,
-                )
-            }
-            None => None,
-        };
+                semaphore
+                    .try_acquire_owned()
+                    .map_err(|_| AdmissionError::Busy)?
+            };
+            scoped_permits.push(permit);
+        }
 
         Ok(AdmissionPermit {
             _global: global,
-            _scoped: scoped,
+            _scoped: scoped_permits,
         })
     }
 }
 
 struct AdmissionPermit {
     _global: OwnedSemaphorePermit,
-    _scoped: Option<OwnedSemaphorePermit>,
+    _scoped: Vec<OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for AdmissionPermit {
@@ -231,6 +346,154 @@ enum AdmissionError {
     Busy,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CircuitBreakers {
+    states: Arc<Mutex<BTreeMap<String, CircuitBreakerState>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CircuitBreakerState {
+    consecutive_failures: u32,
+    opened_at: Option<Instant>,
+    half_open_probe_in_flight: bool,
+}
+
+impl CircuitBreakers {
+    fn allow_request(&self, upstream: &str, reset_after: Duration) -> bool {
+        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
+        let Some(state) = states.get_mut(upstream) else {
+            return true;
+        };
+        let Some(opened_at) = state.opened_at else {
+            return true;
+        };
+        if opened_at.elapsed() >= reset_after {
+            if state.half_open_probe_in_flight {
+                record_circuit_breaker_state(
+                    upstream,
+                    "half_open_busy",
+                    state.consecutive_failures,
+                );
+                false
+            } else {
+                state.half_open_probe_in_flight = true;
+                record_circuit_breaker_state(upstream, "half_open", state.consecutive_failures);
+                true
+            }
+        } else {
+            record_circuit_breaker_state(upstream, "open", state.consecutive_failures);
+            false
+        }
+    }
+
+    fn record_success(&self, upstream: &str) {
+        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
+        let state = states
+            .entry(upstream.to_string())
+            .or_insert(CircuitBreakerState {
+                consecutive_failures: 0,
+                opened_at: None,
+                half_open_probe_in_flight: false,
+            });
+        state.consecutive_failures = 0;
+        state.opened_at = None;
+        state.half_open_probe_in_flight = false;
+        record_circuit_breaker_state(upstream, "closed", 0);
+    }
+
+    fn record_failure(&self, upstream: &str, threshold: u32) {
+        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
+        let state = states
+            .entry(upstream.to_string())
+            .or_insert(CircuitBreakerState {
+                consecutive_failures: 0,
+                opened_at: None,
+                half_open_probe_in_flight: false,
+            });
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.half_open_probe_in_flight = false;
+        if threshold > 0 && state.consecutive_failures >= threshold {
+            state.opened_at = Some(Instant::now());
+            record_circuit_breaker_state(upstream, "open", state.consecutive_failures);
+        } else {
+            record_circuit_breaker_state(upstream, "closed", state.consecutive_failures);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AuthFailureLimiter {
+    failures: Arc<Mutex<BTreeMap<String, AuthFailureWindow>>>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthFailureWindow {
+    started: Instant,
+    count: u32,
+}
+
+impl AuthFailureLimiter {
+    fn is_limited(&self, key: &str, limit: u32) -> bool {
+        if limit == 0 {
+            return false;
+        }
+        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
+        let window = failures
+            .entry(key.to_string())
+            .or_insert(AuthFailureWindow {
+                started: Instant::now(),
+                count: 0,
+            });
+        if window.started.elapsed() >= Duration::from_secs(60) {
+            window.started = Instant::now();
+            window.count = 0;
+        }
+        window.count >= limit
+    }
+
+    fn record_failure(&self, key: &str, limit: u32) {
+        if limit == 0 {
+            return;
+        }
+        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
+        let window = failures
+            .entry(key.to_string())
+            .or_insert(AuthFailureWindow {
+                started: Instant::now(),
+                count: 0,
+            });
+        if window.started.elapsed() >= Duration::from_secs(60) {
+            window.started = Instant::now();
+            window.count = 0;
+        }
+        window.count = window.count.saturating_add(1);
+        let meter = global::meter(crate::SERVICE_NAME);
+        meter
+            .u64_counter("llmctl_auth_failures_total")
+            .with_description("Failed bearer authentication attempts by throttle state")
+            .build()
+            .add(
+                1,
+                &[
+                    KeyValue::new("limited", window.count >= limit),
+                    KeyValue::new(
+                        "status",
+                        if window.count >= limit {
+                            "limited"
+                        } else {
+                            "failed"
+                        },
+                    ),
+                ],
+            );
+    }
+
+    fn record_success(&self, key: &str) {
+        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
+        failures.remove(key);
+    }
+}
+
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
@@ -241,7 +504,9 @@ async fn livez() -> impl IntoResponse {
 
 async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
     let storage_ready = storage_ready(&state.storage).await;
-    let http_status = if storage_ready {
+    let draining = state.draining.load(Ordering::SeqCst);
+    let ready = storage_ready && !draining;
+    let http_status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -249,25 +514,27 @@ async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
 
     (
         http_status,
-        Json(readiness_status_for(&state.cfg, storage_ready)),
+        Json(readiness_status_for(&state.cfg, storage_ready, draining)),
     )
         .into_response()
 }
 
 pub async fn readiness_status(cfg: &Config, storage: &Storage) -> Value {
-    readiness_status_for(cfg, storage_ready(storage).await)
+    readiness_status_for(cfg, storage_ready(storage).await, false)
 }
 
-fn readiness_status_for(cfg: &Config, storage_ready: bool) -> Value {
+fn readiness_status_for(cfg: &Config, storage_ready: bool, draining: bool) -> Value {
     let aliases: Vec<_> = routed_models(cfg)
         .into_iter()
         .map(|model| model.alias.as_str())
         .collect();
     let worker_plan = StartupPlan::from_config(cfg);
+    let ready = storage_ready && !draining;
 
     json!({
-        "status": if storage_ready { "ready" } else { "unavailable" },
+        "status": if ready { "ready" } else if draining { "draining" } else { "unavailable" },
         "mode": cfg.mode,
+        "draining": draining,
         "models": {
             "configured": aliases.len(),
             "aliases": aliases
@@ -298,9 +565,13 @@ fn is_external_host(host: &str) -> bool {
     !matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
+async fn list_models(
+    State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     let request_id = request_id_from_headers(&headers);
-    let principal = match authenticate(&state.cfg, &headers) {
+    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
             record_audit(
@@ -382,11 +653,12 @@ fn default_search_limit() -> usize {
 
 async fn local_search(
     State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(request): Json<LocalSearchRequest>,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
-    let principal = match authenticate(&state.cfg, &headers) {
+    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
             return with_request_id(
@@ -443,11 +715,12 @@ struct LocalRecommendationRequest {
 
 async fn local_recommendations(
     State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(request): Json<LocalRecommendationRequest>,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
-    let principal = match authenticate(&state.cfg, &headers) {
+    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
             return with_request_id(
@@ -534,11 +807,12 @@ struct AdminSwapRequest {
 
 async fn admin_swap(
     State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(request): Json<AdminSwapRequest>,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
-    let principal = match authenticate(&state.cfg, &headers) {
+    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
             return with_request_id(
@@ -638,14 +912,25 @@ fn replacement_worker(cfg: &Config, replacement: &str) -> Option<PlannedWorker> 
 
 async fn proxy_embeddings(
     State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    proxy_openai_endpoint(state, headers, body, "/v1/embeddings", "embeddings", "chat").await
+    proxy_openai_endpoint(
+        state,
+        connect_info,
+        headers,
+        body,
+        "/v1/embeddings",
+        "embeddings",
+        "chat",
+    )
+    .await
 }
 
 async fn proxy_openai_endpoint(
     state: Arc<ServerState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
     path: &'static str,
@@ -653,7 +938,7 @@ async fn proxy_openai_endpoint(
     required_scope: &'static str,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
-    let principal = match authenticate(&state.cfg, &headers) {
+    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
             return with_request_id(
@@ -694,6 +979,20 @@ async fn proxy_openai_endpoint(
         }
     };
 
+    if !state.circuit_breakers.allow_request(
+        &upstream,
+        Duration::from_secs(state.cfg.server.circuit_breaker_reset_seconds),
+    ) {
+        return with_request_id(
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_circuit_open",
+                "upstream circuit breaker is open".to_string(),
+            ),
+            request_id,
+        );
+    }
+
     let response = match timeout(
         upstream_timeout_budget(&state),
         state
@@ -705,12 +1004,27 @@ async fn proxy_openai_endpoint(
     )
     .await
     {
-        Ok(Ok(response)) => response,
+        Ok(Ok(response)) => {
+            if response.status().is_success() {
+                state.circuit_breakers.record_success(&upstream);
+            } else if should_retry_upstream_status(response.status()) {
+                state
+                    .circuit_breakers
+                    .record_failure(&upstream, state.cfg.server.circuit_breaker_failures);
+            }
+            response
+        }
         Ok(Err(err)) => {
+            state
+                .circuit_breakers
+                .record_failure(&upstream, state.cfg.server.circuit_breaker_failures);
             let (status, code, message, _usage_status) = upstream_request_error(&err);
             return with_request_id(error_response(status, code, message), request_id);
         }
         Err(_) => {
+            state
+                .circuit_breakers
+                .record_failure(&upstream, state.cfg.server.circuit_breaker_failures);
             return with_request_id(
                 error_response(
                     StatusCode::GATEWAY_TIMEOUT,
@@ -762,12 +1076,13 @@ async fn proxy_openai_endpoint(
 
 async fn chat_completions(
     State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
     let started = Instant::now();
-    let principal = match authenticate(&state.cfg, &headers) {
+    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
             record_audit(
@@ -862,8 +1177,8 @@ async fn chat_completions(
         "chat.completions",
     )
     .await;
-    let quota = match check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await {
-        Ok(decision) => decision,
+    let quota_guard = match state.storage.quota_admission_guard().await {
+        Ok(guard) => guard,
         Err(err) => {
             record_audit(
                 &state,
@@ -879,7 +1194,31 @@ async fn chat_completions(
                 error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "quota_error",
-                    err.to_string(),
+                    "quota admission is unavailable".to_string(),
+                ),
+                request_id,
+            );
+        }
+    };
+    let quota = match check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await {
+        Ok(decision) => decision,
+        Err(err) => {
+            let _ = quota_guard.release().await;
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                model,
+                "rejected",
+                json!({ "reason": err.to_string() }),
+            )
+            .await;
+            return with_request_id(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "quota_error",
+                    "quota admission is unavailable".to_string(),
                 ),
                 request_id,
             );
@@ -894,6 +1233,9 @@ async fn chat_completions(
         json!({ "configured_quotas": state.cfg.quotas.len() }),
     )
     .await;
+    if let Err(err) = quota_guard.release().await {
+        tracing::warn!(error = %err, "failed to release quota admission lock");
+    }
 
     if !quota.allowed {
         record_audit(
@@ -929,10 +1271,11 @@ async fn chat_completions(
 
     let admission = match state
         .admission
-        .try_acquire_for(quota_admission_scope(&state.cfg, &principal))
+        .try_acquire_for_all(quota_admission_scopes(&state.cfg, &principal))
     {
         Ok(permit) => permit,
         Err(AdmissionError::Busy) => {
+            record_admission_busy_telemetry(&model, &principal, request.stream);
             record_audit(
                 &state,
                 Some(request_id),
@@ -953,6 +1296,22 @@ async fn chat_completions(
             );
         }
     };
+
+    if matches!(state.cfg.runtime.backend, RuntimeBackend::CandleNative) {
+        return dispatch_native_chat(
+            state,
+            NativeChatContext {
+                request_id,
+                principal,
+                model,
+                upstream_model: route.upstream_alias,
+                started,
+                _admission: admission,
+            },
+            request,
+        )
+        .await;
+    }
 
     let (upstream_response, upstream_alias) = match dispatch_chat_request(
         &state,
@@ -1024,6 +1383,7 @@ async fn chat_completions(
             principal,
             model,
             upstream_model: upstream_alias,
+            upstream_timeout: model_upstream_timeout(&state, &route.requested_alias),
             started,
             admission,
         };
@@ -1034,6 +1394,7 @@ async fn chat_completions(
             principal,
             model,
             upstream_model: upstream_alias,
+            upstream_timeout: model_upstream_timeout(&state, &route.requested_alias),
             started,
             admission,
         };
@@ -1041,20 +1402,333 @@ async fn chat_completions(
     }
 }
 
-fn quota_admission_scope(cfg: &Config, principal: &Principal) -> Option<(String, usize)> {
-    matching_quota_policy(&cfg.quotas, principal).and_then(|quota| {
-        usize::try_from(quota.max_concurrency)
-            .ok()
-            .filter(|limit| *limit > 0)
-            .map(|limit| {
-                let scope = if quota.subject == principal.subject {
-                    format!("subject:{}", principal.subject)
-                } else {
-                    format!("team:{}", principal.team)
-                };
-                (scope, limit)
-            })
-    })
+async fn dispatch_native_chat(
+    state: Arc<ServerState>,
+    context: NativeChatContext,
+    request: ChatCompletionRequest,
+) -> Response {
+    let Some(engine) = state.native_engines.get(&context.upstream_model).cloned() else {
+        return native_chat_runtime_not_ready(&state, context, request.stream).await;
+    };
+
+    let native_request = native::NativeChatRequest {
+        model: context.upstream_model.clone(),
+        messages: request.messages,
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        metadata: native_chat_metadata(request.metadata, &context, request.stream),
+    };
+
+    if request.stream {
+        let native_response = match engine.chat_stream(native_request).await {
+            Ok(response) => response,
+            Err(err) => {
+                return native_chat_runtime_error(&state, context, err).await;
+            }
+        };
+        return native_chat_stream_response(&state, context, native_response).await;
+    }
+
+    let native_response = match engine.chat(native_request).await {
+        Ok(response) => response,
+        Err(err) => {
+            return native_chat_runtime_error(&state, context, err).await;
+        }
+    };
+
+    native_chat_response(&state, context, native_response).await
+}
+
+struct NativeChatContext {
+    request_id: Uuid,
+    principal: Principal,
+    model: String,
+    upstream_model: String,
+    started: Instant,
+    _admission: AdmissionPermit,
+}
+
+fn token_accounting_label(mode: &native::TokenAccountingMode) -> &'static str {
+    match mode {
+        native::TokenAccountingMode::NativeExact => "native-exact",
+        native::TokenAccountingMode::Estimated => "estimated",
+    }
+}
+
+async fn native_chat_response(
+    state: &ServerState,
+    context: NativeChatContext,
+    native_response: native::NativeChatResponse,
+) -> Response {
+    record_usage(
+        state,
+        UsageRecordInput {
+            request_id: context.request_id,
+            principal: &context.principal,
+            model: &context.model,
+            input_tokens: native_response.usage.input_tokens,
+            output_tokens: native_response.usage.output_tokens,
+            latency_ms: elapsed_ms(context.started),
+            status: "ok",
+            accounting_mode: token_accounting_label(&native_response.usage.accounting_mode),
+        },
+    )
+    .await;
+    record_audit(
+        state,
+        Some(context.request_id),
+        context.principal,
+        "chat.completions",
+        context.model.clone(),
+        "ok",
+        json!({
+            "runtime_backend": "candle-native",
+            "token_accounting": native_response.usage.accounting_mode.clone()
+        }),
+    )
+    .await;
+
+    let body = Json(json!({
+        "id": format!("chatcmpl-{}", context.request_id),
+        "object": "chat.completion",
+        "created": Utc::now().timestamp(),
+        "model": native_response.model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": native_response.content
+            },
+            "finish_reason": native_response.finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": native_response.usage.input_tokens,
+            "completion_tokens": native_response.usage.output_tokens,
+            "total_tokens": native_response.usage.total_tokens()
+        }
+    }))
+    .into_response();
+    with_chat_metadata(
+        with_request_id(body, context.request_id),
+        &context.model,
+        &context.upstream_model,
+        "allowed",
+    )
+}
+
+async fn native_chat_stream_response(
+    state: &ServerState,
+    context: NativeChatContext,
+    native_response: native::NativeChatResponse,
+) -> Response {
+    record_usage(
+        state,
+        UsageRecordInput {
+            request_id: context.request_id,
+            principal: &context.principal,
+            model: &context.model,
+            input_tokens: native_response.usage.input_tokens,
+            output_tokens: native_response.usage.output_tokens,
+            latency_ms: elapsed_ms(context.started),
+            status: "ok",
+            accounting_mode: token_accounting_label(&native_response.usage.accounting_mode),
+        },
+    )
+    .await;
+    record_audit(
+        state,
+        Some(context.request_id),
+        context.principal,
+        "chat.completions",
+        context.model.clone(),
+        "ok",
+        json!({
+            "runtime_backend": "candle-native",
+            "stream": true,
+            "token_accounting": native_response.usage.accounting_mode.clone()
+        }),
+    )
+    .await;
+
+    let request_id = context.request_id;
+    let model = native_response.model.clone();
+    let content = native_response.content;
+    let finish_reason = native_response.finish_reason;
+    let stream = async_stream::stream! {
+        if !content.is_empty() {
+            let chunk = json!({
+                "id": format!("chatcmpl-{request_id}"),
+                "object": "chat.completion.chunk",
+                "created": Utc::now().timestamp(),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": content },
+                    "finish_reason": Value::Null
+                }]
+            });
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {chunk}\n\n")));
+        }
+
+        let done_chunk = json!({
+            "id": format!("chatcmpl-{request_id}"),
+            "object": "chat.completion.chunk",
+            "created": Utc::now().timestamp(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason
+            }]
+        });
+        yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {done_chunk}\n\n")));
+        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    let response = build_response(
+        StatusCode::OK,
+        headers,
+        Body::from_stream(stream),
+        context.request_id,
+    );
+    with_chat_metadata(response, &context.model, &context.upstream_model, "allowed")
+}
+
+async fn native_chat_runtime_error(
+    state: &ServerState,
+    context: NativeChatContext,
+    err: anyhow::Error,
+) -> Response {
+    tracing::warn!(error = %err, "native runtime failed");
+    record_usage(
+        state,
+        UsageRecordInput {
+            request_id: context.request_id,
+            principal: &context.principal,
+            model: &context.model,
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: elapsed_ms(context.started),
+            status: "native_runtime_error",
+            accounting_mode: "none",
+        },
+    )
+    .await;
+    record_audit(
+        state,
+        Some(context.request_id),
+        context.principal,
+        "chat.completions",
+        context.model,
+        "error",
+        json!({
+            "reason": "native_runtime_error",
+            "runtime_backend": "candle-native"
+        }),
+    )
+    .await;
+    with_request_id(
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_runtime_error",
+            "native runtime failed to serve chat completions".to_string(),
+        ),
+        context.request_id,
+    )
+}
+
+async fn native_chat_runtime_not_ready(
+    state: &ServerState,
+    context: NativeChatContext,
+    stream: bool,
+) -> Response {
+    record_usage(
+        state,
+        UsageRecordInput {
+            request_id: context.request_id,
+            principal: &context.principal,
+            model: &context.model,
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: elapsed_ms(context.started),
+            status: "native_runtime_not_ready",
+            accounting_mode: "none",
+        },
+    )
+    .await;
+    record_audit(
+        state,
+        Some(context.request_id),
+        context.principal,
+        "chat.completions",
+        context.model,
+        "error",
+        json!({
+            "reason": "native_runtime_not_ready",
+            "runtime_backend": "candle-native",
+            "stream": stream
+        }),
+    )
+    .await;
+    with_request_id(
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_runtime_not_ready",
+            "native runtime is not ready to serve chat completions".to_string(),
+        ),
+        context.request_id,
+    )
+}
+
+fn native_chat_metadata(
+    metadata: Option<Value>,
+    context: &NativeChatContext,
+    stream: bool,
+) -> BTreeMap<String, Value> {
+    let mut metadata: BTreeMap<String, Value> = metadata
+        .and_then(|value| match value {
+            Value::Object(object) => Some(object.into_iter().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    metadata.insert(
+        "llmctl.request_id".to_string(),
+        Value::String(context.request_id.to_string()),
+    );
+    metadata.insert(
+        "llmctl.requested_model".to_string(),
+        Value::String(context.model.clone()),
+    );
+    metadata.insert(
+        "llmctl.upstream_model".to_string(),
+        Value::String(context.upstream_model.clone()),
+    );
+    metadata.insert("llmctl.stream".to_string(), Value::Bool(stream));
+    metadata
+}
+
+fn quota_admission_scopes(cfg: &Config, principal: &Principal) -> Vec<(String, usize)> {
+    let mut scopes = BTreeMap::<String, usize>::new();
+    for quota in matching_quota_policies(&cfg.quotas, principal) {
+        let Ok(limit) = usize::try_from(quota.max_concurrency) else {
+            continue;
+        };
+        if limit == 0 {
+            continue;
+        }
+        let scope = if quota_is_subject_scoped(quota, principal) {
+            format!("subject:{}", principal.subject)
+        } else {
+            format!("team:{}", principal.team)
+        };
+        scopes
+            .entry(scope)
+            .and_modify(|existing| *existing = (*existing).min(limit))
+            .or_insert(limit);
+    }
+    scopes.into_iter().collect()
 }
 
 fn upstream_for_alias(
@@ -1102,10 +1776,23 @@ async fn dispatch_chat_request(
         };
         let body = rewrite_chat_model(original_body, &attempt_route)
             .map_err(DispatchFailure::BadRequest)?;
-        let upstream = upstream_for_alias(state, &alias).map_err(DispatchFailure::NoUpstream)?;
-        let upstream = format!("{upstream}/v1/chat/completions");
+        let upstream_base =
+            upstream_for_alias(state, &alias).map_err(DispatchFailure::NoUpstream)?;
+        if !state.circuit_breakers.allow_request(
+            &upstream_base,
+            Duration::from_secs(state.cfg.server.circuit_breaker_reset_seconds),
+        ) {
+            last_failure = Some(DispatchFailure::Request {
+                status: StatusCode::BAD_GATEWAY,
+                code: "upstream_circuit_open",
+                message: "upstream circuit breaker is open".to_string(),
+                usage_status: "upstream_circuit_open",
+            });
+            continue;
+        }
+        let upstream = format!("{upstream_base}/v1/chat/completions");
         match timeout(
-            upstream_timeout_budget(state),
+            model_upstream_timeout(state, &route.requested_alias),
             state
                 .client
                 .post(upstream)
@@ -1116,6 +1803,10 @@ async fn dispatch_chat_request(
         .await
         {
             Ok(Ok(response)) if should_retry_upstream_status(response.status()) => {
+                state
+                    .circuit_breakers
+                    .record_failure(&upstream_base, state.cfg.server.circuit_breaker_failures);
+                retry_after_delay(&response).await;
                 last_failure = Some(DispatchFailure::Request {
                     status: StatusCode::BAD_GATEWAY,
                     code: "upstream_error",
@@ -1124,8 +1815,16 @@ async fn dispatch_chat_request(
                 });
                 continue;
             }
-            Ok(Ok(response)) => return Ok((response, alias)),
+            Ok(Ok(response)) => {
+                if response.status().is_success() {
+                    state.circuit_breakers.record_success(&upstream_base);
+                }
+                return Ok((response, alias));
+            }
             Ok(Err(err)) => {
+                state
+                    .circuit_breakers
+                    .record_failure(&upstream_base, state.cfg.server.circuit_breaker_failures);
                 let (status, code, message, usage_status) = upstream_request_error(&err);
                 record_upstream_failure(state, request_id, principal, model, started, usage_status)
                     .await;
@@ -1137,6 +1836,9 @@ async fn dispatch_chat_request(
                 });
             }
             Err(_) => {
+                state
+                    .circuit_breakers
+                    .record_failure(&upstream_base, state.cfg.server.circuit_breaker_failures);
                 record_upstream_failure(state, request_id, principal, model, started, "timeout")
                     .await;
                 last_failure = Some(DispatchFailure::Request {
@@ -1158,7 +1860,18 @@ async fn dispatch_chat_request(
 }
 
 fn should_retry_upstream_status(status: StatusCode) -> bool {
-    status.is_server_error()
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+async fn retry_after_delay(response: &reqwest::Response) {
+    let delay = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(2)))
+        .unwrap_or_else(|| Duration::from_millis(100));
+    tokio::time::sleep(delay).await;
 }
 
 struct UpstreamRequestContext {
@@ -1166,6 +1879,7 @@ struct UpstreamRequestContext {
     principal: Principal,
     model: String,
     upstream_model: String,
+    upstream_timeout: Duration,
     started: Instant,
     admission: AdmissionPermit,
 }
@@ -1180,12 +1894,13 @@ async fn json_upstream(
         principal,
         model,
         upstream_model,
+        upstream_timeout,
         started,
         admission: _admission,
     } = context;
     let status = upstream_response.status();
     let headers = response_headers(upstream_response.headers());
-    let bytes = match timeout(upstream_timeout_budget(&state), upstream_response.bytes()).await {
+    let bytes = match timeout(upstream_timeout, upstream_response.bytes()).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(err)) => {
             record_upstream_failure(
@@ -1227,6 +1942,13 @@ async fn json_upstream(
     } else {
         "upstream_error"
     };
+    record_upstream_telemetry(
+        &model,
+        &upstream_model,
+        status.as_u16(),
+        latency_ms,
+        status_text,
+    );
     record_usage(
         &state,
         UsageRecordInput {
@@ -1237,6 +1959,7 @@ async fn json_upstream(
             output_tokens,
             latency_ms,
             status: status_text,
+            accounting_mode: "upstream",
         },
     )
     .await;
@@ -1269,6 +1992,7 @@ async fn stream_upstream(
         principal,
         model,
         upstream_model,
+        upstream_timeout,
         started,
         admission,
     } = context;
@@ -1284,6 +2008,7 @@ async fn stream_upstream(
                 output_tokens: 0,
                 latency_ms: elapsed_ms(started),
                 status: "upstream_error",
+                accounting_mode: "none",
             },
         )
         .await;
@@ -1312,7 +2037,7 @@ async fn stream_upstream(
     let response_model = model.clone();
     let response_upstream_model = upstream_model.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
-    let idle_timeout = upstream_timeout_budget(&state);
+    let idle_timeout = upstream_timeout;
     let stream = async_stream::stream! {
         let _admission = admission;
         let mut input_tokens = 0u64;
@@ -1333,9 +2058,17 @@ async fn stream_upstream(
                             output_tokens,
                             latency_ms: elapsed_ms(started),
                             status: "timeout",
+                            accounting_mode: "upstream",
                         },
                     )
                     .await;
+                    record_upstream_telemetry(
+                        &model,
+                        &upstream_model,
+                        status.as_u16(),
+                        elapsed_ms(started),
+                        "timeout",
+                    );
                     record_audit(
                         &state,
                         Some(request_id),
@@ -1352,10 +2085,48 @@ async fn stream_upstream(
             };
             match chunk {
                 Ok(bytes) => {
-                    let (input, output) = usage_parser.push(&bytes);
-                    input_tokens = input_tokens.saturating_add(input);
-                    output_tokens = output_tokens.saturating_add(output);
-                    yield Ok::<Bytes, std::io::Error>(bytes)
+                    match usage_parser.push(&bytes) {
+                        Ok((input, output)) => {
+                            input_tokens = input_tokens.saturating_add(input);
+                            output_tokens = output_tokens.saturating_add(output);
+                            yield Ok::<Bytes, std::io::Error>(bytes)
+                        }
+                        Err(reason) => {
+                            record_usage(
+                                &state,
+                                UsageRecordInput {
+                                    request_id,
+                                    principal: &principal,
+                                    model: &model,
+                                    input_tokens,
+                                    output_tokens,
+                                    latency_ms: elapsed_ms(started),
+                                    status: "stream_error",
+                                    accounting_mode: "upstream",
+                                },
+                            )
+                            .await;
+                            record_upstream_telemetry(
+                                &model,
+                                &upstream_model,
+                                status.as_u16(),
+                                elapsed_ms(started),
+                                "stream_error",
+                            );
+                            record_audit(
+                                &state,
+                                Some(request_id),
+                                principal.clone(),
+                                "chat.completions",
+                                model.clone(),
+                                "stream_error",
+                                json!({ "status": status.as_u16(), "stream": true, "reason": reason }),
+                            )
+                            .await;
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(reason));
+                            return;
+                        }
+                    }
                 }
                 Err(err) => {
                     record_usage(
@@ -1368,9 +2139,17 @@ async fn stream_upstream(
                             output_tokens,
                             latency_ms: elapsed_ms(started),
                             status: "stream_error",
+                            accounting_mode: "upstream",
                         },
                     )
                     .await;
+                    record_upstream_telemetry(
+                        &model,
+                        &upstream_model,
+                        status.as_u16(),
+                        elapsed_ms(started),
+                        "stream_error",
+                    );
                     record_audit(
                         &state,
                         Some(request_id),
@@ -1396,9 +2175,17 @@ async fn stream_upstream(
                 output_tokens,
                 latency_ms: elapsed_ms(started),
                 status: stream_status(input_tokens, output_tokens),
+                accounting_mode: "upstream",
             },
         )
         .await;
+        record_upstream_telemetry(
+            &model,
+            &upstream_model,
+            status.as_u16(),
+            elapsed_ms(started),
+            stream_status(input_tokens, output_tokens),
+        );
         record_audit(
             &state,
             Some(request_id),
@@ -1425,6 +2212,18 @@ async fn stream_upstream(
 
 fn upstream_timeout_budget(state: &ServerState) -> Duration {
     state.serving_limits.upstream_timeout()
+}
+
+fn model_upstream_timeout(state: &ServerState, alias: &str) -> Duration {
+    state
+        .cfg
+        .server
+        .model_upstream_timeout_seconds
+        .get(alias)
+        .copied()
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| state.serving_limits.upstream_timeout())
+        .max(Duration::from_millis(1))
 }
 
 fn upstream_request_error(
@@ -1473,9 +2272,97 @@ async fn record_upstream_failure(
             output_tokens: 0,
             latency_ms: elapsed_ms(started),
             status,
+            accounting_mode: "none",
         },
     )
     .await;
+    record_upstream_telemetry(model, "unknown", 0, elapsed_ms(started), status);
+}
+
+fn record_admission_busy_telemetry(model: &str, principal: &Principal, stream: bool) {
+    let attributes = [
+        KeyValue::new("llmctl.model", model.to_string()),
+        KeyValue::new("llmctl.actor", principal.subject.clone()),
+        KeyValue::new("llmctl.team", principal.team.clone()),
+        KeyValue::new("llmctl.stream", stream),
+        KeyValue::new("model", model.to_string()),
+        KeyValue::new("team", principal.team.clone()),
+        KeyValue::new("reason", "admission_limit_exceeded"),
+    ];
+    global::meter(crate::SERVICE_NAME)
+        .u64_counter("llmctl_admission_rejections_total")
+        .with_description("Requests rejected because global or scoped admission limits were full")
+        .build()
+        .add(1, &attributes);
+}
+
+fn record_upstream_telemetry(
+    model: &str,
+    upstream_model: &str,
+    status_code: u16,
+    latency_ms: u64,
+    status: &str,
+) {
+    let attributes = [
+        KeyValue::new("llmctl.model", model.to_string()),
+        KeyValue::new("llmctl.upstream_model", upstream_model.to_string()),
+        KeyValue::new("llmctl.status", status.to_string()),
+        KeyValue::new("http.response.status_code", i64::from(status_code)),
+        KeyValue::new("model", model.to_string()),
+        KeyValue::new("upstream_model", upstream_model.to_string()),
+        KeyValue::new("status", slo_status(status)),
+    ];
+    let meter = global::meter(crate::SERVICE_NAME);
+    meter
+        .u64_counter("llmctl_upstream_requests_total")
+        .with_description("Upstream worker requests by routed model and status")
+        .build()
+        .add(1, &attributes);
+    if status != "ok" {
+        meter
+            .u64_counter("llmctl_upstream_errors_total")
+            .with_description("Failed upstream worker requests by routed model and status")
+            .build()
+            .add(1, &attributes);
+    }
+    meter
+        .u64_histogram("llmctl_upstream_latency_ms")
+        .with_description("Upstream worker round-trip or stream duration in milliseconds")
+        .build()
+        .record(latency_ms, &attributes);
+}
+
+fn record_circuit_breaker_state(upstream: &str, state: &str, consecutive_failures: u32) {
+    let attributes = [
+        KeyValue::new("llmctl.upstream", upstream.to_string()),
+        KeyValue::new("llmctl.circuit.state", state.to_string()),
+        KeyValue::new("upstream", upstream.to_string()),
+        KeyValue::new("state", state.to_string()),
+    ];
+    let meter = global::meter(crate::SERVICE_NAME);
+    meter
+        .u64_counter("llmctl_upstream_circuit_state_total")
+        .with_description("Circuit breaker state transitions and observations by upstream")
+        .build()
+        .add(1, &attributes);
+    meter
+        .u64_histogram("llmctl_upstream_circuit_consecutive_failures")
+        .with_description("Observed consecutive upstream failures before circuit reset")
+        .build()
+        .record(u64::from(consecutive_failures), &attributes);
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Metric,
+        TelemetryEventName::CircuitBreaker,
+        Utc::now(),
+        BTreeMap::from([
+            ("llmctl.upstream".to_string(), json!(upstream)),
+            ("llmctl.circuit.state".to_string(), json!(state)),
+            (
+                "llmctl.circuit.consecutive_failures".to_string(),
+                json!(consecutive_failures),
+            ),
+        ]),
+    ));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1644,6 +2531,44 @@ fn authenticate(cfg: &Config, headers: &HeaderMap) -> std::result::Result<Princi
             scopes: key.scopes.clone(),
         })
         .ok_or_else(|| "invalid bearer token".to_string())
+}
+
+fn authenticate_request(
+    state: &ServerState,
+    headers: &HeaderMap,
+    source_key: String,
+) -> std::result::Result<Principal, String> {
+    let key = auth_failure_key(&source_key);
+    if state
+        .auth_failures
+        .is_limited(&key, state.cfg.security.auth_failure_limit_per_minute)
+    {
+        return Err("too many failed authentication attempts; retry later".to_string());
+    }
+
+    match authenticate(&state.cfg, headers) {
+        Ok(principal) => {
+            state.auth_failures.record_success(&key);
+            Ok(principal)
+        }
+        Err(err) => {
+            state
+                .auth_failures
+                .record_failure(&key, state.cfg.security.auth_failure_limit_per_minute);
+            Err(err)
+        }
+    }
+}
+
+fn auth_source_key(connect_info: Option<ConnectInfo<SocketAddr>>) -> String {
+    connect_info
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown-source".to_string())
+}
+
+fn auth_failure_key(source_key: &str) -> String {
+    let digest = Sha256::digest(source_key.as_bytes());
+    format!("{:x}", digest)[..16].to_string()
 }
 
 fn constant_time_eq_case_insensitive(left: &str, right: &str) -> bool {
@@ -1887,6 +2812,7 @@ struct UsageRecordInput<'a> {
     output_tokens: u64,
     latency_ms: u64,
     status: &'a str,
+    accounting_mode: &'a str,
 }
 
 async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
@@ -1905,10 +2831,10 @@ async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
     if let Err(err) = state.storage.insert_usage_event(&event).await {
         tracing::warn!(error = %err, "failed to record usage event");
     }
-    record_usage_telemetry(&event);
+    record_usage_telemetry(&event, input.accounting_mode);
 }
 
-fn record_usage_telemetry(event: &UsageEvent) {
+fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str) {
     emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
         TelemetrySignal::Span,
         TelemetryEventName::RequestRouting,
@@ -1931,6 +2857,10 @@ fn record_usage_telemetry(event: &UsageEvent) {
             ),
             ("llmctl.latency_ms".to_string(), json!(event.latency_ms)),
             ("llmctl.status".to_string(), json!(event.status.as_str())),
+            (
+                "llmctl.token_accounting.mode".to_string(),
+                json!(accounting_mode),
+            ),
         ]),
     ));
     let attributes = [
@@ -1938,8 +2868,29 @@ fn record_usage_telemetry(event: &UsageEvent) {
         KeyValue::new("llmctl.actor", event.actor.clone()),
         KeyValue::new("llmctl.team", event.team.clone()),
         KeyValue::new("llmctl.status", event.status.clone()),
+        KeyValue::new("model", event.model.clone()),
+        KeyValue::new("team", event.team.clone()),
+        KeyValue::new("endpoint", "/v1/chat/completions"),
+        KeyValue::new("status", slo_status(&event.status)),
+        KeyValue::new("token_accounting_mode", accounting_mode.to_string()),
     ];
     let meter = global::meter(crate::SERVICE_NAME);
+    meter
+        .u64_counter("llmctl_requests_total")
+        .with_description(
+            "Total OpenAI-compatible model requests by endpoint, model, team, and status",
+        )
+        .build()
+        .add(1, &attributes);
+    if event.status != "ok" {
+        meter
+            .u64_counter("llmctl_request_errors_total")
+            .with_description(
+                "Failed OpenAI-compatible model requests by endpoint, model, team, and status",
+            )
+            .build()
+            .add(1, &attributes);
+    }
     meter
         .u64_counter("llmctl.tokens.input")
         .with_description("Input tokens reported by model workers")
@@ -1951,10 +2902,17 @@ fn record_usage_telemetry(event: &UsageEvent) {
         .build()
         .add(event.output_tokens, &attributes);
     meter
-        .u64_histogram("llmctl.request.latency_ms")
+        .u64_histogram("llmctl_request_latency_ms")
         .with_description("Model request latency in milliseconds")
         .build()
         .record(event.latency_ms, &attributes);
+    if event.status != "ok" || event.latency_ms > DEFAULT_SLO_LATENCY_MS {
+        meter
+            .u64_counter("llmctl_slo_violations_total")
+            .with_description("Requests that violate the default latency or success SLO")
+            .build()
+            .add(1, &attributes);
+    }
     tracing::info!(
         request_id = %event.request_id,
         model = %event.model,
@@ -1966,6 +2924,14 @@ fn record_usage_telemetry(event: &UsageEvent) {
         status = %event.status,
         "model usage recorded"
     );
+}
+
+fn slo_status(status: &str) -> &'static str {
+    if status == "ok" {
+        "ok"
+    } else {
+        "error"
+    }
 }
 
 fn usage_tokens(bytes: &[u8]) -> (u64, u64) {
@@ -1998,13 +2964,19 @@ struct SseUsageParser {
 }
 
 impl SseUsageParser {
-    fn push(&mut self, bytes: &[u8]) -> (u64, u64) {
+    fn push(&mut self, bytes: &[u8]) -> std::result::Result<(u64, u64), &'static str> {
         let text = String::from_utf8_lossy(bytes);
         self.buffer.push_str(&text);
+        if self.buffer.len() > MAX_SSE_USAGE_BUFFER_BYTES && !self.buffer.contains("\n\n") {
+            return Err("SSE usage parser buffer exceeded maximum frame size");
+        }
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
 
         while let Some(frame_end) = self.buffer.find("\n\n") {
+            if frame_end > MAX_SSE_USAGE_BUFFER_BYTES {
+                return Err("SSE usage parser buffer exceeded maximum frame size");
+            }
             let frame = self.buffer[..frame_end].to_string();
             self.buffer.drain(..frame_end + 2);
             let (input, output) = sse_frame_usage_tokens(&frame);
@@ -2012,13 +2984,13 @@ impl SseUsageParser {
             output_tokens = output_tokens.saturating_add(output);
         }
 
-        (input_tokens, output_tokens)
+        Ok((input_tokens, output_tokens))
     }
 }
 
 #[cfg(test)]
 fn sse_usage_tokens(bytes: &[u8]) -> (u64, u64) {
-    SseUsageParser::default().push(bytes)
+    SseUsageParser::default().push(bytes).expect("valid SSE")
 }
 
 fn sse_frame_usage_tokens(frame: &str) -> (u64, u64) {
@@ -2219,6 +3191,12 @@ fn elapsed_ms(started: Instant) -> u64 {
 struct ChatCompletionRequest {
     model: String,
     #[serde(default)]
+    messages: Vec<native::NativeChatMessage>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
     stream: bool,
     #[serde(default)]
     metadata: Option<Value>,
@@ -2263,6 +3241,39 @@ pub async fn serve_with_storage(cfg: Config, storage: Storage) -> Result<()> {
     serve_with_storage_and_shutdown(cfg, storage, shutdown_signal()).await
 }
 
+pub async fn serve_with_storage_and_native_engine<S>(
+    cfg: Config,
+    storage: Storage,
+    native_engine: Arc<dyn native::NativeEngine>,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let mut native_engines = NativeEngineRegistry::new();
+    native_engines.insert(native_engine.model_alias().to_string(), native_engine);
+    serve_with_storage_and_native_engines(cfg, storage, native_engines, shutdown).await
+}
+
+pub async fn serve_with_storage_and_native_engines<S>(
+    cfg: Config,
+    storage: Storage,
+    native_engines: NativeEngineRegistry,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    serve_with_storage_worker_control_native_engine_and_shutdown(
+        cfg,
+        storage,
+        None,
+        native_engines,
+        shutdown,
+    )
+    .await
+}
+
 pub async fn serve_with_storage_and_shutdown<S>(
     cfg: Config,
     storage: Storage,
@@ -2271,7 +3282,14 @@ pub async fn serve_with_storage_and_shutdown<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
-    serve_with_storage_worker_control_and_shutdown(cfg, storage, None, shutdown).await
+    serve_with_storage_worker_control_native_engine_and_shutdown(
+        cfg,
+        storage,
+        None,
+        NativeEngineRegistry::new(),
+        shutdown,
+    )
+    .await
 }
 
 pub async fn serve_with_storage_worker_control_and_shutdown<S>(
@@ -2283,18 +3301,105 @@ pub async fn serve_with_storage_worker_control_and_shutdown<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    serve_with_storage_worker_control_native_engine_and_shutdown(
+        cfg,
+        storage,
+        worker_control,
+        NativeEngineRegistry::new(),
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_with_storage_worker_control_native_engine_and_shutdown<S>(
+    cfg: Config,
+    storage: Storage,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    native_engines: NativeEngineRegistry,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     let limits = ServingLimits::from_config(&cfg);
-    axum::serve(
+    let draining = Arc::new(AtomicBool::new(false));
+    let shutdown = drain_before_shutdown(
+        shutdown,
+        draining.clone(),
+        cfg.server.graceful_drain_seconds,
+    );
+    let heartbeat = spawn_runtime_heartbeat(&cfg);
+    let result = axum::serve(
         listener,
-        router_with_worker_control(cfg, storage, limits, worker_control),
+        router_with_worker_control_native_engine_and_drain(
+            cfg,
+            storage,
+            limits,
+            worker_control,
+            native_engines,
+            draining,
+        ),
     )
     .with_graceful_shutdown(shutdown)
     .await
-    .context("serve HTTP API")
+    .context("serve HTTP API");
+    if let Some(handle) = heartbeat {
+        handle.abort();
+    }
+    result
+}
+
+async fn drain_before_shutdown<S>(shutdown: S, draining: Arc<AtomicBool>, drain_seconds: u64)
+where
+    S: Future<Output = ()>,
+{
+    shutdown.await;
+    draining.store(true, Ordering::SeqCst);
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Metric,
+        TelemetryEventName::RuntimeHeartbeat,
+        Utc::now(),
+        BTreeMap::from([
+            ("llmctl.server.draining".to_string(), json!(true)),
+            (
+                "llmctl.server.graceful_drain_seconds".to_string(),
+                json!(drain_seconds),
+            ),
+        ]),
+    ));
+    if drain_seconds > 0 {
+        tokio::time::sleep(Duration::from_secs(drain_seconds)).await;
+    }
+}
+
+fn spawn_runtime_heartbeat(cfg: &Config) -> Option<JoinHandle<()>> {
+    let interval_seconds = cfg.runtime.heartbeat_interval_seconds;
+    if interval_seconds == 0 {
+        return None;
+    }
+
+    let cfg = cfg.clone();
+    Some(tokio::spawn(async move {
+        emit_runtime_heartbeat(&cfg);
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
+            emit_runtime_heartbeat(&cfg);
+        }
+    }))
+}
+
+fn emit_runtime_heartbeat(cfg: &Config) {
+    let heartbeat = native::heartbeat_from_config(cfg);
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Metric,
+        TelemetryEventName::RuntimeHeartbeat,
+        Utc::now(),
+        heartbeat.safe_telemetry_attributes(),
+    ));
 }
 
 pub async fn shutdown_signal() {
@@ -2370,7 +3475,7 @@ data: [DONE]
 
         assert_eq!(
             parser.push(br#"data: {"choices":[],"usage":{"prompt_tokens":7"#),
-            (0, 0)
+            Ok((0, 0))
         );
         assert_eq!(
             parser.push(
@@ -2378,8 +3483,57 @@ data: [DONE]
 
 "#
             ),
-            (7, 9)
+            Ok((7, 9))
         );
+    }
+
+    #[test]
+    fn sse_usage_parser_rejects_unbounded_partial_frames() {
+        let mut parser = SseUsageParser::default();
+        let oversized = vec![b'a'; MAX_SSE_USAGE_BUFFER_BYTES + 1];
+        assert!(parser.push(&oversized).is_err());
+    }
+
+    #[test]
+    fn sse_usage_parser_rejects_oversized_complete_frames() {
+        let mut parser = SseUsageParser::default();
+        let mut oversized = vec![b'a'; MAX_SSE_USAGE_BUFFER_BYTES + 1];
+        oversized.extend_from_slice(b"\n\n");
+        assert!(parser.push(&oversized).is_err());
+    }
+
+    #[test]
+    fn readiness_status_reports_draining_as_not_ready() {
+        let status = readiness_status_for(&Config::default(), true, true);
+        assert_eq!(status["status"], "draining");
+        assert_eq!(status["draining"], true);
+    }
+
+    #[test]
+    fn auth_failure_limiter_blocks_after_configured_window_limit() {
+        let limiter = AuthFailureLimiter::default();
+        assert!(!limiter.is_limited("bad-token", 2));
+        limiter.record_failure("bad-token", 2);
+        assert!(!limiter.is_limited("bad-token", 2));
+        limiter.record_failure("bad-token", 2);
+        assert!(limiter.is_limited("bad-token", 2));
+        limiter.record_success("bad-token");
+        assert!(!limiter.is_limited("bad-token", 2));
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold_and_half_opens_after_reset() {
+        let breakers = CircuitBreakers::default();
+        let upstream = "http://127.0.0.1:18765";
+        assert!(breakers.allow_request(upstream, Duration::from_secs(30)));
+        breakers.record_failure(upstream, 2);
+        assert!(breakers.allow_request(upstream, Duration::from_secs(30)));
+        breakers.record_failure(upstream, 2);
+        assert!(!breakers.allow_request(upstream, Duration::from_secs(30)));
+        assert!(breakers.allow_request(upstream, Duration::from_secs(0)));
+        assert!(!breakers.allow_request(upstream, Duration::from_secs(0)));
+        breakers.record_success(upstream);
+        assert!(breakers.allow_request(upstream, Duration::from_secs(30)));
     }
 
     #[test]
@@ -2471,6 +3625,44 @@ data: [DONE]
     }
 
     #[test]
+    fn quota_admission_scopes_include_subject_and_team_limits() {
+        let cfg = Config {
+            quotas: vec![
+                crate::config::QuotaConfig {
+                    subject: "alice".to_string(),
+                    team: "platform".to_string(),
+                    requests_per_minute: 10,
+                    tokens_per_day: 100,
+                    max_concurrency: 2,
+                    allowed_models: vec!["llama".to_string()],
+                },
+                crate::config::QuotaConfig {
+                    subject: "team-default".to_string(),
+                    team: "platform".to_string(),
+                    requests_per_minute: 10,
+                    tokens_per_day: 100,
+                    max_concurrency: 1,
+                    allowed_models: vec!["llama".to_string()],
+                },
+            ],
+            ..Default::default()
+        };
+        let principal = Principal {
+            subject: "alice".to_string(),
+            team: "platform".to_string(),
+            scopes: vec!["chat".to_string()],
+        };
+
+        assert_eq!(
+            quota_admission_scopes(&cfg, &principal),
+            vec![
+                ("subject:alice".to_string(), 2),
+                ("team:platform".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
     fn admission_controller_rejects_when_in_flight_limit_is_full() {
         let controller = AdmissionController::new(1);
         let first = controller.try_acquire_for(None).expect("first permit");
@@ -2482,6 +3674,41 @@ data: [DONE]
 
         drop(first);
         assert!(controller.try_acquire_for(None).is_ok());
+    }
+
+    #[test]
+    fn admission_controller_applies_all_scoped_limits() {
+        let controller = AdmissionController::new(8);
+        let first = controller
+            .try_acquire_for_all(vec![
+                ("subject:alice".to_string(), 2),
+                ("team:platform".to_string(), 1),
+            ])
+            .expect("scoped permit");
+
+        assert_eq!(
+            controller
+                .try_acquire_for_all(vec![
+                    ("subject:alice".to_string(), 2),
+                    ("team:platform".to_string(), 1),
+                ])
+                .unwrap_err(),
+            AdmissionError::Busy
+        );
+        assert!(controller
+            .try_acquire_for_all(vec![
+                ("subject:alice".to_string(), 2),
+                ("team:research".to_string(), 1),
+            ])
+            .is_ok());
+
+        drop(first);
+        assert!(controller
+            .try_acquire_for_all(vec![
+                ("subject:alice".to_string(), 2),
+                ("team:platform".to_string(), 1),
+            ])
+            .is_ok());
     }
 
     #[test]
@@ -2608,6 +3835,7 @@ data: [DONE]
         let storage = Storage::in_memory().await.expect("storage");
         let mut cfg = Config::default();
         cfg.server.port = 0;
+        cfg.server.graceful_drain_seconds = 0;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         let server = tokio::spawn(serve_with_storage_and_shutdown(cfg, storage, async move {

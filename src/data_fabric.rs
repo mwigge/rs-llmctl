@@ -13,37 +13,58 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+pub const DEFAULT_ARROW_BATCH_ROWS: usize = 8192;
+
 pub fn write_arrow_ipc(path: &Path, contract: &DataContract, rows: &[Value]) -> Result<u64> {
-    let batch = record_batch(contract, rows)?;
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut writer = FileWriter::try_new(file, batch.schema().as_ref())?;
-    writer.write(&batch)?;
+    let schema = arrow_schema(contract);
+    let mut writer = FileWriter::try_new(file, schema.as_ref())?;
+    if rows.is_empty() {
+        writer.write(&record_batch_with_schema(contract, &schema, rows)?)?;
+    } else {
+        for chunk in rows.chunks(DEFAULT_ARROW_BATCH_ROWS) {
+            writer.write(&record_batch_with_schema(contract, &schema, chunk)?)?;
+        }
+    }
     writer.finish()?;
     Ok(rows.len() as u64)
 }
 
 pub fn write_parquet(path: &Path, contract: &DataContract, rows: &[Value]) -> Result<u64> {
-    let batch = record_batch(contract, rows)?;
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
-    writer.write(&batch)?;
+    let schema = arrow_schema(contract);
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+    if rows.is_empty() {
+        writer.write(&record_batch_with_schema(contract, &schema, rows)?)?;
+    } else {
+        for chunk in rows.chunks(DEFAULT_ARROW_BATCH_ROWS) {
+            writer.write(&record_batch_with_schema(contract, &schema, chunk)?)?;
+        }
+    }
     writer.close()?;
     Ok(rows.len() as u64)
 }
 
-fn record_batch(contract: &DataContract, rows: &[Value]) -> Result<RecordBatch> {
+fn arrow_schema(contract: &DataContract) -> Arc<Schema> {
     let fields = contract
         .fields
         .iter()
         .map(|field| Field::new(field.name, arrow_type(field.data_type), field.nullable))
         .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(fields));
+    Arc::new(Schema::new(fields))
+}
+
+fn record_batch_with_schema(
+    contract: &DataContract,
+    schema: &Arc<Schema>,
+    rows: &[Value],
+) -> Result<RecordBatch> {
     let columns = contract
         .fields
         .iter()
         .map(|field| array_for_field(field.name, field.data_type, rows))
         .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema, columns)?)
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
 fn arrow_type(data_type: &str) -> DataType {

@@ -3,8 +3,8 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
-fn llmctld() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_llmctld"))
+fn llmctl() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_llmctl"))
 }
 
 fn write_config(dir: &TempDir) -> std::path::PathBuf {
@@ -22,6 +22,9 @@ port = 8765
 worker_base_port = 18765
 llama_server = "/usr/local/bin/llama-server"
 context_size = 4096
+
+[runtime]
+backend = "llama-server"
 
 [security]
 production = false
@@ -53,16 +56,34 @@ weight = 10
 }
 
 #[test]
-fn daemon_dry_run_validates_storage_and_prints_startup_plan_json() {
+fn server_check_validates_storage_and_server_plan_prints_startup_plan_json() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
 
-    let output = llmctld()
+    let check = llmctl()
         .arg("--config")
         .arg(&config)
-        .arg("--dry-run")
+        .arg("server")
+        .arg("check")
         .output()
-        .expect("run llmctld dry-run");
+        .expect("run llmctl server check");
+    assert!(
+        check.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        check.status,
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(dir.path().join("state").join("llmctl.db").exists());
+    assert!(dir.path().join("models").exists());
+
+    let output = llmctl()
+        .arg("--config")
+        .arg(&config)
+        .arg("server")
+        .arg("plan")
+        .output()
+        .expect("run llmctl server plan");
 
     assert!(
         output.status.success(),
@@ -82,12 +103,10 @@ fn daemon_dry_run_validates_storage_and_prints_startup_plan_json() {
         "/usr/local/bin/llama-server"
     );
     assert_eq!(plan["workers"][0]["command"]["args"][0], "--host");
-    assert!(dir.path().join("state").join("llmctl.db").exists());
-    assert!(dir.path().join("models").exists());
 }
 
 #[test]
-fn daemon_dry_run_rejects_insecure_external_bind() {
+fn server_security_check_rejects_insecure_external_bind() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
     let body = fs::read_to_string(&config)
@@ -95,12 +114,13 @@ fn daemon_dry_run_rejects_insecure_external_bind() {
         .replace("host = \"127.0.0.1\"", "host = \"0.0.0.0\"");
     fs::write(&config, body).expect("write insecure config");
 
-    let output = llmctld()
+    let output = llmctl()
         .arg("--config")
         .arg(&config)
-        .arg("--dry-run")
+        .arg("server")
+        .arg("security-check")
         .output()
-        .expect("run llmctld dry-run");
+        .expect("run llmctl server security-check");
 
     assert!(
         !output.status.success(),

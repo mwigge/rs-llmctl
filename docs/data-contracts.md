@@ -49,6 +49,11 @@ Binary exports require a concrete `--dataset` so the writer can apply a stable
 schema. `--dataset all` remains JSON-only because it is an envelope-style
 object, not one rectangular table.
 
+Model inventory exports are client-safe by design. The `models` contract and
+full JSON data export include aliases, roles, weights, and timestamps, but they
+do not include local filesystem paths. Arrow IPC and Parquet writers emit rows
+in bounded batches instead of constructing one unbounded table in memory.
+
 ## Canonical Evidence
 
 Report envelopes are still the canonical evidence mechanism for signed audit

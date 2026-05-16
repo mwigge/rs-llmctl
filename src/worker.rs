@@ -1,6 +1,13 @@
 use crate::config::{Config, ModelConfig, ResourceConfig, ServerConfig};
+use crate::observability::{
+    emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
+};
+use crate::resources::{budget_plan, snapshot, ResourceLimitPlan};
+use crate::runtime::RuntimeBackend;
+use chrono::Utc;
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -73,6 +80,53 @@ impl WorkerBackend {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerDeviceSelection {
+    pub device_index: Option<u32>,
+    pub selection: String,
+}
+
+impl WorkerDeviceSelection {
+    pub fn cpu() -> Self {
+        Self {
+            device_index: None,
+            selection: "cpu-only".to_string(),
+        }
+    }
+
+    pub fn first_visible_gpu() -> Self {
+        Self {
+            device_index: Some(0),
+            selection: "first-visible-gpu".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerExecutionPlan {
+    pub backend: WorkerBackend,
+    pub device: WorkerDeviceSelection,
+    pub gpu_layers: u32,
+}
+
+impl WorkerExecutionPlan {
+    pub fn cpu() -> Self {
+        Self::from_backend(&WorkerBackend::Cpu)
+    }
+
+    pub fn from_backend(backend: &WorkerBackend) -> Self {
+        Self {
+            backend: backend.clone(),
+            device: if matches!(backend, WorkerBackend::Cpu) {
+                WorkerDeviceSelection::cpu()
+            } else {
+                WorkerDeviceSelection::first_visible_gpu()
+            },
+            gpu_layers: backend.gpu_layers(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub id: WorkerId,
     pub model: ModelConfig,
@@ -113,13 +167,32 @@ pub struct CommandSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum WorkerLaunchPlan {
+    InProcess {
+        backend: RuntimeBackend,
+        engine: String,
+        implemented: bool,
+    },
+    ExternalProcess {
+        backend: RuntimeBackend,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedWorker {
     pub worker: WorkerSpec,
+    #[serde(default = "WorkerLaunchPlan::llama_server")]
+    pub launch: WorkerLaunchPlan,
+    #[serde(default = "WorkerExecutionPlan::cpu")]
+    pub execution: WorkerExecutionPlan,
     pub command: CommandSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupPlan {
+    #[serde(default)]
+    pub resource_limits: ResourceLimitPlan,
     pub workers: Vec<PlannedWorker>,
 }
 
@@ -156,14 +229,26 @@ impl StartupPlan {
                     &cfg.resources,
                     port_offset,
                 );
-                let command =
-                    LlamaServerCommand::new(cfg.server.llama_server.clone(), worker.clone())
+                match cfg.runtime.backend {
+                    RuntimeBackend::CandleNative => PlannedWorker::in_process_candle_native(worker),
+                    RuntimeBackend::LlamaServer => {
+                        let command = LlamaServerCommand::new(
+                            cfg.server.llama_server.clone(),
+                            worker.clone(),
+                        )
                         .build();
-                PlannedWorker { worker, command }
+                        PlannedWorker::external_llama_server(worker, command)
+                    }
+                }
             })
             .collect();
 
-        Self { workers }
+        let resource_limits = budget_plan(&snapshot(&cfg.resources), cfg.resources.budget).limits;
+
+        Self {
+            resource_limits,
+            workers,
+        }
     }
 
     pub fn diff(&self, next: &Self) -> PlanDiff {
@@ -185,7 +270,7 @@ impl StartupPlan {
         let mut unchanged = Vec::new();
         for (alias, old_worker) in &old_workers {
             if let Some(new_worker) = new_workers.get(alias) {
-                if old_worker.command == new_worker.command {
+                if old_worker == new_worker {
                     unchanged.push(WorkerId::new(alias.clone()));
                 } else {
                     changed.push(WorkerId::new(alias.clone()));
@@ -208,6 +293,49 @@ impl StartupPlan {
     }
 }
 
+impl WorkerLaunchPlan {
+    pub fn candle_native() -> Self {
+        Self::InProcess {
+            backend: RuntimeBackend::CandleNative,
+            engine: "candle-native".to_string(),
+            implemented: true,
+        }
+    }
+
+    pub fn llama_server() -> Self {
+        Self::ExternalProcess {
+            backend: RuntimeBackend::LlamaServer,
+        }
+    }
+
+    pub fn is_in_process(&self) -> bool {
+        matches!(self, Self::InProcess { .. })
+    }
+}
+
+impl PlannedWorker {
+    pub fn in_process_candle_native(worker: WorkerSpec) -> Self {
+        let command = CommandSpec::in_process_placeholder(&worker);
+        let execution = WorkerExecutionPlan::from_backend(&worker.backend);
+        Self {
+            worker,
+            launch: WorkerLaunchPlan::candle_native(),
+            execution,
+            command,
+        }
+    }
+
+    pub fn external_llama_server(worker: WorkerSpec, command: CommandSpec) -> Self {
+        let execution = WorkerExecutionPlan::from_backend(&worker.backend);
+        Self {
+            worker,
+            launch: WorkerLaunchPlan::llama_server(),
+            execution,
+            command,
+        }
+    }
+}
+
 fn workers_by_alias(workers: &[PlannedWorker]) -> BTreeMap<String, &PlannedWorker> {
     workers
         .iter()
@@ -216,6 +344,19 @@ fn workers_by_alias(workers: &[PlannedWorker]) -> BTreeMap<String, &PlannedWorke
 }
 
 impl CommandSpec {
+    fn in_process_placeholder(spec: &WorkerSpec) -> Self {
+        Self {
+            program: PathBuf::from("<in-process:candle-native>"),
+            args: vec![
+                "--model".to_string(),
+                spec.model.path.display().to_string(),
+                "--ctx-size".to_string(),
+                spec.context_size.to_string(),
+            ],
+            env: Vec::new(),
+        }
+    }
+
     pub fn into_tokio_command(self) -> Command {
         let mut command = Command::new(self.program);
         command.args(self.args);
@@ -362,6 +503,12 @@ impl WorkerRunner for TokioWorkerRunner {
         planned: &'a PlannedWorker,
     ) -> BoxFuture<'a, Result<SpawnedWorker, WorkerRunnerError>> {
         async move {
+            if planned.launch.is_in_process() {
+                return Err(WorkerRunnerError::new(
+                    "candle-native runtime is planned as an in-process worker, but the engine implementation is not available yet",
+                ));
+            }
+
             let child = planned.command.clone().into_tokio_command().spawn()?;
             let pid = child.id().unwrap_or_default();
             self.children.insert(planned.worker.id.clone(), child);
@@ -466,6 +613,9 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
                 last_error: None,
             },
         );
+        if let Some(status) = self.statuses.get(&worker_id) {
+            emit_worker_lifecycle_transition(status, WorkerState::Stopped);
+        }
 
         match self.runner.spawn(planned).await {
             Ok(spawned) => {
@@ -556,9 +706,39 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
             .statuses
             .entry(worker_id.clone())
             .or_insert_with(|| WorkerStatus::new(worker_id.clone()));
+        let previous = status.state;
         update(status);
-        status.clone()
+        let updated = status.clone();
+        if previous != updated.state {
+            emit_worker_lifecycle_transition(&updated, previous);
+        }
+        updated
     }
+}
+
+fn emit_worker_lifecycle_transition(status: &WorkerStatus, previous: WorkerState) {
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Span,
+        TelemetryEventName::WorkerLifecycle,
+        Utc::now(),
+        BTreeMap::from([
+            (
+                "llmctl.worker.id".to_string(),
+                json!(status.worker_id.as_str()),
+            ),
+            ("llmctl.worker.previous_state".to_string(), json!(previous)),
+            ("llmctl.worker.state".to_string(), json!(status.state)),
+            (
+                "llmctl.worker.restart_count".to_string(),
+                json!(status.restart_count),
+            ),
+            ("llmctl.worker.pid".to_string(), json!(status.pid)),
+            (
+                "llmctl.worker.failed".to_string(),
+                json!(status.state == WorkerState::Failed),
+            ),
+        ]),
+    ));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,7 +913,14 @@ mod tests {
             env: vec![("API_TOKEN".to_string(), "super-secret".to_string())],
         };
 
-        PlannedWorker { worker, command }
+        PlannedWorker::external_llama_server(worker, command)
+    }
+
+    fn startup_plan(workers: Vec<PlannedWorker>) -> StartupPlan {
+        StartupPlan {
+            resource_limits: ResourceLimitPlan::default(),
+            workers,
+        }
     }
 
     #[derive(Debug, Default)]
@@ -889,9 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_starts_all_workers_and_reports_runtime_status() {
-        let plan = StartupPlan {
-            workers: vec![planned_worker("chat"), planned_worker("coder")],
-        };
+        let plan = startup_plan(vec![planned_worker("chat"), planned_worker("coder")]);
         let runner = FakeRunner {
             next_pid: 5000,
             ..FakeRunner::default()
@@ -913,9 +1098,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_records_spawn_failures_without_leaking_command_env() {
-        let plan = StartupPlan {
-            workers: vec![planned_worker("chat")],
-        };
+        let plan = startup_plan(vec![planned_worker("chat")]);
         let runner = FakeRunner {
             fail_spawn_for: vec![WorkerId::new("chat")],
             ..FakeRunner::default()
@@ -935,9 +1118,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_stops_worker_when_readiness_probe_fails() {
-        let plan = StartupPlan {
-            workers: vec![planned_worker("chat")],
-        };
+        let plan = startup_plan(vec![planned_worker("chat")]);
         let runner = FakeRunner {
             next_pid: 6000,
             fail_ready_for: vec![WorkerId::new("chat")],
@@ -960,9 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_drains_and_stops_running_workers() {
         let worker = planned_worker("chat");
-        let plan = StartupPlan {
-            workers: vec![worker.clone()],
-        };
+        let plan = startup_plan(vec![worker.clone()]);
         let mut supervisor = WorkerSupervisor::new(FakeRunner {
             next_pid: 7000,
             ..FakeRunner::default()
@@ -981,9 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_restart_stops_then_starts_worker_and_increments_count() {
         let worker = planned_worker("chat");
-        let plan = StartupPlan {
-            workers: vec![worker.clone()],
-        };
+        let plan = startup_plan(vec![worker.clone()]);
         let mut supervisor = WorkerSupervisor::new(FakeRunner {
             next_pid: 8000,
             ..FakeRunner::default()
@@ -1002,9 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_restart_does_not_spawn_when_stop_fails() {
         let worker = planned_worker("chat");
-        let plan = StartupPlan {
-            workers: vec![worker.clone()],
-        };
+        let plan = startup_plan(vec![worker.clone()]);
         let mut supervisor = WorkerSupervisor::new(FakeRunner {
             next_pid: 9000,
             fail_stop_for: vec![WorkerId::new("chat")],
@@ -1023,9 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_stop_all_cleans_up_every_known_worker() {
-        let plan = StartupPlan {
-            workers: vec![planned_worker("chat"), planned_worker("coder")],
-        };
+        let plan = startup_plan(vec![planned_worker("chat"), planned_worker("coder")]);
         let mut supervisor = WorkerSupervisor::new(FakeRunner {
             next_pid: 10_000,
             ..FakeRunner::default()
@@ -1053,9 +1226,7 @@ mod tests {
             ..FakeRunner::default()
         });
         supervisor
-            .start_all(&StartupPlan {
-                workers: vec![active.clone()],
-            })
+            .start_all(&startup_plan(vec![active.clone()]))
             .await;
 
         let execution = supervisor
@@ -1092,9 +1263,7 @@ mod tests {
             ..FakeRunner::default()
         });
         supervisor
-            .start_all(&StartupPlan {
-                workers: vec![active.clone()],
-            })
+            .start_all(&startup_plan(vec![active.clone()]))
             .await;
 
         let execution = supervisor
@@ -1132,9 +1301,7 @@ mod tests {
             ..FakeRunner::default()
         });
         supervisor
-            .start_all(&StartupPlan {
-                workers: vec![active.clone()],
-            })
+            .start_all(&startup_plan(vec![active.clone()]))
             .await;
 
         let execution = supervisor
@@ -1199,6 +1366,10 @@ mod tests {
     #[test]
     fn startup_plan_builds_cpu_only_commands_for_configured_models() {
         let cfg = crate::config::Config {
+            runtime: crate::config::RuntimeConfig {
+                backend: RuntimeBackend::LlamaServer,
+                ..crate::config::RuntimeConfig::default()
+            },
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 worker_base_port: 19000,
@@ -1219,9 +1390,34 @@ mod tests {
         };
 
         let plan = StartupPlan::from_config(&cfg);
+        let rendered = serde_json::to_value(&plan).expect("startup plan serializes");
 
         assert_eq!(plan.workers.len(), 2);
+        assert!(rendered["resource_limits"]["systemd"]["CPUQuota"]
+            .as_str()
+            .expect("CPUQuota")
+            .ends_with('%'));
+        assert!(
+            rendered["resource_limits"]["systemd"]["MemoryMax"]
+                .as_u64()
+                .expect("MemoryMax")
+                > 0
+        );
+        assert!(rendered["resource_limits"]["systemd"]["unit_properties"]
+            .as_array()
+            .expect("unit properties")
+            .iter()
+            .any(|property| property == "CPUAccounting=true"));
+        assert!(rendered["resource_limits"]["systemd"]["systemd_run_args"]
+            .as_array()
+            .expect("systemd-run args")
+            .iter()
+            .any(|property| property
+                .as_str()
+                .expect("systemd-run arg")
+                .starts_with("--property=MemoryMax=")));
         assert_eq!(plan.workers[0].worker.id, WorkerId::new("chat"));
+        assert_eq!(plan.workers[0].launch, WorkerLaunchPlan::llama_server());
         assert_eq!(plan.workers[0].worker.port, 19000);
         assert_eq!(plan.workers[0].worker.backend, WorkerBackend::Cpu);
         assert_eq!(
@@ -1251,6 +1447,10 @@ mod tests {
     #[test]
     fn startup_plan_selects_gpu_backend_commands_from_resources() {
         let cfg = crate::config::Config {
+            runtime: crate::config::RuntimeConfig {
+                backend: RuntimeBackend::LlamaServer,
+                ..crate::config::RuntimeConfig::default()
+            },
             server: ServerConfig {
                 worker_base_port: 19100,
                 llama_server: "llama-server".to_string(),
@@ -1268,9 +1468,21 @@ mod tests {
         let plan = StartupPlan::from_config(&cfg);
 
         assert_eq!(plan.workers.len(), 1);
+        assert_eq!(plan.workers[0].launch, WorkerLaunchPlan::llama_server());
         assert_eq!(
             plan.workers[0].worker.backend,
             WorkerBackend::Nvidia { gpu_layers: 99 }
+        );
+        assert_eq!(
+            plan.workers[0].execution,
+            WorkerExecutionPlan {
+                backend: WorkerBackend::Nvidia { gpu_layers: 99 },
+                device: WorkerDeviceSelection {
+                    device_index: Some(0),
+                    selection: "first-visible-gpu".to_string(),
+                },
+                gpu_layers: 99,
+            }
         );
         assert_eq!(
             plan.workers[0].command.env,
@@ -1283,8 +1495,54 @@ mod tests {
     }
 
     #[test]
+    fn startup_plan_defaults_to_in_process_candle_native() {
+        let cfg = crate::config::Config {
+            models: vec![model("chat", "/models/chat.gguf")],
+            ..Default::default()
+        };
+
+        let plan = StartupPlan::from_config(&cfg);
+
+        assert_eq!(plan.workers.len(), 1);
+        assert_eq!(
+            plan.workers[0].launch,
+            WorkerLaunchPlan::InProcess {
+                backend: RuntimeBackend::CandleNative,
+                engine: "candle-native".to_string(),
+                implemented: true,
+            }
+        );
+        assert_eq!(
+            plan.workers[0].command.program,
+            PathBuf::from("<in-process:candle-native>")
+        );
+    }
+
+    #[tokio::test]
+    async fn candle_native_placeholder_fails_clearly_if_started() {
+        let cfg = crate::config::Config {
+            models: vec![model("chat", "/models/chat.gguf")],
+            ..Default::default()
+        };
+        let plan = StartupPlan::from_config(&cfg);
+        let mut supervisor = WorkerSupervisor::new(TokioWorkerRunner::new());
+
+        let statuses = supervisor.start_all(&plan).await;
+
+        assert_eq!(statuses[0].worker_id, WorkerId::new("chat"));
+        assert_eq!(statuses[0].pid, None);
+        assert_eq!(statuses[0].state, WorkerState::Failed);
+        assert!(statuses[0]
+            .last_error
+            .as_deref()
+            .expect("last error")
+            .contains("candle-native runtime is planned as an in-process worker"));
+    }
+
+    #[test]
     fn startup_plan_diff_reports_added_removed_and_changed_worker_aliases() {
         let old = StartupPlan {
+            resource_limits: ResourceLimitPlan::default(),
             workers: vec![
                 PlannedWorker {
                     worker: WorkerSpec {
@@ -1295,6 +1553,8 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
+                    launch: WorkerLaunchPlan::llama_server(),
+                    execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
                         program: PathBuf::from("llama-server"),
                         args: vec!["--model".to_string(), "/models/chat-v1.gguf".to_string()],
@@ -1310,6 +1570,8 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
+                    launch: WorkerLaunchPlan::llama_server(),
+                    execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
                         program: PathBuf::from("llama-server"),
                         args: vec!["--model".to_string(), "/models/embed.gguf".to_string()],
@@ -1319,6 +1581,7 @@ mod tests {
             ],
         };
         let new = StartupPlan {
+            resource_limits: ResourceLimitPlan::default(),
             workers: vec![
                 PlannedWorker {
                     worker: WorkerSpec {
@@ -1329,6 +1592,8 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
+                    launch: WorkerLaunchPlan::llama_server(),
+                    execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
                         program: PathBuf::from("llama-server"),
                         args: vec!["--model".to_string(), "/models/chat-v2.gguf".to_string()],
@@ -1344,6 +1609,8 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
+                    launch: WorkerLaunchPlan::llama_server(),
+                    execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
                         program: PathBuf::from("llama-server"),
                         args: vec!["--model".to_string(), "/models/coder.gguf".to_string()],

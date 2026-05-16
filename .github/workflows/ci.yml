@@ -38,13 +38,15 @@ jobs:
         run: cargo test --all-targets --all-features
 
       - name: Build release binaries
-        run: cargo build --release --bins
+        run: cargo build --release --bin llmctl
 
       - name: Generate release checksums
         run: packaging/generate-checksums.sh
 
-      - name: Upload release checksums
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-checksums
-          path: SHA256SUMS
+          name: release-artifacts
+          path: |
+            dist/rs-llmctl-*.tar.gz
+            dist/SHA256SUMS

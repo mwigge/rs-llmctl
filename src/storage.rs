@@ -5,10 +5,15 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::any::{install_default_drivers, AnyPoolOptions};
-use sqlx::{AnyPool, Row};
+use sqlx::pool::PoolConnection;
+use sqlx::{Any, AnyPool, Row};
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
+
+const QUOTA_ADVISORY_LOCK_KEY: i64 = 0x6c6c_6d63_746c;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -299,6 +304,37 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
 pub struct Storage {
     pool: AnyPool,
     dialect: SqlDialect,
+    quota_admission_lock: Arc<AsyncMutex<()>>,
+}
+
+pub struct QuotaAdmissionGuard {
+    _local: OwnedMutexGuard<()>,
+    postgres_connection: Option<PoolConnection<Any>>,
+}
+
+impl QuotaAdmissionGuard {
+    pub async fn release(mut self) -> Result<()> {
+        if let Some(mut connection) = self.postgres_connection.take() {
+            sqlx::query("SELECT pg_advisory_unlock(?)")
+                .bind(QUOTA_ADVISORY_LOCK_KEY)
+                .execute(&mut *connection)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QuotaAdmissionGuard {
+    fn drop(&mut self) {
+        if let Some(mut connection) = self.postgres_connection.take() {
+            tokio::spawn(async move {
+                let _ = sqlx::query("SELECT pg_advisory_unlock(?)")
+                    .bind(QUOTA_ADVISORY_LOCK_KEY)
+                    .execute(&mut *connection)
+                    .await;
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,10 +422,18 @@ impl QuotaDecisionRecord {
 impl Storage {
     pub async fn connect_config(config: &StorageConfig) -> Result<Self> {
         let plan = config.connection_plan()?;
+        let max_connections = config.max_connections.max(1);
         match plan.backend {
-            StorageBackend::Sqlite => Self::connect_sqlite_target(plan.target()).await,
+            StorageBackend::Sqlite => {
+                Self::connect_sqlite_target(plan.target(), max_connections).await
+            }
             StorageBackend::Postgres => {
-                Self::connect_any(plan.target(), SqlDialect::Postgres).await
+                if max_connections < 2 {
+                    anyhow::bail!(
+                        "postgres storage requires max_connections >= 2 for atomic quota admission"
+                    );
+                }
+                Self::connect_any(plan.target(), SqlDialect::Postgres, max_connections).await
             }
         }
     }
@@ -405,23 +449,32 @@ impl Storage {
         Self::connect_any(
             &format!("sqlite://{}?mode=rwc", db_path.display()),
             SqlDialect::Sqlite,
+            5,
         )
         .await
     }
 
-    async fn connect_any(database_url: &str, dialect: SqlDialect) -> Result<Self> {
+    async fn connect_any(
+        database_url: &str,
+        dialect: SqlDialect,
+        max_connections: u32,
+    ) -> Result<Self> {
         install_default_drivers();
         let pool = AnyPoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .connect(database_url)
             .await
             .with_context(|| format!("open {} database", dialect_name(dialect)))?;
-        let storage = Self { pool, dialect };
+        let storage = Self {
+            pool,
+            dialect,
+            quota_admission_lock: Arc::new(AsyncMutex::new(())),
+        };
         storage.migrate().await?;
         Ok(storage)
     }
 
-    async fn connect_sqlite_target(target: &str) -> Result<Self> {
+    async fn connect_sqlite_target(target: &str, max_connections: u32) -> Result<Self> {
         if let Some(path) = target.strip_prefix("sqlite://") {
             if path != ":memory:" {
                 let path_without_query = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
@@ -432,9 +485,14 @@ impl Storage {
                 }
             }
             if path.contains("?mode=") || path == ":memory:" {
-                Self::connect_any(target, SqlDialect::Sqlite).await
+                Self::connect_any(target, SqlDialect::Sqlite, max_connections).await
             } else {
-                Self::connect_any(&format!("{target}?mode=rwc"), SqlDialect::Sqlite).await
+                Self::connect_any(
+                    &format!("{target}?mode=rwc"),
+                    SqlDialect::Sqlite,
+                    max_connections,
+                )
+                .await
             }
         } else {
             Self::connect(target).await
@@ -451,6 +509,7 @@ impl Storage {
         let storage = Self {
             pool,
             dialect: SqlDialect::Sqlite,
+            quota_admission_lock: Arc::new(AsyncMutex::new(())),
         };
         storage.migrate().await?;
         Ok(storage)
@@ -458,6 +517,24 @@ impl Storage {
 
     pub fn pool(&self) -> &AnyPool {
         &self.pool
+    }
+
+    pub async fn quota_admission_guard(&self) -> Result<QuotaAdmissionGuard> {
+        let local = self.quota_admission_lock.clone().lock_owned().await;
+        let postgres_connection = if self.dialect == SqlDialect::Postgres {
+            let mut connection = self.pool.acquire().await?;
+            sqlx::query("SELECT pg_advisory_lock(?)")
+                .bind(QUOTA_ADVISORY_LOCK_KEY)
+                .execute(&mut *connection)
+                .await?;
+            Some(connection)
+        } else {
+            None
+        };
+        Ok(QuotaAdmissionGuard {
+            _local: local,
+            postgres_connection,
+        })
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -858,27 +935,53 @@ impl Storage {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<u64> {
-        let scope_value = if subject_scoped {
-            &principal.subject
-        } else {
-            &principal.team
+        let (query, scope_value) = match (self.dialect, subject_scoped) {
+            (SqlDialect::Sqlite, true) => (
+                r#"
+                SELECT COUNT(*) AS count
+                FROM quota_decisions
+                WHERE allowed = 1
+                  AND at >= ?
+                  AND at < ?
+                  AND actor = ?
+                "#,
+                &principal.subject,
+            ),
+            (SqlDialect::Sqlite, false) => (
+                r#"
+                SELECT COUNT(*) AS count
+                FROM quota_decisions
+                WHERE allowed = 1
+                  AND at >= ?
+                  AND at < ?
+                  AND team = ?
+                "#,
+                &principal.team,
+            ),
+            (SqlDialect::Postgres, true) => (
+                r#"
+                SELECT COUNT(*) AS count
+                FROM quota_decisions
+                WHERE allowed = TRUE
+                  AND at >= ?
+                  AND at < ?
+                  AND actor = ?
+                "#,
+                &principal.subject,
+            ),
+            (SqlDialect::Postgres, false) => (
+                r#"
+                SELECT COUNT(*) AS count
+                FROM quota_decisions
+                WHERE allowed = TRUE
+                  AND at >= ?
+                  AND at < ?
+                  AND team = ?
+                "#,
+                &principal.team,
+            ),
         };
-        let scope_column = if subject_scoped { "actor" } else { "team" };
-        let allowed_predicate = match self.dialect {
-            SqlDialect::Sqlite => "allowed = 1",
-            SqlDialect::Postgres => "allowed = TRUE",
-        };
-        let query = format!(
-            r#"
-            SELECT COUNT(*) AS count
-            FROM quota_decisions
-            WHERE {allowed_predicate}
-              AND at >= ?
-              AND at < ?
-              AND {scope_column} = ?
-            "#
-        );
-        let row = sqlx::query(&query)
+        let row = sqlx::query(query)
             .bind(encode_time(from))
             .bind(encode_time(to))
             .bind(scope_value)
@@ -1198,6 +1301,11 @@ mod tests {
 
         let from = Utc::now() - chrono::Duration::minutes(1);
         let to = Utc::now() + chrono::Duration::minutes(1);
+        let principal = Principal {
+            subject: "alice".to_string(),
+            team: "platform".to_string(),
+            scopes: vec!["chat".to_string()],
+        };
         assert_eq!(storage.audit_events_between(from, to).await?.len(), 1);
         assert_eq!(storage.audit_events_for_request(request_id).await?.len(), 1);
         assert_eq!(storage.usage_events_between(from, to).await?.len(), 1);
@@ -1214,6 +1322,18 @@ mod tests {
         assert_eq!(storage.quota_decisions_between(from, to).await?.len(), 1);
         assert_eq!(
             storage.quota_decisions_for_request(request_id).await?.len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .allowed_quota_decision_count(&principal, true, from, to)
+                .await?,
+            1
+        );
+        assert_eq!(
+            storage
+                .allowed_quota_decision_count(&principal, false, from, to)
+                .await?,
             1
         );
         assert_eq!(

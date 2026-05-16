@@ -59,7 +59,26 @@ pub struct MonthlyAuditReport {
     pub usage_summary: UsageSummary,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
     pub observations: Vec<ObservationEvent>,
-    pub models: Vec<ModelInventoryRecord>,
+    pub models: Vec<ExportModelInventoryRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportModelInventoryRecord {
+    pub alias: String,
+    pub role: String,
+    pub weight: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<ModelInventoryRecord> for ExportModelInventoryRecord {
+    fn from(record: ModelInventoryRecord) -> Self {
+        Self {
+            alias: record.alias,
+            role: record.role,
+            weight: record.weight,
+            updated_at: record.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +175,7 @@ pub struct DataExport {
     pub usage_summary: UsageSummary,
     pub observation_events: Vec<ObservationEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
-    pub models: Vec<ModelInventoryRecord>,
+    pub models: Vec<ExportModelInventoryRecord>,
 }
 
 pub async fn monthly_audit_report(
@@ -169,7 +188,12 @@ pub async fn monthly_audit_report(
     let usage_events = storage.usage_events_between(from, to).await?;
     let quota_decisions = storage.quota_decisions_between(from, to).await?;
     let observations = storage.observation_events_between(from, to).await?;
-    let models = storage.list_models().await?;
+    let models = storage
+        .list_models()
+        .await?
+        .into_iter()
+        .map(ExportModelInventoryRecord::from)
+        .collect::<Vec<_>>();
     let usage_summary = summarize_usage(&usage_events);
     let report_summary = summarize_report(
         audit_events.len(),
@@ -275,7 +299,12 @@ pub async fn data_export(
     let usage_events = storage.usage_events_between(from, to).await?;
     let observation_events = storage.observation_events_between(from, to).await?;
     let quota_decisions = storage.quota_decisions_between(from, to).await?;
-    let models = storage.list_models().await?;
+    let models = storage
+        .list_models()
+        .await?
+        .into_iter()
+        .map(ExportModelInventoryRecord::from)
+        .collect::<Vec<_>>();
     let usage_summary = summarize_usage(&usage_events);
     let report_summary = summarize_report(
         audit_events.len(),

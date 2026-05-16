@@ -1,6 +1,6 @@
 [package]
 name = "rs-llmctl"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -8,9 +8,15 @@ license = "Apache-2.0"
 name = "llmctl"
 path = "src/bin/llmctl.rs"
 
-[[bin]]
-name = "llmctld"
-path = "src/bin/llmctld.rs"
+[features]
+default = []
+native = ["native-candle", "native-tokenizers"]
+candle-core = ["dep:candle-core"]
+candle-nn = ["dep:candle-nn"]
+candle-transformers = ["dep:candle-transformers"]
+native-candle = ["candle-core", "candle-nn", "candle-transformers"]
+native-tokenizers = ["tokenizers"]
+tokenizers = ["dep:tokenizers"]
 
 [dependencies]
 anyhow = "1.0"
@@ -18,6 +24,9 @@ arrow = "58.3.0"
 async-stream = "0.3"
 axum = "0.7"
 base64 = "0.22"
+candle-core = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
+candle-transformers = { version = "0.10.2", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
@@ -41,6 +50,7 @@ sysinfo = "0.33"
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "process", "signal", "fs", "io-util", "time", "net"] }
 tokio-stream = "0.1"
 toml = "0.8"
+tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["onig"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

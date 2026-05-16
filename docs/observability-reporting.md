@@ -16,6 +16,19 @@ The config exposes an OTel-oriented exporter plan:
 Runtime events include audit rows, usage rows, quota decisions, model inventory,
 and resource observations.
 
+The daemon emits RED-style metrics for SLO dashboards and alerts:
+
+- `llmctl_requests_total` with `endpoint`, `model`, `team`, and `status`;
+- `llmctl_request_errors_total` for non-OK request outcomes;
+- `llmctl_request_latency_ms` as an end-to-end latency histogram;
+- `llmctl_upstream_requests_total`, `llmctl_upstream_errors_total`, and
+  `llmctl_upstream_latency_ms` for compatibility worker calls;
+- `llmctl_admission_rejections_total` for saturated global or scoped admission
+  limits;
+- `llmctl.tokens.input` and `llmctl.tokens.output` for token throughput.
+
+`llmctl aiops slo-plan --format prometheus` uses these metric names.
+
 The production config also has explicit controls for the local event surface:
 
 - `sse.enabled`, `sse.heartbeat-seconds`, and `sse.max-stream-seconds`;
@@ -43,6 +56,32 @@ observations, and resource snapshots emit OTel-friendly runtime event names:
 - `llmctl.resource.snapshot`
 - `llmctl.drift.observation`
 - `llmctl.model.install.verification`
+- `llmctl.runtime.heartbeat`
+
+`llmctl server run` emits `llmctl.runtime.heartbeat` at startup and then every
+`runtime.heartbeat-interval-seconds` seconds. Set that value to `0` to disable
+the background heartbeat loop.
+
+The HTTP serving path also emits production SLI metrics:
+
+- `llmctl_requests_total`, `llmctl_request_errors_total`, and
+  `llmctl_request_latency_ms`;
+- `llmctl_upstream_requests_total`, `llmctl_upstream_errors_total`, and
+  `llmctl_upstream_latency_ms`;
+- `llmctl_upstream_circuit_state_total` and
+  `llmctl_upstream_circuit_consecutive_failures`;
+- `llmctl_admission_rejections_total` and `llmctl_auth_failures_total`.
+- `llmctl_slo_violations_total` for requests that miss the default success or
+  latency SLO.
+
+Circuit breakers count transport errors, 5xx responses, and upstream 429
+responses as backend health failures. Other client-facing 4xx responses are
+not allowed to poison the circuit. Half-open probes are single-flight so a
+recovering backend does not receive a burst of simultaneous probes.
+
+During shutdown, readiness flips to `draining` before the configured graceful
+drain window elapses, so load balancers can stop sending new traffic while
+in-flight requests finish.
 
 Sensitive attributes are redacted before emission. Prompts, messages, bearer
 tokens, API keys, passwords, collector authorization headers, and local file

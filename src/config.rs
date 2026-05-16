@@ -1,3 +1,4 @@
+use crate::runtime::RuntimeBackend;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,6 +27,10 @@ pub struct Config {
     #[serde(default)]
     pub resources: ResourceConfig,
     #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -52,6 +57,8 @@ impl Default for Config {
             server: ServerConfig::default(),
             security: SecurityConfig::default(),
             resources: ResourceConfig::default(),
+            runtime: RuntimeConfig::default(),
+            cluster: ClusterConfig::default(),
             storage: StorageConfig::default(),
             observability: ObservabilityConfig::default(),
             sse: SseConfig::default(),
@@ -65,6 +72,58 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RuntimeConfig {
+    pub backend: RuntimeBackend,
+    pub heartbeat_interval_seconds: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend: RuntimeBackend::CandleNative,
+            heartbeat_interval_seconds: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ClusterConfig {
+    pub node_id: String,
+    pub nodes: Vec<ClusterNodeConfig>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            node_id: "local".to_string(),
+            nodes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ClusterNodeConfig {
+    pub id: String,
+    pub base_url: String,
+    pub roles: Vec<String>,
+    pub model_aliases: Vec<String>,
+}
+
+impl Default for ClusterNodeConfig {
+    fn default() -> Self {
+        Self {
+            id: "local".to_string(),
+            base_url: "http://127.0.0.1:8765/v1".to_string(),
+            roles: Vec::new(),
+            model_aliases: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
@@ -72,6 +131,16 @@ pub struct ServerConfig {
     pub worker_base_port: u16,
     pub llama_server: String,
     pub context_size: u32,
+    #[serde(default = "default_upstream_timeout_seconds")]
+    pub upstream_timeout_seconds: u64,
+    #[serde(default = "default_graceful_drain_seconds")]
+    pub graceful_drain_seconds: u64,
+    #[serde(default = "default_circuit_breaker_failures")]
+    pub circuit_breaker_failures: u32,
+    #[serde(default = "default_circuit_breaker_reset_seconds")]
+    pub circuit_breaker_reset_seconds: u64,
+    #[serde(default)]
+    pub model_upstream_timeout_seconds: BTreeMap<String, u64>,
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
 }
@@ -84,12 +153,33 @@ impl Default for ServerConfig {
             worker_base_port: 18765,
             llama_server: "llama-server".to_string(),
             context_size: 8192,
+            upstream_timeout_seconds: default_upstream_timeout_seconds(),
+            graceful_drain_seconds: default_graceful_drain_seconds(),
+            circuit_breaker_failures: default_circuit_breaker_failures(),
+            circuit_breaker_reset_seconds: default_circuit_breaker_reset_seconds(),
+            model_upstream_timeout_seconds: BTreeMap::new(),
             cors_allowed_origins: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_upstream_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_graceful_drain_seconds() -> u64 {
+    5
+}
+
+fn default_circuit_breaker_failures() -> u32 {
+    3
+}
+
+fn default_circuit_breaker_reset_seconds() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SecurityConfig {
     pub production: bool,
@@ -97,10 +187,29 @@ pub struct SecurityConfig {
     pub require_auth: bool,
     #[serde(alias = "bind_external")]
     pub bind_external: bool,
+    #[serde(default = "default_auth_failure_limit_per_minute")]
+    pub auth_failure_limit_per_minute: u32,
     #[serde(default, alias = "tls_termination")]
     pub tls_termination: TlsTerminationConfig,
     #[serde(alias = "api_keys")]
     pub api_keys: Vec<ApiKeyConfig>,
+}
+
+fn default_auth_failure_limit_per_minute() -> u32 {
+    60
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            production: false,
+            require_auth: false,
+            bind_external: false,
+            auth_failure_limit_per_minute: default_auth_failure_limit_per_minute(),
+            tls_termination: TlsTerminationConfig::default(),
+            api_keys: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +254,8 @@ impl Default for ResourceConfig {
 pub struct StorageConfig {
     pub db_path: PathBuf,
     pub model_dir: PathBuf,
+    #[serde(default = "default_storage_max_connections")]
+    pub max_connections: u32,
     #[serde(default, alias = "database-url")]
     pub database_url: Option<String>,
     #[serde(default)]
@@ -157,10 +268,15 @@ impl Default for StorageConfig {
         Self {
             db_path: PathBuf::from(format!("{home}/.local/share/rs-llmctl/llmctl.db")),
             model_dir: PathBuf::from(format!("{home}/.local/share/rs-llmctl/models")),
+            max_connections: default_storage_max_connections(),
             database_url: None,
             backend: None,
         }
     }
+}
+
+fn default_storage_max_connections() -> u32 {
+    5
 }
 
 impl StorageConfig {
@@ -407,8 +523,29 @@ pub async fn load(path: &Path) -> Result<Config> {
     let body = fs::read_to_string(path)
         .await
         .with_context(|| format!("read config {}", path.display()))?;
-    let cfg = toml::from_str(&body).with_context(|| format!("parse config {}", path.display()))?;
+    let mut cfg =
+        toml::from_str(&body).with_context(|| format!("parse config {}", path.display()))?;
+    apply_legacy_runtime_backend(&body, &mut cfg);
     Ok(cfg)
+}
+
+fn apply_legacy_runtime_backend(body: &str, cfg: &mut Config) {
+    let Ok(value) = toml::from_str::<toml::Value>(body) else {
+        return;
+    };
+    if value.get("runtime").is_some() {
+        return;
+    }
+
+    let has_legacy_llama_server = value
+        .get("server")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|server| {
+            server.contains_key("llama_server") || server.contains_key("llama-server")
+        });
+    if has_legacy_llama_server {
+        cfg.runtime.backend = RuntimeBackend::LlamaServer;
+    }
 }
 
 pub async fn save(path: &Path, cfg: &Config) -> Result<()> {
@@ -422,4 +559,65 @@ pub async fn save(path: &Path, cfg: &Config) -> Result<()> {
 
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
     crate::security::validate_production_security(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeBackend;
+
+    #[test]
+    fn default_runtime_backend_is_candle_native() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.runtime.backend, RuntimeBackend::CandleNative);
+        assert_eq!(cfg.runtime.heartbeat_interval_seconds, 30);
+        assert_eq!(cfg.storage.max_connections, 5);
+        assert_eq!(cfg.server.upstream_timeout_seconds, 300);
+        assert_eq!(cfg.server.graceful_drain_seconds, 5);
+        assert_eq!(cfg.server.circuit_breaker_failures, 3);
+        assert_eq!(cfg.server.circuit_breaker_reset_seconds, 30);
+        assert_eq!(cfg.security.auth_failure_limit_per_minute, 60);
+    }
+
+    #[test]
+    fn parses_compatibility_llama_server_runtime_backend() {
+        let cfg: Config = toml::from_str(
+            r#"
+[runtime]
+backend = "llama-server"
+heartbeat-interval-seconds = 10
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(cfg.runtime.backend, RuntimeBackend::LlamaServer);
+        assert_eq!(cfg.runtime.heartbeat_interval_seconds, 10);
+    }
+
+    #[tokio::test]
+    async fn load_treats_legacy_llama_server_field_as_compatibility_backend() {
+        let path = std::env::temp_dir().join(format!(
+            "rs-llmctl-runtime-compat-{}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "/usr/local/bin/llama-server"
+context_size = 4096
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let cfg = load(&path).await.expect("load config");
+        let _ = fs::remove_file(&path).await;
+
+        assert_eq!(cfg.runtime.backend, RuntimeBackend::LlamaServer);
+    }
 }

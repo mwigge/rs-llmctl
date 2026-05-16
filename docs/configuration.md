@@ -41,6 +41,18 @@ operator action.
 ## Relevant Blocks
 
 ```toml
+[server]
+upstream-timeout-seconds = 300
+graceful-drain-seconds = 5
+circuit-breaker-failures = 3
+circuit-breaker-reset-seconds = 30
+
+[security]
+auth-failure-limit-per-minute = 60
+
+[storage]
+max-connections = 5
+
 [sse]
 enabled = true
 heartbeat-seconds = 15
@@ -82,6 +94,10 @@ audit = true
 `llmctld` uses `[log].format = "json"` unless the operator overrides it with
 `--json-logs`. OTel collector secrets should be referenced through environment
 variables in exporter headers, for example `authorization = "env:OTEL_TOKEN"`.
+`storage.max-connections` controls the SQLx pool size for SQLite/Postgres.
+`server.graceful-drain-seconds` flips readiness to `draining` before process
+shutdown, and the circuit-breaker settings protect compatibility upstreams from
+repeated failing retries.
 
 ## Validation
 

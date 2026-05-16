@@ -1,5 +1,6 @@
 use chrono::{Duration, Utc};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent, UsageEvent};
+use rs_llmctl::config::ModelConfig;
 use rs_llmctl::storage::{RequestLineageJoinRecord, Storage};
 use serde_json::json;
 use serde_json::Value;
@@ -7,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -530,6 +532,9 @@ worker_base_port = 19000
 llama_server = "/usr/local/bin/llama-server"
 context_size = 4096
 
+[runtime]
+backend = "llama-server"
+
 [security]
 production = false
 require_auth = true
@@ -580,6 +585,19 @@ weight = 1
     let raw = String::from_utf8(output.stdout).expect("stdout utf8");
     let plan: Value = serde_json::from_str(&raw).expect("stdout is startup plan json");
     assert_eq!(plan["workers"].as_array().expect("workers").len(), 2);
+    assert!(plan["resource_limits"]["systemd"]["unit_properties"]
+        .as_array()
+        .expect("unit properties")
+        .iter()
+        .any(|property| property == "CPUAccounting=true"));
+    assert!(plan["resource_limits"]["systemd"]["systemd_run_args"]
+        .as_array()
+        .expect("systemd-run args")
+        .iter()
+        .any(|property| property
+            .as_str()
+            .expect("systemd-run property")
+            .starts_with("--property=CPUQuota=")));
     assert_eq!(plan["workers"][0]["worker"]["id"], "chat");
     assert_eq!(plan["workers"][0]["worker"]["port"], 19000);
     assert_eq!(plan["workers"][0]["worker"]["backend"]["type"], "cpu");
@@ -627,6 +645,9 @@ port = 8765
 worker_base_port = 19100
 llama_server = "llama-server"
 context_size = 8192
+
+[runtime]
+backend = "llama-server"
 
 [security]
 production = false
@@ -1309,6 +1330,730 @@ sha256 = "{}"
 }
 
 #[test]
+fn model_lifecycle_help_lists_operational_commands() {
+    let output = llmctl()
+        .arg("model")
+        .arg("--help")
+        .output()
+        .expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    for command in [
+        "install",
+        "status",
+        "start",
+        "stop",
+        "update",
+        "upgrade",
+        "downgrade",
+        "import-manifest",
+        "inventory",
+        "list",
+    ] {
+        assert!(help.contains(command), "model help should list `{command}`");
+    }
+
+    let output = llmctl()
+        .arg("model")
+        .arg("upgrade")
+        .arg("--help")
+        .output()
+        .expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8_lossy(&output.stdout);
+    for option in [
+        "--alias",
+        "--new-alias",
+        "--role",
+        "--weight",
+        "--copy",
+        "--sha256",
+        "--dry-run",
+    ] {
+        assert!(
+            help.contains(option),
+            "upgrade help should include `{option}`"
+        );
+    }
+}
+
+#[test]
+fn service_lifecycle_help_and_dry_run_are_json_friendly() {
+    let output = llmctl()
+        .arg("service")
+        .arg("--help")
+        .output()
+        .expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8_lossy(&output.stdout);
+    for command in ["status", "start", "stop", "restart", "upgrade", "downgrade"] {
+        assert!(
+            help.contains(command),
+            "service help should list `{command}`"
+        );
+    }
+
+    let mut status = llmctl();
+    status
+        .arg("service")
+        .arg("status")
+        .arg("--service-name")
+        .arg("llmctld")
+        .arg("--dry-run");
+    let status = assert_success_json(status);
+    assert_eq!(status["status"], "planned");
+    assert_eq!(status["action"], "status");
+    assert_eq!(status["service_name"], "llmctld.service");
+    assert_eq!(status["scope"], "user");
+    assert_eq!(status["commands"][0]["program"], "systemctl");
+    assert_eq!(
+        status["commands"][0]["args"],
+        serde_json::json!(["--user", "status", "llmctld.service"])
+    );
+    assert_eq!(
+        status["restart_hint"],
+        "systemctl --user restart llmctld.service"
+    );
+    assert_eq!(status["one_binary"], true);
+    assert_eq!(status["runtime_backend"], "candle-native");
+    assert_eq!(status["entrypoint"]["program"], "llmctl");
+    assert_eq!(status["entrypoint"]["args"], json!(["server", "run"]));
+
+    let mut upgrade = llmctl();
+    upgrade
+        .arg("service")
+        .arg("upgrade")
+        .arg("--service-name")
+        .arg("llmctld.service")
+        .arg("--system")
+        .arg("--dry-run");
+    let upgrade = assert_success_json(upgrade);
+    assert_eq!(upgrade["action"], "upgrade");
+    assert_eq!(upgrade["scope"], "system");
+    assert_eq!(
+        upgrade["commands"],
+        serde_json::json!([
+            { "program": "systemctl", "args": ["daemon-reload"] },
+            { "program": "systemctl", "args": ["restart", "llmctld.service"] }
+        ])
+    );
+    assert_eq!(upgrade["restart_hint"], "systemctl restart llmctld.service");
+    assert_eq!(upgrade["one_binary"], true);
+    assert_eq!(upgrade["runtime_backend"], "candle-native");
+    assert_eq!(upgrade["entrypoint"]["program"], "llmctl");
+}
+
+#[test]
+fn model_lifecycle_dry_run_reports_one_binary_candle_native_plan() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    fs::write(
+        &config,
+        format!(
+            "{}\n[runtime]\nbackend = \"candle-native\"\n",
+            read_config(&config)
+        ),
+    )
+    .expect("write runtime backend");
+    let bundle = dir.path().join("bundle");
+    fs::create_dir(&bundle).expect("create bundle");
+    fs::write(bundle.join("chat.gguf"), b"chat-model").expect("write chat model");
+    fs::write(bundle.join("chat-v2.gguf"), b"chat-model-v2").expect("write chat v2 model");
+    let manifest = bundle.join("manifest.toml");
+    fs::write(
+        &manifest,
+        format!(
+            r#"
+[[models]]
+alias = "chat"
+path = "chat.gguf"
+role = "chat"
+weight = 4
+sha256 = "{}"
+"#,
+            sha256(b"chat-model")
+        ),
+    )
+    .expect("write manifest");
+
+    let mut import = llmctl();
+    import
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("import-manifest")
+        .arg(&manifest);
+    assert_success_json(import);
+
+    let mut stop = llmctl();
+    stop.arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("stop")
+        .arg("chat")
+        .arg("--dry-run");
+    let stop = assert_success_json(stop);
+    assert_eq!(stop["status"], "planned");
+    assert_eq!(stop["action"], "stop");
+    assert_eq!(stop["alias"], "chat");
+    assert_eq!(stop["previous_weight"], 4);
+    assert_eq!(stop["weight"], 0);
+    assert_eq!(stop["runtime_backend"], "candle-native");
+    assert_eq!(stop["one_binary"], true);
+    assert_eq!(stop["entrypoint"]["program"], "llmctl");
+    assert_eq!(stop["entrypoint"]["args"], json!(["server", "run"]));
+    assert_eq!(
+        stop["restart_hint"],
+        "systemctl --user restart llmctld.service"
+    );
+    assert!(read_config(&config).contains("weight = 4"));
+
+    let mut upgrade = llmctl();
+    upgrade
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("upgrade")
+        .arg(bundle.join("chat-v2.gguf"))
+        .arg("--alias")
+        .arg("chat")
+        .arg("--sha256")
+        .arg(sha256(b"chat-model-v2"))
+        .arg("--dry-run");
+    let upgrade = assert_success_json(upgrade);
+    assert_eq!(upgrade["status"], "planned");
+    assert_eq!(upgrade["action"], "upgrade");
+    assert_eq!(upgrade["alias"], "chat");
+    assert_eq!(upgrade["new_alias"], "chat");
+    assert_eq!(upgrade["runtime_backend"], "candle-native");
+    assert_eq!(upgrade["restart_required"], true);
+    assert!(read_config(&config).contains("chat.gguf"));
+    assert!(!read_config(&config).contains("chat-v2.gguf"));
+}
+
+#[test]
+fn runtime_status_reports_candle_native_starter_contract_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[runtime]
+backend = "candle-native"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = false
+bind_external = false
+api_keys = []
+
+[resources]
+budget = 0.8
+cpu_only = false
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[observability]
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut command = llmctl();
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("runtime")
+        .arg("status");
+    let status = assert_success_json(command);
+
+    assert_eq!(status["backend"], "candle-native");
+    assert_eq!(status["primary"], true);
+    assert_eq!(status["implemented"], true);
+    assert_eq!(status["engine"], "candle-native");
+    assert_eq!(status["resource_policy"]["budget_fraction"], 0.8);
+    assert_eq!(status["resource_policy"]["cpu_fraction"], 0.8);
+    assert_eq!(status["resource_policy"]["ram_fraction"], 0.8);
+    assert_eq!(status["resource_policy"]["gpu_vram_fraction"], 0.8);
+    assert_eq!(
+        status["starter_roles"]
+            .as_array()
+            .expect("starter roles")
+            .iter()
+            .map(|role| role["role"].as_str().expect("role"))
+            .collect::<Vec<_>>(),
+        vec!["query", "recommendation", "thinking", "coding"]
+    );
+    assert!(status["starter_roles"]
+        .as_array()
+        .expect("starter roles")
+        .iter()
+        .all(|role| role["default_family"] == "qwen3"));
+    assert!(status["starter_roles"]
+        .as_array()
+        .expect("starter roles")
+        .iter()
+        .all(
+            |role| role["alternative_families"] == serde_json::json!(["gemma4", "kimi", "mistral"])
+        ));
+    assert!(status["starter_roles"]
+        .as_array()
+        .expect("starter roles")
+        .iter()
+        .any(|role| role["status"]
+            .as_str()
+            .unwrap_or("")
+            .contains("kimi-blocked")));
+    assert!(status["starter_roles"]
+        .as_array()
+        .expect("starter roles")
+        .iter()
+        .all(|role| role["eu_friendly_family"] == "mistral"));
+    let detection = status["resource_policy"]["gpu_detection"]
+        .as_array()
+        .expect("gpu detection")
+        .iter()
+        .map(|entry| entry.as_str().expect("gpu detection entry"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(detection.contains("nvidia"));
+    assert!(detection.contains("amd"));
+    assert!(detection.contains("apple"));
+    assert!(status["observability"]
+        .as_array()
+        .expect("observability")
+        .iter()
+        .any(|entry| entry == "runtime telemetry event: llmctl.runtime.native.status"));
+
+    let rendered = serde_json::to_string(&status).expect("render status");
+    assert!(!rendered.contains(&dir.path().display().to_string()));
+}
+
+#[test]
+fn runtime_placement_assigns_roles_across_two_servers() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[runtime]
+backend = "candle-native"
+
+[cluster]
+node-id = "server-a"
+
+[[cluster.nodes]]
+id = "server-a"
+base-url = "http://10.0.0.10:8765/v1"
+roles = ["thinking", "recommendation"]
+
+[[cluster.nodes]]
+id = "server-b"
+base-url = "http://10.0.0.11:8765/v1"
+roles = ["coding"]
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = false
+bind_external = false
+api_keys = []
+
+[resources]
+budget = 0.8
+cpu_only = false
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[[models]]
+alias = "qwen-think"
+path = "/private/models/qwen-thinking.gguf"
+role = "thinking"
+weight = 1
+
+[[models]]
+alias = "qwen-reco"
+path = "/private/models/qwen-reco.gguf"
+role = "recommendation"
+weight = 1
+
+[[models]]
+alias = "qwen-code"
+path = "/private/models/qwen-code.gguf"
+role = "coding"
+weight = 1
+
+[observability]
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut command = llmctl();
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("runtime")
+        .arg("placement");
+    let placement = assert_success_json(command);
+
+    assert_eq!(placement["routing_mode"], "cluster-role-placement");
+    assert_eq!(placement["local_node"], "server-a");
+    assert_eq!(
+        placement["nodes"][0]["model_aliases"],
+        serde_json::json!(["qwen-think", "qwen-reco"])
+    );
+    assert_eq!(
+        placement["nodes"][1]["model_aliases"],
+        serde_json::json!(["qwen-code"])
+    );
+    assert_eq!(placement["unassigned_models"], serde_json::json!([]));
+
+    let rendered = serde_json::to_string(&placement).expect("render placement");
+    assert!(!rendered.contains("/private"));
+    assert!(!rendered.contains(".gguf"));
+}
+
+#[test]
+fn runtime_route_selects_node_for_role_or_model_and_validate_fails_bad_placement() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[runtime]
+backend = "candle-native"
+
+[cluster]
+node-id = "server-a"
+
+[[cluster.nodes]]
+id = "server-a"
+base-url = "http://10.0.0.10:8765/v1"
+roles = ["thinking", "recommendation"]
+
+[[cluster.nodes]]
+id = "server-b"
+base-url = "http://10.0.0.11:8765/v1"
+roles = ["coding"]
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = false
+bind_external = false
+api_keys = []
+
+[resources]
+budget = 0.8
+cpu_only = false
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[[models]]
+alias = "qwen-think"
+path = "/private/models/qwen-thinking.gguf"
+role = "thinking"
+weight = 1
+
+[[models]]
+alias = "qwen-reco"
+path = "/private/models/qwen-reco.gguf"
+role = "recommendation"
+weight = 1
+
+[[models]]
+alias = "qwen-code"
+path = "/private/models/qwen-code.gguf"
+role = "coding"
+weight = 1
+
+[observability]
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut validate = llmctl();
+    validate
+        .arg("--config")
+        .arg(&config)
+        .arg("runtime")
+        .arg("validate");
+    let validated = assert_success_json(validate);
+    assert_eq!(validated["status"], "ok");
+    assert_eq!(validated["nodes"], 2);
+
+    let mut by_model = llmctl();
+    by_model
+        .arg("--config")
+        .arg(&config)
+        .arg("runtime")
+        .arg("route")
+        .arg("--model")
+        .arg("qwen-code");
+    let by_model = assert_success_json(by_model);
+    assert_eq!(by_model["query"], "model:qwen-code");
+    assert_eq!(by_model["candidates"][0]["id"], "server-b");
+
+    let mut by_role = llmctl();
+    by_role
+        .arg("--config")
+        .arg(&config)
+        .arg("runtime")
+        .arg("route")
+        .arg("--role")
+        .arg("thinking");
+    let by_role = assert_success_json(by_role);
+    assert_eq!(by_role["query"], "role:thinking");
+    assert_eq!(by_role["candidates"][0]["id"], "server-a");
+
+    let bad_config = dir.path().join("bad-config.toml");
+    let mut bad_body = read_config(&config);
+    bad_body = bad_body.replace("roles = [\"coding\"]", "roles = [\"query\"]");
+    fs::write(&bad_config, bad_body).expect("write bad config");
+
+    let mut bad_validate = llmctl();
+    bad_validate
+        .arg("--config")
+        .arg(&bad_config)
+        .arg("runtime")
+        .arg("validate");
+    assert_failure_stderr_contains(bad_validate, "qwen-code");
+}
+
+#[test]
+fn runtime_heartbeat_reports_single_node_health_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[runtime]
+backend = "candle-native"
+
+[cluster]
+node-id = "local-dev"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = false
+bind_external = false
+api_keys = []
+
+[resources]
+budget = 0.8
+cpu_only = false
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[[models]]
+alias = "qwen-code"
+path = "/private/models/qwen-code.gguf"
+role = "coding"
+weight = 1
+
+[observability]
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut command = llmctl();
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("runtime")
+        .arg("heartbeat");
+    let heartbeat = assert_success_json(command);
+
+    assert_eq!(heartbeat["node_id"], "local-dev");
+    assert_eq!(heartbeat["runtime"], "candle-native");
+    assert_eq!(heartbeat["routing_mode"], "single-node");
+    assert_eq!(heartbeat["healthy"], true);
+    assert_eq!(heartbeat["models"], 1);
+    assert_eq!(heartbeat["assigned_models"], 1);
+    assert_eq!(heartbeat["budget_fraction"], 0.8);
+    assert_eq!(heartbeat["heartbeat_interval_seconds"], 30);
+    assert_eq!(heartbeat["telemetry_event"], "llmctl.runtime.heartbeat");
+
+    let rendered = serde_json::to_string(&heartbeat).expect("render heartbeat");
+    assert!(!rendered.contains("/private"));
+    assert!(!rendered.contains(".gguf"));
+}
+
+#[test]
+fn model_start_and_stop_persist_weight_changes() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let bundle = dir.path().join("bundle");
+    fs::create_dir(&bundle).expect("create bundle");
+    fs::write(bundle.join("chat.gguf"), b"chat-model").expect("write chat model");
+    let manifest = bundle.join("manifest.toml");
+    fs::write(
+        &manifest,
+        format!(
+            r#"
+[[models]]
+alias = "chat"
+path = "chat.gguf"
+role = "chat"
+weight = 4
+sha256 = "{}"
+"#,
+            sha256(b"chat-model")
+        ),
+    )
+    .expect("write manifest");
+
+    let mut import = llmctl();
+    import
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("import-manifest")
+        .arg(&manifest);
+    assert_success_json(import);
+
+    let mut stop = llmctl();
+    stop.arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("stop")
+        .arg("chat");
+    let stopped = assert_success_json(stop);
+    assert_eq!(stopped["status"], "stopped");
+    assert_eq!(stopped["alias"], "chat");
+    assert_eq!(stopped["previous_weight"], 4);
+    assert_eq!(stopped["weight"], 0);
+    assert_eq!(stopped["restart_required"], true);
+    assert_eq!(
+        stopped["restart_hint"],
+        "systemctl --user restart llmctld.service"
+    );
+    assert!(read_config(&config).contains("weight = 0"));
+
+    let mut status = llmctl();
+    status
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("status")
+        .arg("chat");
+    let status = assert_success_json(status);
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["alias"], "chat");
+    assert_eq!(status["weight"], 0);
+    assert_eq!(status["restart_required"], false);
+
+    let mut start = llmctl();
+    start
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("start")
+        .arg("chat")
+        .arg("--weight")
+        .arg("6");
+    let started = assert_success_json(start);
+    assert_eq!(started["status"], "started");
+    assert_eq!(started["alias"], "chat");
+    assert_eq!(started["previous_weight"], 0);
+    assert_eq!(started["weight"], 6);
+    assert_eq!(started["restart_required"], true);
+    assert_eq!(
+        started["restart_hint"],
+        "systemctl --user restart llmctld.service"
+    );
+    assert!(read_config(&config).contains("weight = 6"));
+}
+
+#[test]
 fn quota_status_and_report_are_scriptable_json() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
@@ -1962,6 +2707,20 @@ fn data_contracts_report_schema_versions_for_selected_dataset() {
         output["contracts"][0]["arrow_schema"]["format"],
         "arrow-json-schema"
     );
+
+    let mut model_contract = llmctl();
+    model_contract
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("contracts")
+        .arg("--dataset")
+        .arg("models");
+    let output = assert_success_json(model_contract);
+    let fields = output["contracts"][0]["fields"]
+        .as_array()
+        .expect("model contract fields");
+    assert!(fields.iter().all(|field| field["name"] != "path"));
 }
 
 #[tokio::test]
@@ -2002,6 +2761,32 @@ async fn data_export_filters_finops_as_arrow_json() {
         .expect("rows")
         .iter()
         .any(|row| row["team"] == "platform" && row["total_tokens"] == 25));
+}
+
+#[tokio::test]
+async fn model_drift_reports_drift_observations_for_operator_workflow() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let db_path = dir.path().join("llmctl.db");
+    let storage = Storage::connect(&db_path).await.expect("connect storage");
+    storage
+        .insert_observation_event(&observation_event("model.drift.embedding", "qwen", 0.14))
+        .await
+        .expect("insert drift observation");
+
+    let mut drift = llmctl();
+    drift
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("drift")
+        .arg("--hours")
+        .arg("1");
+    let output = assert_success_json(drift);
+
+    assert_eq!(output["kind"], "drift");
+    assert_eq!(output["events"][0]["model"], "qwen");
+    assert_eq!(output["events"][0]["kind"], "model.drift.embedding");
 }
 
 #[tokio::test]
@@ -2050,6 +2835,42 @@ async fn data_export_writes_arrow_ipc_and_parquet_files() {
     assert_eq!(parquet["format"], "parquet");
     assert_eq!(parquet["rows"], 3);
     assert!(fs::metadata(&parquet_path).expect("parquet metadata").len() > 0);
+}
+
+#[tokio::test]
+async fn data_export_models_redacts_local_model_paths() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let db_path = dir.path().join("llmctl.db");
+    let storage = Storage::connect(&db_path).await.expect("connect storage");
+    storage
+        .upsert_model(&ModelConfig {
+            alias: "qwen".to_string(),
+            path: PathBuf::from("/home/alice/.cache/llmctl/models/qwen.gguf"),
+            role: "chat".to_string(),
+            weight: 1,
+        })
+        .await
+        .expect("insert model");
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--dataset")
+        .arg("models")
+        .arg("--format")
+        .arg("arrow-json");
+    let output = assert_success_json(export);
+
+    assert_eq!(output["dataset"], "models");
+    assert_eq!(output["rows"][0]["alias"], "qwen");
+    assert!(output["rows"][0].get("path").is_none());
+    assert!(!serde_json::to_string(&output)
+        .expect("json")
+        .contains("/home/alice"));
 }
 
 #[test]
@@ -2650,7 +3471,7 @@ fn security_audit_config_reports_scriptable_posture_without_secrets() {
 Description=rs-llmctl
 
 [Service]
-ExecStart=/usr/local/bin/llmctld --config /etc/rs-llmctl/config.toml
+ExecStart=/usr/local/bin/llmctl --config /etc/rs-llmctl/config.toml server run
 "#,
     )
     .expect("write unit");

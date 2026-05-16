@@ -50,6 +50,10 @@ deployment:
 - Deployment sync for SLO artifacts; today `aiops slo-plan --format
   prometheus` and `--format grafana` render files for operator-managed
   Prometheus and Grafana provisioning.
+- Native Kimi inference. Qwen3, Gemma-family, and Mistral use Candle model
+  constructors where Candle exposes them. Kimi is blocked until Candle exposes a
+  Kimi architecture module or rs-llmctl vendors a reviewed native
+  implementation.
 - External Sigstore/Rekor publication. Ed25519 signatures and local
   transparency logs are available now; public transparency-log publication is
   optional organization-level integration.
@@ -60,11 +64,13 @@ For a small internal platform, the next high-value path is:
 
 1. Add optional LLM-as-judge and rubric evaluators for eval suites.
 2. Infer lineage IDs from managed model manifests and RAG indexes.
-3. Add optional apply/push helpers for Prometheus rule files and Grafana
+3. Add native Kimi support once there is a reviewed Candle-compatible
+   architecture implementation.
+4. Add optional apply/push helpers for Prometheus rule files and Grafana
    dashboard provisioning.
-4. Add optional managed transparency-log publication for policy-bundle and
+5. Add optional managed transparency-log publication for policy-bundle and
    incident evidence hashes.
-5. Add Sigstore integration when external keyless signing is required.
+6. Add Sigstore integration when external keyless signing is required.
 
 ## Junior SRE Mental Model
 

@@ -1,11 +1,17 @@
 use crate::config::ModelConfig;
+use crate::observability::{
+    emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
+};
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -115,7 +121,7 @@ fn default_role() -> String {
     "chat".to_string()
 }
 
-pub fn builtin_catalog() -> Vec<CatalogModel> {
+static BUILTIN_CATALOG: LazyLock<Vec<CatalogModel>> = LazyLock::new(|| {
     vec![
         CatalogModel {
             id: "qwen2.5-7b-instruct-q4-k-m",
@@ -142,12 +148,17 @@ pub fn builtin_catalog() -> Vec<CatalogModel> {
             role: "chat",
         },
     ]
+});
+
+pub fn builtin_catalog() -> Vec<CatalogModel> {
+    BUILTIN_CATALOG.clone()
 }
 
 pub fn catalog_model(id_or_alias: &str) -> Option<CatalogModel> {
-    builtin_catalog()
-        .into_iter()
+    BUILTIN_CATALOG
+        .iter()
         .find(|model| model.id == id_or_alias || model.alias == id_or_alias)
+        .cloned()
 }
 
 pub fn huggingface_download_url(repo: &str, filename: &str, revision: &str) -> Result<String> {
@@ -264,6 +275,22 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         verified: plan.verification.expected_sha256.is_some(),
         ..plan.verification
     };
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Span,
+        TelemetryEventName::ModelInstallVerification,
+        Utc::now(),
+        BTreeMap::from([
+            (
+                "llmctl.model.alias".to_string(),
+                serde_json::json!(req.alias.as_str()),
+            ),
+            (
+                "llmctl.model.verified".to_string(),
+                serde_json::json!(verification.verified),
+            ),
+            ("llmctl.model.bytes".to_string(), serde_json::json!(bytes)),
+        ]),
+    ));
 
     Ok(InstalledModel {
         alias: req.alias.clone(),
@@ -381,6 +408,7 @@ pub async fn download_model(
     expected_sha256: &str,
 ) -> Result<PathBuf> {
     validate_direct_download_url(url)?;
+    validate_direct_download_resolves_public(url)?;
     let expected_sha256 = normalized_sha256(expected_sha256)?;
     fs::create_dir_all(cache_dir)
         .await
@@ -560,27 +588,53 @@ fn validate_direct_download_url(url: &str) -> Result<()> {
         "direct model download URL host is not allowed"
     );
     if let Ok(ip) = host.parse::<IpAddr>() {
-        let blocked = match ip {
-            IpAddr::V4(ip) => {
-                ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_unspecified()
-                    || ip.octets() == [169, 254, 169, 254]
-            }
-            IpAddr::V6(ip) => {
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-            }
-        };
         anyhow::ensure!(
-            !blocked,
+            !is_blocked_download_ip(ip),
             "direct model download URL must not target local or private addresses"
         );
     }
     Ok(())
+}
+
+fn validate_direct_download_resolves_public(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("parse model URL {url}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("direct model download URL must include a host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let resolved = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve direct model download host {host}"))?
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !resolved.is_empty(),
+        "direct model download URL host did not resolve"
+    );
+    for addr in resolved {
+        anyhow::ensure!(
+            !is_blocked_download_ip(addr.ip()),
+            "direct model download URL must not resolve to local or private addresses"
+        );
+    }
+    Ok(())
+}
+
+fn is_blocked_download_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.octets() == [169, 254, 169, 254]
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
 }
 
 fn validate_sha256(value: &str) -> Result<()> {

@@ -2,7 +2,8 @@ use crate::config::{Config, OtlpProtocol};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
-use opentelemetry::trace::{Span, Tracer};
+use opentelemetry::metrics::Counter;
+use opentelemetry::trace::{Span, Status, Tracer};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -308,9 +310,12 @@ pub enum TelemetryEventName {
     RequestRouting,
     QuotaDecision,
     WorkerLifecycle,
+    CircuitBreaker,
     ResourceSnapshot,
     DriftObservation,
     ModelInstallVerification,
+    NativeRuntimeStatus,
+    RuntimeHeartbeat,
 }
 
 impl TelemetryEventName {
@@ -319,9 +324,12 @@ impl TelemetryEventName {
             Self::RequestRouting => "llmctl.request.routing",
             Self::QuotaDecision => "llmctl.quota.decision",
             Self::WorkerLifecycle => "llmctl.worker.lifecycle",
+            Self::CircuitBreaker => "llmctl.upstream.circuit_breaker",
             Self::ResourceSnapshot => "llmctl.resource.snapshot",
             Self::DriftObservation => "llmctl.drift.observation",
             Self::ModelInstallVerification => "llmctl.model.install.verification",
+            Self::NativeRuntimeStatus => "llmctl.runtime.native.status",
+            Self::RuntimeHeartbeat => "llmctl.runtime.heartbeat",
         }
     }
 }
@@ -345,9 +353,12 @@ impl<'de> Deserialize<'de> for TelemetryEventName {
             "llmctl.request.routing" => Ok(Self::RequestRouting),
             "llmctl.quota.decision" => Ok(Self::QuotaDecision),
             "llmctl.worker.lifecycle" => Ok(Self::WorkerLifecycle),
+            "llmctl.upstream.circuit_breaker" => Ok(Self::CircuitBreaker),
             "llmctl.resource.snapshot" => Ok(Self::ResourceSnapshot),
             "llmctl.drift.observation" => Ok(Self::DriftObservation),
             "llmctl.model.install.verification" => Ok(Self::ModelInstallVerification),
+            "llmctl.runtime.native.status" => Ok(Self::NativeRuntimeStatus),
+            "llmctl.runtime.heartbeat" => Ok(Self::RuntimeHeartbeat),
             _ => Err(serde::de::Error::custom(format!(
                 "unknown telemetry event name `{value}`"
             ))),
@@ -409,17 +420,21 @@ impl NoopTelemetryExporter {
 
 pub fn emit_runtime_telemetry(event: &RuntimeTelemetryEvent) {
     let attributes = telemetry_key_values(event);
-    global::meter(crate::SERVICE_NAME)
-        .u64_counter("llmctl.runtime.events")
-        .with_description("Runtime telemetry events emitted by rs-llmctl")
-        .build()
-        .add(1, &attributes);
+    runtime_events_counter().add(1, &attributes);
 
     if matches!(event.signal, TelemetrySignal::Span) {
         let tracer = global::tracer(crate::SERVICE_NAME);
         let mut span = tracer.start(event.name.as_str().to_string());
         for attribute in attributes {
             span.set_attribute(attribute);
+        }
+        if event
+            .attributes
+            .get("llmctl.status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "ok")
+        {
+            span.set_status(Status::error("llmctl status is not ok"));
         }
         span.end();
     }
@@ -429,6 +444,16 @@ pub fn emit_runtime_telemetry(event: &RuntimeTelemetryEvent) {
         telemetry_signal = ?event.signal,
         "runtime telemetry event emitted"
     );
+}
+
+fn runtime_events_counter() -> &'static Counter<u64> {
+    static COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .u64_counter("llmctl.runtime.events")
+            .with_description("Runtime telemetry events emitted by rs-llmctl")
+            .build()
+    })
 }
 
 fn telemetry_key_values(event: &RuntimeTelemetryEvent) -> Vec<KeyValue> {
@@ -546,6 +571,10 @@ mod tests {
             "llmctl.worker.lifecycle"
         );
         assert_eq!(
+            TelemetryEventName::CircuitBreaker.as_str(),
+            "llmctl.upstream.circuit_breaker"
+        );
+        assert_eq!(
             TelemetryEventName::ResourceSnapshot.as_str(),
             "llmctl.resource.snapshot"
         );
@@ -556,6 +585,14 @@ mod tests {
         assert_eq!(
             TelemetryEventName::ModelInstallVerification.as_str(),
             "llmctl.model.install.verification"
+        );
+        assert_eq!(
+            TelemetryEventName::NativeRuntimeStatus.as_str(),
+            "llmctl.runtime.native.status"
+        );
+        assert_eq!(
+            TelemetryEventName::RuntimeHeartbeat.as_str(),
+            "llmctl.runtime.heartbeat"
         );
     }
 

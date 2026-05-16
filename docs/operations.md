@@ -24,7 +24,8 @@ the manifest directory, and SHA-256 hashes pin the bytes accepted into the
 inventory.
 
 Direct downloads are treated as controlled operations: they require HTTPS,
-expected SHA-256, no redirects, and a bounded network timeout.
+expected SHA-256, public-address DNS resolution, no redirects, and a bounded
+network timeout.
 
 ## Runtime Modes
 
@@ -56,6 +57,12 @@ with request ID, planned steps, worker statuses, and success state.
 
 The default resource budget is 80%. That applies to CPU/RAM/VRAM planning so
 the model service does not assume it owns the whole host.
+
+The packaged Linux systemd unit applies `CPUQuota=80%` and `MemoryMax=80%` as
+the default cgroup guard. Generated `server plan` output also includes
+host-specific `CPUQuota` and `MemoryMax` properties for reviewed drop-ins.
+Detected GPU VRAM remains planning evidence because there is no portable
+systemd cgroup property for hard GPU VRAM enforcement.
 
 ## Package Validation
 

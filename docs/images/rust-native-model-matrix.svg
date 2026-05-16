@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">rs-llmctl native model matrix</title>
+  <desc id="desc">Qwen3, Gemma, Mistral, and Kimi status in the rs-llmctl Candle-native plan.</desc>
+  <rect width="1280" height="720" fill="#f7f8fa"/>
+  <text x="90" y="95" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="700" fill="#17202a">Native model matrix for the MVP</text>
+  <text x="90" y="132" font-family="Inter, Arial, sans-serif" font-size="18" fill="#4d5968">Keep the first release small: query, recommendation, thinking, and coding models.</text>
+
+  <g font-family="Inter, Arial, sans-serif">
+    <rect x="90" y="190" width="250" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="120" y="245" font-size="27" font-weight="700" fill="#213044">Qwen3</text>
+    <text x="120" y="290" font-size="17" fill="#425164">primary query/thinking/coding</text>
+    <text x="120" y="332" font-size="16" fill="#1f7a4d">native loader wired</text>
+    <text x="120" y="370" font-size="16" fill="#425164">GGUF or safetensors</text>
+    <text x="120" y="408" font-size="16" fill="#425164">exact tokenizer when present</text>
+
+    <rect x="375" y="190" width="250" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="405" y="245" font-size="27" font-weight="700" fill="#213044">Gemma</text>
+    <text x="405" y="290" font-size="17" fill="#425164">compact recommendation option</text>
+    <text x="405" y="332" font-size="16" fill="#1f7a4d">native loader wired</text>
+    <text x="405" y="370" font-size="16" fill="#425164">family contract tracked</text>
+    <text x="405" y="408" font-size="16" fill="#425164">Candle acceleration path</text>
+
+    <rect x="660" y="190" width="250" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="690" y="245" font-size="27" font-weight="700" fill="#213044">Mistral</text>
+    <text x="690" y="290" font-size="17" fill="#425164">EU-friendly fallback</text>
+    <text x="690" y="332" font-size="16" fill="#1f7a4d">native loader wired where exposed</text>
+    <text x="690" y="370" font-size="16" fill="#425164">safetensors first</text>
+    <text x="690" y="408" font-size="16" fill="#425164">good small-node target</text>
+
+    <rect x="945" y="190" width="250" height="330" rx="8" fill="#fffdf8" stroke="#d7b36c"/>
+    <text x="975" y="245" font-size="27" font-weight="700" fill="#213044">Kimi</text>
+    <text x="975" y="290" font-size="17" fill="#5f4b22">tracked coding target</text>
+    <text x="975" y="332" font-size="16" fill="#a15c00">blocked pending architecture</text>
+    <text x="975" y="370" font-size="16" fill="#5f4b22">fails closed with action</text>
+    <text x="975" y="408" font-size="16" fill="#5f4b22">ready for reviewed module</text>
+  </g>
+
+  <rect x="250" y="575" width="780" height="68" rx="8" fill="#eaf1fb" stroke="#7a9bd2"/>
+  <text x="290" y="616" font-family="Inter, Arial, sans-serif" font-size="20" fill="#1d3f6e">One binary loads all non-zero-weight native engines for its assigned node.</text>
+</svg>

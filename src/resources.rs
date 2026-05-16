@@ -67,7 +67,29 @@ pub struct GpuBudget {
 pub struct ResourceLimitPlan {
     pub cpu_quota_percent: u32,
     pub memory_max_bytes: u64,
+    pub systemd: SystemdResourceProperties,
     pub gpu_vram_budgets: Vec<GpuVramBudgetMetadata>,
+}
+
+impl Default for ResourceLimitPlan {
+    fn default() -> Self {
+        Self {
+            cpu_quota_percent: 100,
+            memory_max_bytes: u64::MAX,
+            systemd: systemd_resource_properties(100, u64::MAX),
+            gpu_vram_budgets: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemdResourceProperties {
+    #[serde(rename = "CPUQuota")]
+    pub cpu_quota: String,
+    #[serde(rename = "MemoryMax")]
+    pub memory_max: u64,
+    pub unit_properties: Vec<String>,
+    pub systemd_run_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +97,10 @@ pub struct GpuVramBudgetMetadata {
     pub vendor: GpuVendor,
     pub name: String,
     pub vram_budget_bytes: u64,
+    pub enforcement: String,
+    pub enforcement_status: String,
+    pub hard_enforced: bool,
+    pub systemd_property: Option<String>,
 }
 
 pub fn snapshot(config: &ResourceConfig) -> ResourceSnapshot {
@@ -131,8 +157,13 @@ pub fn budget_plan(snapshot: &ResourceSnapshot, requested_fraction: f64) -> Budg
             vendor: budget.vendor.clone(),
             name: budget.name.clone(),
             vram_budget_bytes: budget.vram_budget_bytes,
+            enforcement: "metadata-only".to_string(),
+            enforcement_status: "metadata-only".to_string(),
+            hard_enforced: false,
+            systemd_property: None,
         })
         .collect();
+    let cpu_quota_percent = cpu_quota_percent(snapshot.cpu_threads, budget_fraction);
     BudgetPlan {
         budget_fraction,
         cpu_threads: ((snapshot.cpu_threads as f64) * budget_fraction)
@@ -141,8 +172,9 @@ pub fn budget_plan(snapshot: &ResourceSnapshot, requested_fraction: f64) -> Budg
         memory_budget_bytes,
         gpu_budgets,
         limits: ResourceLimitPlan {
-            cpu_quota_percent: cpu_quota_percent(snapshot.cpu_threads, budget_fraction),
+            cpu_quota_percent,
             memory_max_bytes: memory_budget_bytes,
+            systemd: systemd_resource_properties(cpu_quota_percent, memory_budget_bytes),
             gpu_vram_budgets,
         },
         findings,
@@ -325,6 +357,30 @@ fn cpu_quota_percent(cpu_threads: usize, fraction: f64) -> u32 {
         .max(1.0) as u32
 }
 
+fn systemd_resource_properties(
+    cpu_quota_percent: u32,
+    memory_max_bytes: u64,
+) -> SystemdResourceProperties {
+    let cpu_quota = format!("{cpu_quota_percent}%");
+    let unit_properties = vec![
+        "CPUAccounting=true".to_string(),
+        "MemoryAccounting=true".to_string(),
+        format!("CPUQuota={cpu_quota}"),
+        format!("MemoryMax={memory_max_bytes}"),
+    ];
+    let systemd_run_args = unit_properties
+        .iter()
+        .map(|property| format!("--property={property}"))
+        .collect();
+
+    SystemdResourceProperties {
+        cpu_quota,
+        memory_max: memory_max_bytes,
+        unit_properties,
+        systemd_run_args,
+    }
+}
+
 fn bytes_fraction(bytes: u64, fraction: f64) -> u64 {
     ((bytes as f64) * fraction).floor() as u64
 }
@@ -353,12 +409,63 @@ mod tests {
         assert_eq!(plan.cpu_threads, 6);
         assert_eq!(plan.limits.cpu_quota_percent, 640);
         assert_eq!(plan.limits.memory_max_bytes, 8_000);
+        assert_eq!(plan.limits.systemd.cpu_quota, "640%");
+        assert_eq!(plan.limits.systemd.memory_max, 8_000);
         assert_eq!(
             plan.findings,
             vec!["resource budget must be finite and greater than zero".to_string()]
         );
         assert!(plan.gpu_budgets.is_empty());
         assert!(plan.limits.gpu_vram_budgets.is_empty());
+    }
+
+    #[test]
+    fn first_time_user_default_surfaces_eighty_percent_cpu_ram_and_vram_budgets() {
+        let snapshot = ResourceSnapshot {
+            cpu_threads: 10,
+            total_memory_bytes: 64_000,
+            available_memory_bytes: 40_000,
+            cpu_only: false,
+            gpus: vec![GpuSnapshot {
+                vendor: GpuVendor::Nvidia,
+                name: "RTX 6000".to_string(),
+                total_vram_bytes: 48_000,
+                free_vram_bytes: Some(30_000),
+            }],
+        };
+        let plan = budget_plan(&snapshot, ResourceConfig::default().budget);
+
+        assert_eq!(plan.budget_fraction, 0.80);
+        assert_eq!(plan.cpu_threads, 8);
+        assert_eq!(plan.memory_budget_bytes, 32_000);
+        assert_eq!(plan.gpu_budgets[0].vram_budget_bytes, 24_000);
+        assert_eq!(plan.limits.cpu_quota_percent, 800);
+        assert_eq!(plan.limits.memory_max_bytes, 32_000);
+        assert_eq!(
+            plan.limits.systemd.unit_properties,
+            vec![
+                "CPUAccounting=true",
+                "MemoryAccounting=true",
+                "CPUQuota=800%",
+                "MemoryMax=32000"
+            ]
+        );
+        assert_eq!(
+            plan.limits.systemd.systemd_run_args,
+            vec![
+                "--property=CPUAccounting=true",
+                "--property=MemoryAccounting=true",
+                "--property=CPUQuota=800%",
+                "--property=MemoryMax=32000"
+            ]
+        );
+        assert_eq!(plan.limits.gpu_vram_budgets[0].enforcement, "metadata-only");
+        assert_eq!(
+            plan.limits.gpu_vram_budgets[0].enforcement_status,
+            "metadata-only"
+        );
+        assert!(!plan.limits.gpu_vram_budgets[0].hard_enforced);
+        assert_eq!(plan.limits.gpu_vram_budgets[0].systemd_property, None);
     }
 
     #[test]
@@ -403,13 +510,47 @@ mod tests {
         assert_eq!(plan.gpu_budgets[0].vram_budget_bytes, 5_000);
         assert_eq!(plan.limits.cpu_quota_percent, 600);
         assert_eq!(plan.limits.memory_max_bytes, 16_000);
+        assert_eq!(plan.limits.systemd.cpu_quota, "600%");
+        assert_eq!(plan.limits.systemd.memory_max, 16_000);
         assert_eq!(
             plan.limits.gpu_vram_budgets,
             vec![GpuVramBudgetMetadata {
                 vendor: GpuVendor::Amd,
                 name: "card0".to_string(),
                 vram_budget_bytes: 5_000,
+                enforcement: "metadata-only".to_string(),
+                enforcement_status: "metadata-only".to_string(),
+                hard_enforced: false,
+                systemd_property: None,
             }]
+        );
+    }
+
+    #[test]
+    fn serialized_budget_plan_includes_enforceable_systemd_properties() {
+        let snapshot = cpu_only_snapshot(16_000, 10_000, 8);
+        let plan = budget_plan(&snapshot, 0.8);
+        let rendered = serde_json::to_value(&plan).expect("budget plan serializes");
+
+        assert_eq!(rendered["limits"]["systemd"]["CPUQuota"], "640%");
+        assert_eq!(rendered["limits"]["systemd"]["MemoryMax"], 8_000);
+        assert_eq!(
+            rendered["limits"]["systemd"]["unit_properties"],
+            serde_json::json!([
+                "CPUAccounting=true",
+                "MemoryAccounting=true",
+                "CPUQuota=640%",
+                "MemoryMax=8000"
+            ])
+        );
+        assert_eq!(
+            rendered["limits"]["systemd"]["systemd_run_args"],
+            serde_json::json!([
+                "--property=CPUAccounting=true",
+                "--property=MemoryAccounting=true",
+                "--property=CPUQuota=640%",
+                "--property=MemoryMax=8000"
+            ])
         );
     }
 

@@ -38,26 +38,24 @@ fn ci_workflow_enforces_core_rust_gates() {
         "cargo fmt --all -- --check",
         "cargo clippy --all-targets --all-features -- -D warnings",
         "cargo test --all-targets --all-features",
-        "cargo build --release --bins",
+        "cargo build --release --bin llmctl",
     ] {
         assert!(workflow.contains(gate), "CI workflow should run `{gate}`");
     }
 }
 
 #[test]
-fn package_manifest_publishes_expected_binaries() {
+fn package_manifest_publishes_default_binary() {
     let manifest = read("Cargo.toml");
 
     for expected in [
         r#"name = "rs-llmctl""#,
         r#"name = "llmctl""#,
         r#"path = "src/bin/llmctl.rs""#,
-        r#"name = "llmctld""#,
-        r#"path = "src/bin/llmctld.rs""#,
     ] {
         assert!(
             manifest.contains(expected),
-            "Cargo.toml should declare `{expected}`"
+            "Cargo.toml should declare default binary detail `{expected}`"
         );
     }
 }
@@ -73,7 +71,12 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
         "cargo test",
         "cargo build --release",
         "target/release/llmctl",
-        "target/release/llmctld",
+        "one rust binary",
+        "default release package publishes one rust binary",
+        "candle-native",
+        "llama-server compatibility and fallback",
+        "upstream-reported token counts",
+        "native tokenizer metering",
         "pci dss",
         "external bind",
         "offline install",
@@ -93,7 +96,6 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
         "aqe",
         "openai_base_url",
         "/usr/local/bin/llmctl",
-        "/usr/local/bin/llmctld",
         "/etc/rs-llmctl/config.toml",
         "/var/lib/rs-llmctl/models",
         "llmctl --config /etc/rs-llmctl/config.toml server check",
@@ -104,6 +106,10 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
         "llmctl --config /etc/rs-llmctl/config.toml observe plan",
         "systemd",
         "llmctld.service",
+        "sudo systemctl status llmctld.service",
+        "sudo systemctl restart llmctld.service",
+        "sudo systemctl stop llmctld.service",
+        "sudo systemctl start llmctld.service",
     ] {
         assert!(docs.contains(topic), "docs should cover `{topic}`");
     }
@@ -151,6 +157,31 @@ fn docs_cover_ordered_deployment_operations() {
 }
 
 #[test]
+fn docs_cover_model_lifecycle_operations() {
+    let docs = product_docs().to_lowercase();
+
+    for required in [
+        "model install",
+        "model import-manifest",
+        "model inventory",
+        "model list",
+        "model stop",
+        "model start",
+        "model update",
+        "model upgrade",
+        "model downgrade",
+        "--new-alias",
+        "restart is required",
+        "without leaking full paths",
+    ] {
+        assert!(
+            docs.contains(required),
+            "docs should cover model lifecycle detail `{required}`"
+        );
+    }
+}
+
+#[test]
 fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
     let docs = product_docs();
     let docs_lower = docs.to_lowercase();
@@ -163,7 +194,7 @@ fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
         "printf '%s' \"$LLMCTL_NEW_API_KEY\" | llmctl security hash-key --stdin",
         "[[security.api_keys]]",
         "sha256 = \"<sha256-from-hash-key>\"",
-        "llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json",
+        "llmctl --json --config /etc/rs-llmctl/config.toml server plan > server-plan.json",
         "server plan export",
         "llmctl --config /etc/rs-llmctl/config.toml audit retention plan --envelope > retention-plan-envelope.json",
         "llmctl --config /etc/rs-llmctl/config.toml data verify-envelope retention-plan-envelope.json",
@@ -193,11 +224,7 @@ fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
 
 #[test]
 fn policy_runbook_documents_strict_passive_review_expectations() {
-    let docs = format!(
-        "{}\n{}",
-        read("README.md"),
-        read("examples/policy-operations-runbook.md")
-    );
+    let docs = read("examples/policy-operations-runbook.md");
     let docs_lower = docs.to_lowercase();
 
     for required in [
@@ -211,7 +238,6 @@ fn policy_runbook_documents_strict_passive_review_expectations() {
         "aliases",
         "retention-plan-envelope.json",
         "metadata sha256",
-        "dry_run",
         "deletes",
         "server-plan.before.json",
         "server-plan.after.json",
@@ -338,12 +364,19 @@ fn systemd_template_documents_server_deployment_controls() {
         "user=llmctl",
         "group=llmctl",
         "environment=llmctl_config=/etc/rs-llmctl/config.toml",
-        "execstart=/usr/local/bin/llmctld --config ${llmctl_config}",
+        "execstart=/usr/local/bin/llmctl --config ${llmctl_config} server run",
         "nonewprivileges=true",
         "privatetmp=true",
         "protectsystem=strict",
         "protecthome=true",
         "readwritepaths=/var/lib/rs-llmctl /var/log/rs-llmctl",
+        "cpuaccounting=true",
+        "memoryaccounting=true",
+        "systemd-run --property=cpuaccounting=true",
+        "cpuquota=<server-plan.resource_limits.systemd.cpuquota>",
+        "memorymax=<server-plan.resource_limits.systemd.memorymax>",
+        "--property=cpuquota=<server-plan.resource_limits.systemd.cpuquota>",
+        "--property=memorymax=<server-plan.resource_limits.systemd.memorymax>",
         "restart=on-failure",
         "[install]",
         "wantedby=multi-user.target",
@@ -351,6 +384,64 @@ fn systemd_template_documents_server_deployment_controls() {
         assert!(
             unit.contains(required),
             "systemd unit should include `{required}`"
+        );
+    }
+}
+
+#[test]
+fn resource_docs_cover_systemd_enforcement_without_gpu_vram_overclaim() {
+    let readme = read("README.md");
+    let readme_lower = readme.to_lowercase();
+    let docs_flat = normalize_doc_text(&readme_lower);
+
+    for required in [
+        "resource_limits.systemd",
+        "cpuquota",
+        "memorymax",
+        "unit_properties",
+        "systemd_run_args",
+        "systemd drop-in",
+        "systemd-run",
+        "default runtime policy budgets 80% of cpu, ram, and detected gpu vram",
+        "gpu vram budgets are exported as `metadata-only` planning evidence",
+        "does not claim hard gpu vram enforcement",
+    ] {
+        assert!(
+            docs_flat.contains(required),
+            "resource docs should cover `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "hard gpu vram enforcement is supported",
+        "gpu vram is hard enforced",
+        "enforces gpu vram with cgroups",
+    ] {
+        assert!(
+            !docs_flat.contains(forbidden),
+            "resource docs should not overclaim `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn docs_pin_native_scheduler_as_contract_only() {
+    let readme = read("README.md");
+    let docs_flat = normalize_doc_text(&readme.to_lowercase());
+
+    for required in [
+        "native scheduler contract",
+        "metadata-only",
+        "queue discipline",
+        "admission/backpressure",
+        "continuous batching",
+        "kv cache budget metadata",
+        "cancellation token metadata",
+        "implemented=false",
+    ] {
+        assert!(
+            docs_flat.contains(required),
+            "README should document scheduler contract detail `{required}`"
         );
     }
 }
@@ -369,11 +460,15 @@ fn install_validation_artifact_is_safe_offline_and_pins_release_checks() {
     for required in [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
-        "CONFIG=${CONFIG:-/etc/rs-llmctl/config.toml}",
-        "UNIT=${UNIT:-/etc/systemd/system/llmctld.service}",
-        "LLMCTL=${LLMCTL:-llmctl}",
-        "LLMCTLD=${LLMCTLD:-llmctld}",
-        "\"${LLMCTLD}\" --config \"${CONFIG}\" --dry-run",
+        "CONFIG=${CONFIG:-${LLMCTL_CONFIG:-/etc/rs-llmctl/config.toml}}",
+        "UNIT=${UNIT:-/etc/systemd/system/${SERVICE_NAME}.service}",
+        "LLMCTL=${LLMCTL:-${BIN_DIR}/llmctl}",
+        "STATE_DIR=${LLMCTL_STATE_DIR:-/var/lib/rs-llmctl}",
+        "LOG_DIR=${LLMCTL_LOG_DIR:-/var/log/rs-llmctl}",
+        "require_dir \"${STATE_DIR}/models\"",
+        "require_dir \"${STATE_DIR}/reports\"",
+        "require_dir \"${LOG_DIR}\"",
+        "require_executable \"${LLMCTL}\"",
         "\"${LLMCTL}\" --config \"${CONFIG}\" security check",
         "\"${LLMCTL}\" --config \"${CONFIG}\" server status",
         "\"${LLMCTL}\" --config \"${CONFIG}\" server plan",
@@ -414,6 +509,62 @@ fn install_validation_artifact_is_safe_offline_and_pins_release_checks() {
         readme.contains("packaging/validate-install.sh"),
         "README should document the install validation script"
     );
+}
+
+#[test]
+fn installer_docs_cover_systemd_defaults_and_overrides() {
+    let script = read("install.sh");
+    let readme = read("README.md");
+    let readme_lower = readme.to_lowercase();
+
+    for required in [
+        "install_systemd=\"${LLMCTL_INSTALL_SYSTEMD:-auto}\"",
+        "config_dir=\"${LLMCTL_CONFIG_DIR:-/etc/rs-llmctl}\"",
+        "config_file=\"${LLMCTL_CONFIG:-${config_dir}/config.toml}\"",
+        "state_dir=\"${LLMCTL_STATE_DIR:-/var/lib/rs-llmctl}\"",
+        "log_dir=\"${LLMCTL_LOG_DIR:-/var/log/rs-llmctl}\"",
+        "service_name=\"${LLMCTL_SERVICE_NAME:-llmctld}\"",
+        "system service installs cannot use a home-directory PREFIX",
+        "useradd --system --gid llmctl",
+        "enable --now \"${service_name}.service\"",
+        "http://127.0.0.1:8765/v1",
+        "release archive includes legacy llmctld",
+        "default install uses llmctl only",
+    ] {
+        assert!(
+            script.contains(required),
+            "install.sh should include installer behavior `{required}`"
+        );
+    }
+
+    for required in [
+        "single default `llmctl` binary",
+        "creates the `llmctl` system user",
+        "`/var/lib/rs-llmctl/models`",
+        "`/var/lib/rs-llmctl/reports`",
+        "`/var/log/rs-llmctl`",
+        "enables and starts it",
+        "sudo systemctl status llmctld.service",
+        "sudo systemctl restart llmctld.service",
+        "sudo systemctl stop llmctld.service",
+        "sudo systemctl start llmctld.service",
+        "http://127.0.0.1:8765/v1",
+        "LLMCTL_INSTALL_SYSTEMD=0",
+        "binary-only install",
+        "LLMCTL_CONFIG_DIR",
+        "LLMCTL_CONFIG",
+        "LLMCTL_STATE_DIR",
+        "LLMCTL_LOG_DIR",
+        "LLMCTL_SERVICE_NAME",
+        "system service installs",
+        "home-directory prefix",
+    ] {
+        let documented = readme.contains(required) || readme_lower.contains(required);
+        assert!(
+            documented,
+            "README should document installer behavior `{required}`"
+        );
+    }
 }
 
 #[test]
@@ -495,7 +646,9 @@ fn release_checksum_artifact_generation_is_pinned() {
         "packaging/generate-checksums.sh",
         "SHA256SUMS",
         "actions/upload-artifact@v4",
-        "release-checksums",
+        "release-artifacts",
+        "dist/rs-llmctl-*.tar.gz",
+        "dist/SHA256SUMS",
     ] {
         assert!(
             workflow.contains(required),
@@ -515,9 +668,11 @@ fn release_checksum_artifact_generation_is_pinned() {
     for required in [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
-        "sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS",
+        "artifact=\"rs-llmctl-${OS}-${ARCH}\"",
+        "tarball=\"${DIST_DIR}/${artifact}.tar.gz\"",
+        "install -m 0755 target/release/llmctl \"${stage}/llmctl\"",
+        "sha256sum \"${artifact}.tar.gz\" > SHA256SUMS",
         "test -x target/release/llmctl",
-        "test -x target/release/llmctld",
     ] {
         assert!(
             script.contains(required),
@@ -535,7 +690,7 @@ fn release_checksum_artifact_generation_is_pinned() {
     let readme = read("README.md");
     for required in [
         "packaging/generate-checksums.sh",
-        "sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS",
+        "dist/rs-llmctl-<os>-<arch>.tar.gz",
         "SHA256SUMS",
     ] {
         assert!(
