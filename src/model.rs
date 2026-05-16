@@ -51,6 +51,22 @@ pub struct InstalledModel {
     pub config: ModelConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineInstallManifest {
+    pub models: Vec<OfflineManifestModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineManifestModel {
+    pub alias: String,
+    pub path: PathBuf,
+    #[serde(default = "default_role")]
+    pub role: String,
+    #[serde(default)]
+    pub weight: u32,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogModel {
     pub id: &'static str,
@@ -176,6 +192,65 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         source: req.source.clone(),
         config,
     })
+}
+
+pub async fn import_offline_manifest(path: &Path) -> Result<Vec<InstalledModel>> {
+    let body = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("read offline install manifest {}", path.display()))?;
+    let manifest: OfflineInstallManifest = toml::from_str(&body)
+        .with_context(|| format!("parse offline install manifest {}", path.display()))?;
+    install_offline_manifest(&manifest, path.parent().unwrap_or_else(|| Path::new("."))).await
+}
+
+pub async fn install_offline_manifest(
+    manifest: &OfflineInstallManifest,
+    base_dir: &Path,
+) -> Result<Vec<InstalledModel>> {
+    anyhow::ensure!(
+        !manifest.models.is_empty(),
+        "offline install manifest must include at least one model"
+    );
+
+    let mut installed = Vec::with_capacity(manifest.models.len());
+    for entry in &manifest.models {
+        validate_alias(&entry.alias)?;
+        let expected = entry.sha256.to_ascii_lowercase();
+        validate_sha256(&expected)?;
+        let path = resolve_manifest_path(base_dir, &entry.path);
+        ensure_gguf_path(&path)?;
+        let metadata = fs::metadata(&path)
+            .await
+            .with_context(|| format!("stat offline model {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "offline model is not a file: {}",
+            path.display()
+        );
+        let sha256 = sha256_file(&path).await?;
+        if sha256 != expected {
+            bail!(
+                "sha256 mismatch for {}: expected {expected}, got {sha256}",
+                path.display()
+            );
+        }
+        let source = ModelSource::LocalPath { path: path.clone() };
+        let config = ModelConfig {
+            alias: entry.alias.clone(),
+            path: path.clone(),
+            role: entry.role.clone(),
+            weight: entry.weight,
+        };
+        installed.push(InstalledModel {
+            alias: entry.alias.clone(),
+            path,
+            sha256,
+            bytes: metadata.len(),
+            source,
+            config,
+        });
+    }
+    Ok(installed)
 }
 
 pub async fn register_local_model(
@@ -316,6 +391,22 @@ fn ensure_gguf_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_sha256(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "sha256 must be 64 hexadecimal characters"
+    );
+    Ok(())
+}
+
+fn resolve_manifest_path(base_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
 fn ensure_relative_component(value: &str, label: &str) -> Result<()> {
     anyhow::ensure!(!value.trim().is_empty(), "{label} cannot be empty");
     anyhow::ensure!(
@@ -373,6 +464,94 @@ mod tests {
         .unwrap();
         assert!(installed.path.starts_with(dir.path().join("cache")));
         assert_eq!(installed.sha256, expected);
+    }
+
+    #[tokio::test]
+    async fn parses_offline_manifest_relative_paths_and_defaults() {
+        let dir = tempdir().unwrap();
+        let model = dir.path().join("tiny.gguf");
+        fs::write(&model, b"manifest-model").await.unwrap();
+        let expected = sha256_file(&model).await.unwrap();
+        let manifest: OfflineInstallManifest = toml::from_str(&format!(
+            r#"
+[[models]]
+alias = "tiny"
+path = "tiny.gguf"
+sha256 = "{expected}"
+"#
+        ))
+        .unwrap();
+
+        let installed = install_offline_manifest(&manifest, dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].alias, "tiny");
+        assert_eq!(installed[0].path, model);
+        assert_eq!(installed[0].config.role, "chat");
+        assert_eq!(installed[0].config.weight, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_offline_manifest_sha_mismatch() {
+        let dir = tempdir().unwrap();
+        let model = dir.path().join("tiny.gguf");
+        fs::write(&model, b"manifest-model").await.unwrap();
+        let manifest = OfflineInstallManifest {
+            models: vec![OfflineManifestModel {
+                alias: "tiny".to_string(),
+                path: PathBuf::from("tiny.gguf"),
+                role: "chat".to_string(),
+                weight: 1,
+                sha256: "0".repeat(64),
+            }],
+        };
+
+        let err = install_offline_manifest(&manifest, dir.path())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("sha256 mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn registers_multiple_models_from_offline_manifest() {
+        let dir = tempdir().unwrap();
+        let chat = dir.path().join("chat.gguf");
+        let embed = dir.path().join("embed.gguf");
+        fs::write(&chat, b"chat-model").await.unwrap();
+        fs::write(&embed, b"embed-model").await.unwrap();
+        let manifest = OfflineInstallManifest {
+            models: vec![
+                OfflineManifestModel {
+                    alias: "chat".to_string(),
+                    path: PathBuf::from("chat.gguf"),
+                    role: "chat".to_string(),
+                    weight: 10,
+                    sha256: sha256_file(&chat).await.unwrap(),
+                },
+                OfflineManifestModel {
+                    alias: "embed".to_string(),
+                    path: PathBuf::from("embed.gguf"),
+                    role: "embedding".to_string(),
+                    weight: 2,
+                    sha256: sha256_file(&embed).await.unwrap(),
+                },
+            ],
+        };
+
+        let installed = install_offline_manifest(&manifest, dir.path())
+            .await
+            .unwrap();
+        let configs: Vec<_> = installed.into_iter().map(|model| model.config).collect();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].alias, "chat");
+        assert_eq!(configs[0].weight, 10);
+        assert_eq!(configs[1].alias, "embed");
+        assert_eq!(configs[1].role, "embedding");
     }
 
     #[test]

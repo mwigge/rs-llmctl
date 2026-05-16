@@ -502,6 +502,69 @@ impl Storage {
         .await?;
         rows.into_iter().map(row_to_quota_decision_record).collect()
     }
+
+    pub async fn allowed_quota_decision_count(
+        &self,
+        principal: &Principal,
+        subject_scoped: bool,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<u64> {
+        let scope_value = if subject_scoped {
+            &principal.subject
+        } else {
+            &principal.team
+        };
+        let scope_column = if subject_scoped { "actor" } else { "team" };
+        let query = format!(
+            r#"
+            SELECT COUNT(*) AS count
+            FROM quota_decisions
+            WHERE allowed = 1
+              AND at >= ?
+              AND at < ?
+              AND {scope_column} = ?
+            "#
+        );
+        let row = sqlx::query(&query)
+            .bind(encode_time(from))
+            .bind(encode_time(to))
+            .bind(scope_value)
+            .fetch_one(&self.pool)
+            .await?;
+        i64_to_u64(row.try_get("count")?, "count")
+    }
+
+    pub async fn usage_tokens_total(
+        &self,
+        principal: &Principal,
+        subject_scoped: bool,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<u64> {
+        let scope_value = if subject_scoped {
+            &principal.subject
+        } else {
+            &principal.team
+        };
+        let scope_column = if subject_scoped { "actor" } else { "team" };
+        let query = format!(
+            r#"
+            SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens
+            FROM usage_events
+            WHERE at >= ?
+              AND at < ?
+              AND {scope_column} = ?
+            "#
+        );
+        let row = sqlx::query(&query)
+            .bind(encode_time(from))
+            .bind(encode_time(to))
+            .bind(scope_value)
+            .fetch_one(&self.pool)
+            .await?;
+        i64_to_u64(row.try_get("tokens")?, "tokens")
+    }
 }
 
 fn encode_time(at: DateTime<Utc>) -> String {

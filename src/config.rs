@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -29,6 +30,8 @@ pub struct Config {
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
+    pub audit: AuditConfig,
+    #[serde(default)]
     pub models: Vec<ModelConfig>,
     #[serde(default)]
     pub quotas: Vec<QuotaConfig>,
@@ -43,6 +46,7 @@ impl Default for Config {
             resources: ResourceConfig::default(),
             storage: StorageConfig::default(),
             observability: ObservabilityConfig::default(),
+            audit: AuditConfig::default(),
             models: vec![],
             quotas: vec![],
         }
@@ -71,14 +75,19 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SecurityConfig {
     pub production: bool,
+    #[serde(alias = "require_auth")]
     pub require_auth: bool,
+    #[serde(alias = "bind_external")]
     pub bind_external: bool,
+    #[serde(alias = "api_keys")]
     pub api_keys: Vec<ApiKeyConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiKeyConfig {
     pub id: String,
     pub sha256: String,
@@ -120,13 +129,86 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct ObservabilityConfig {
+    /// Deprecated shorthand retained for older configs; prefer exporter.endpoint.
     pub otlp_endpoint: Option<String>,
     pub service_name: Option<String>,
+    pub service_version: Option<String>,
+    pub environment: Option<String>,
+    pub traces_enabled: bool,
+    pub metrics_enabled: bool,
+    pub logs_enabled: bool,
+    pub resource_attributes: BTreeMap<String, String>,
+    pub exporter: ObservabilityExporterConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            service_name: None,
+            service_version: None,
+            environment: None,
+            traces_enabled: true,
+            metrics_enabled: true,
+            logs_enabled: true,
+            resource_attributes: BTreeMap::new(),
+            exporter: ObservabilityExporterConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ObservabilityExporterConfig {
+    pub endpoint: Option<String>,
+    pub protocol: OtlpProtocol,
+    pub headers: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+impl Default for ObservabilityExporterConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            protocol: OtlpProtocol::HttpProtobuf,
+            headers: BTreeMap::new(),
+            timeout_ms: 5_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtlpProtocol {
+    #[default]
+    HttpProtobuf,
+    Grpc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct AuditConfig {
+    pub retention_days: u32,
+    pub report_directory: Option<PathBuf>,
+    pub report_formats: Vec<String>,
+    pub monthly_reports: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: 365,
+            report_directory: None,
+            report_formats: vec!["json".to_string()],
+            monthly_reports: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelConfig {
     pub alias: String,
     pub path: PathBuf,
@@ -173,11 +255,5 @@ pub async fn save(path: &Path, cfg: &Config) -> Result<()> {
 }
 
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
-    if cfg.security.production || cfg.security.bind_external || cfg.server.host == "0.0.0.0" {
-        anyhow::ensure!(
-            cfg.security.require_auth && !cfg.security.api_keys.is_empty(),
-            "external/production serving requires authentication"
-        );
-    }
-    Ok(())
+    crate::security::validate_production_security(cfg)
 }

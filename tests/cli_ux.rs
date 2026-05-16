@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -61,6 +62,10 @@ fn assert_success_json(mut command: Command) -> Value {
 
 fn read_config(path: &Path) -> String {
     fs::read_to_string(path).expect("read config")
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[test]
@@ -153,4 +158,57 @@ fn data_export_and_audit_monthly_are_scriptable_json_reports() {
     assert_eq!(report["month"], 5);
     assert!(report["audit_events"].is_array());
     assert!(report["usage_summary"].is_object());
+}
+
+#[test]
+fn model_import_manifest_registers_multiple_offline_models() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let bundle = dir.path().join("bundle");
+    fs::create_dir(&bundle).expect("create bundle");
+    let chat_bytes = b"chat-model";
+    let review_bytes = b"review-model";
+    fs::write(bundle.join("chat.gguf"), chat_bytes).expect("write chat model");
+    fs::write(bundle.join("review.gguf"), review_bytes).expect("write review model");
+    let manifest = bundle.join("manifest.toml");
+    fs::write(
+        &manifest,
+        format!(
+            r#"
+[[models]]
+alias = "chat"
+path = "chat.gguf"
+role = "chat"
+weight = 10
+sha256 = "{}"
+
+[[models]]
+alias = "review"
+path = "review.gguf"
+role = "review"
+weight = 3
+sha256 = "{}"
+"#,
+            sha256(chat_bytes),
+            sha256(review_bytes)
+        ),
+    )
+    .expect("write manifest");
+
+    let mut import = llmctl();
+    import
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("import-manifest")
+        .arg(&manifest);
+    let imported = assert_success_json(import);
+
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["imported"].as_array().expect("imported").len(), 2);
+    assert_eq!(imported["models"][0]["alias"], "chat");
+    assert_eq!(imported["models"][1]["alias"], "review");
+    let saved = read_config(&config);
+    assert!(saved.contains("alias = \"chat\""));
+    assert!(saved.contains("alias = \"review\""));
 }

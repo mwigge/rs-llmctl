@@ -18,6 +18,11 @@ cargo run --bin llmctld -- --config ~/.config/rs-llmctl/config.toml
 Default production posture requires authentication before binding externally.
 Use dev mode for local unauthenticated experiments only.
 
+Production configs store API keys as SHA-256 digests only. Plaintext secret
+fields in the security section are rejected, and sensitive observability
+headers such as authorization, API key, token, or secret headers must use an
+`env:NAME` reference instead of embedding the value in TOML.
+
 ## Development Gates
 
 Changes are expected to be test-driven: add or update the focused test first,
@@ -41,6 +46,18 @@ external bind and production mode require API key authentication, scoped keys,
 quotas, audit events, usage reports, and resource budget enforcement. Binding
 to `0.0.0.0` or setting `security.bind-external = true` must be paired with
 `security.require-auth = true` and at least one configured API key.
+
+Observability is configured as an OTel-oriented exporter plan. Set
+`observability.service-name`, enable or disable traces, metrics, and logs, and
+configure `observability.exporter.endpoint` with `http-protobuf` or `grpc`
+protocols for an OTLP collector. Collector authentication belongs in
+environment-backed header references, for example `env:OTEL_EXPORTER_OTLP_HEADERS`,
+not plaintext config.
+
+Audit retention and report generation are explicit config: `audit.retention-days`
+defaults to 365, `audit.report-directory` can point at an operator-managed
+artifact path, `audit.report-formats` defaults to JSON, and
+`audit.monthly-reports` controls scheduled monthly report generation.
 
 Model lifecycle is designed for offline install paths as well as direct URL
 downloads: operators can pre-stage approved model bundles and register local

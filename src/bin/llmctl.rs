@@ -80,6 +80,7 @@ enum ServerCommand {
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
     Install(ModelInstallArgs),
+    ImportManifest(ModelImportManifestArgs),
     List,
 }
 
@@ -115,6 +116,11 @@ struct ModelInstallArgs {
     copy: bool,
     #[arg(long)]
     sha256: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ModelImportManifestArgs {
+    manifest: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -313,6 +319,25 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             emit(
                 as_json,
                 &json!({ "status": "installed", "model": installed, "models": cfg.models }),
+            )
+        }
+        ModelCommand::ImportManifest(args) => {
+            create_storage_dirs(&cfg.storage).await?;
+            let installed = model::import_offline_manifest(&args.manifest).await?;
+
+            for model in &installed {
+                upsert_model(&mut cfg.models, model.config.clone());
+            }
+            config::save(path, &cfg).await?;
+
+            let storage = init_storage(&cfg.storage).await?;
+            for model in &cfg.models {
+                storage.upsert_model(model).await?;
+            }
+
+            emit(
+                as_json,
+                &json!({ "status": "imported", "imported": installed, "models": cfg.models }),
             )
         }
         ModelCommand::List => emit(as_json, &cfg.models),

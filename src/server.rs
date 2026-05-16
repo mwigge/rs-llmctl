@@ -210,7 +210,7 @@ async fn chat_completions(
         }
     };
     let model = route.requested_alias.clone();
-    let quota = match check_quota(&state.cfg.quotas, &principal, &model) {
+    let quota = match check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await {
         Ok(decision) => decision,
         Err(err) => {
             record_audit(
