@@ -20,6 +20,8 @@ fn enable_tls_termination(cfg: &mut Config) {
     cfg.security.tls_termination.provider = Some("envoy-edge".to_string());
     cfg.security.tls_termination.evidence = Some("change-record-123".to_string());
     cfg.security.tls_termination.m_tls = true;
+    cfg.audit.monthly_reports = true;
+    cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
 }
 
 #[test]
@@ -65,6 +67,33 @@ fn external_bind_requires_documented_tls_termination() {
 
     enable_tls_termination(&mut cfg);
     config::validate_production_security(&cfg).expect("documented TLS termination is accepted");
+}
+
+#[test]
+fn external_bind_requires_cra_active_audit_and_otel_controls() {
+    let mut cfg = Config::default();
+    cfg.server.host = "0.0.0.0".to_string();
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![hashed_key()];
+    cfg.security.tls_termination.enabled = true;
+    cfg.security.tls_termination.provider = Some("envoy-edge".to_string());
+    cfg.security.tls_termination.evidence = Some("change-record-123".to_string());
+
+    let err = config::validate_production_security(&cfg).expect_err("monthly reports required");
+    assert!(
+        err.to_string().contains("monthly audit reports"),
+        "unexpected error: {err}"
+    );
+
+    cfg.audit.monthly_reports = true;
+    let err = config::validate_production_security(&cfg).expect_err("OTel endpoint required");
+    assert!(
+        err.to_string().contains("OTel exporter endpoint"),
+        "unexpected error: {err}"
+    );
+
+    cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
+    config::validate_production_security(&cfg).expect("CRA active controls accepted");
 }
 
 #[test]

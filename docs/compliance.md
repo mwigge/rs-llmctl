@@ -51,7 +51,7 @@ Monthly evidence should include:
 - `data export --envelope`;
 - `security audit-config`;
 - `compliance evidence`;
-- TLS termination or mTLS evidence from `security audit-config`.
+- TLS termination or mTLS evidence from `security audit-config`;
 - SBOM, checksums, and release signature for deployed binaries.
 
 ## SBOM, Provenance, And Signing

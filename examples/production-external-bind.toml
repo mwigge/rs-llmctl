@@ -54,10 +54,10 @@ headers = { authorization = "env:OTEL_EXPORTER_OTLP_AUTHORIZATION", "x-tenant" =
 timeout_ms = 5000
 
 [audit]
-retention_days = 365
-report_directory = "/var/log/rs-llmctl/reports"
-report_formats = ["json", "jsonl"]
-monthly_reports = true
+retention-days = 365
+report-directory = "/var/log/rs-llmctl/reports"
+report-formats = ["json", "jsonl"]
+monthly-reports = true
 
 [[models]]
 alias = "qwen-prod"

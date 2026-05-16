@@ -32,6 +32,29 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
                 .is_some_and(|evidence| !evidence.trim().is_empty()),
             "TLS termination must declare evidence"
         );
+        anyhow::ensure!(
+            cfg.audit.retention_days > 0,
+            "CRA Article 14 active control requires audit retention"
+        );
+        anyhow::ensure!(
+            cfg.audit.monthly_reports,
+            "CRA Article 14 active control requires monthly audit reports"
+        );
+        anyhow::ensure!(
+            cfg.observability.traces_enabled
+                && cfg.observability.metrics_enabled
+                && cfg.observability.logs_enabled,
+            "CRA Article 14 active control requires OTel traces, metrics, and logs"
+        );
+        anyhow::ensure!(
+            cfg.observability
+                .exporter
+                .endpoint
+                .as_deref()
+                .or(cfg.observability.otlp_endpoint.as_deref())
+                .is_some_and(|endpoint| !endpoint.trim().is_empty()),
+            "CRA Article 14 active control requires an OTel exporter endpoint"
+        );
     }
 
     Ok(())

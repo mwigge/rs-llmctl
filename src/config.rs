@@ -217,7 +217,7 @@ pub enum OtlpProtocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AuditConfig {
     pub retention_days: u32,
     pub report_directory: Option<PathBuf>,

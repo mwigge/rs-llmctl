@@ -2188,6 +2188,12 @@ monthly-reports = true
     );
     assert_eq!(report["audit"]["retention_days"], 90);
     assert_eq!(report["audit"]["monthly_reports"], true);
+    assert_eq!(
+        report["cra_article_14"]["operational_status"],
+        "active_control"
+    );
+    assert_eq!(report["cra_article_14"]["monthly_reports"], true);
+    assert_eq!(report["cra_article_14"]["otel_exporter_configured"], true);
     assert_eq!(report["systemd"]["checked"], true);
     assert_eq!(report["systemd"]["present"], true);
     assert_eq!(report["systemd"]["has_exec_start"], true);
@@ -2273,6 +2279,14 @@ retention-days = 0
         .expect("findings")
         .iter()
         .any(|finding| finding == "external/production serving requires authentication"));
+    assert!(report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .any(|finding| finding == "CRA Article 14 active control requires monthly audit reports"));
+    assert!(report["findings"].as_array().expect("findings").iter().any(
+        |finding| finding == "CRA Article 14 active control requires an OTel exporter endpoint"
+    ));
 
     let output = serde_json::to_string(&report).expect("serialize report");
     assert!(!output.contains("Bearer plaintext"));

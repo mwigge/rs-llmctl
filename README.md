@@ -152,6 +152,8 @@ The validation script runs daemon dry-run planning, `security check`,
 - external bind requires authentication and scoped API keys;
 - raw API keys are never stored in config;
 - external production bind requires documented TLS termination or mTLS evidence;
+- CRA Article 14 is treated as active, so production external bind requires
+  monthly audit reports, audit retention, and an OTel exporter endpoint;
 - sensitive exporter headers must use `env:` references;
 - response headers expose only safe metadata such as request IDs, model aliases,
   quota state, and policy status;

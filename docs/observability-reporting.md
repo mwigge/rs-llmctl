@@ -16,6 +16,11 @@ The config exposes an OTel-oriented exporter plan:
 Runtime events include audit rows, usage rows, quota decisions, model inventory,
 and resource observations.
 
+Because CRA Article 14 is treated as active, production external-bind configs
+must keep traces, metrics, and logs enabled and configure an OTLP exporter
+endpoint. `security check` rejects production external bind without that
+exporter.
+
 When an OTLP endpoint is configured, the daemon installs trace, metric, and log
 providers and bridges `tracing` events into OpenTelemetry logs. Request IDs,
 model aliases, quota decisions, usage totals, and lifecycle events are the

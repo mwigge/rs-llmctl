@@ -1007,7 +1007,14 @@ fn compliance_evidence(cfg: &Config) -> serde_json::Value {
                 && cfg.security.tls_termination.provider.as_deref().is_some_and(|value| !value.trim().is_empty())
                 && cfg.security.tls_termination.evidence.as_deref().is_some_and(|value| !value.trim().is_empty()),
             "audit_reports_enabled": cfg.audit.monthly_reports && cfg.audit.retention_days > 0,
-            "otel_enabled": cfg.observability.traces_enabled || cfg.observability.metrics_enabled || cfg.observability.logs_enabled,
+            "otel_enabled": cfg.observability.traces_enabled && cfg.observability.metrics_enabled && cfg.observability.logs_enabled,
+            "otel_exporter_configured": cfg.observability.exporter.endpoint.is_some() || cfg.observability.otlp_endpoint.is_some(),
+            "cra_article_14_active_control": cfg.audit.monthly_reports
+                && cfg.audit.retention_days > 0
+                && cfg.observability.traces_enabled
+                && cfg.observability.metrics_enabled
+                && cfg.observability.logs_enabled
+                && (cfg.observability.exporter.endpoint.is_some() || cfg.observability.otlp_endpoint.is_some()),
             "release_integrity_scripts": [
                 "packaging/generate-sbom.sh",
                 "packaging/generate-checksums.sh",
@@ -1448,6 +1455,32 @@ async fn audit_config_report(
     if cfg.audit.retention_days == 0 {
         findings.push("audit retention must be greater than zero days".to_string());
     }
+    if cfg.security.production || external_bind {
+        if !cfg.audit.monthly_reports {
+            findings
+                .push("CRA Article 14 active control requires monthly audit reports".to_string());
+        }
+        if !(cfg.observability.traces_enabled
+            && cfg.observability.metrics_enabled
+            && cfg.observability.logs_enabled)
+        {
+            findings.push(
+                "CRA Article 14 active control requires OTel traces, metrics, and logs".to_string(),
+            );
+        }
+        if cfg
+            .observability
+            .exporter
+            .endpoint
+            .as_deref()
+            .or(cfg.observability.otlp_endpoint.as_deref())
+            .is_none_or(|endpoint| endpoint.trim().is_empty())
+        {
+            findings.push(
+                "CRA Article 14 active control requires an OTel exporter endpoint".to_string(),
+            );
+        }
+    }
     if systemd_unit.is_some()
         && (!systemd["present"].as_bool().unwrap_or(false)
             || !systemd["has_exec_start"].as_bool().unwrap_or(false))
@@ -1487,6 +1520,19 @@ async fn audit_config_report(
             "report_directory": cfg.audit.report_directory,
             "report_formats": cfg.audit.report_formats,
             "monthly_reports": cfg.audit.monthly_reports
+        },
+        "cra_article_14": {
+            "regulation": "Regulation (EU) 2024/2847",
+            "operational_status": "active_control",
+            "monthly_reports": cfg.audit.monthly_reports,
+            "otel_exporter_configured": cfg.observability.exporter.endpoint.is_some() || cfg.observability.otlp_endpoint.is_some(),
+            "required_evidence": [
+                "security audit-config",
+                "audit report monthly --envelope",
+                "audit report request --envelope",
+                "data export --envelope",
+                "compliance evidence"
+            ]
         },
         "systemd": systemd,
         "findings": findings
