@@ -18,6 +18,7 @@ pub enum ReportKind {
     PerRequestData,
     DataExport,
     Chargeback,
+    RetentionPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

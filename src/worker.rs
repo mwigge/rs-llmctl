@@ -1,11 +1,12 @@
 use crate::config::{Config, ModelConfig, ResourceConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::process::Command;
 
 const DEFAULT_GPU_LAYERS: u32 = 99;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkerId(String);
 
 impl WorkerId {
@@ -117,6 +118,23 @@ pub struct StartupPlan {
     pub workers: Vec<PlannedWorker>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDiffCounts {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDiff {
+    pub added: Vec<WorkerId>,
+    pub removed: Vec<WorkerId>,
+    pub changed: Vec<WorkerId>,
+    pub unchanged: Vec<WorkerId>,
+    pub counts: PlanDiffCounts,
+}
+
 impl StartupPlan {
     pub fn from_config(cfg: &Config) -> Self {
         let workers = cfg
@@ -142,6 +160,54 @@ impl StartupPlan {
 
         Self { workers }
     }
+
+    pub fn diff(&self, next: &Self) -> PlanDiff {
+        let old_workers = workers_by_alias(&self.workers);
+        let new_workers = workers_by_alias(&next.workers);
+
+        let added = new_workers
+            .keys()
+            .filter(|alias| !old_workers.contains_key(*alias))
+            .map(|alias| WorkerId::new(alias.clone()))
+            .collect::<Vec<_>>();
+        let removed = old_workers
+            .keys()
+            .filter(|alias| !new_workers.contains_key(*alias))
+            .map(|alias| WorkerId::new(alias.clone()))
+            .collect::<Vec<_>>();
+
+        let mut changed = Vec::new();
+        let mut unchanged = Vec::new();
+        for (alias, old_worker) in &old_workers {
+            if let Some(new_worker) = new_workers.get(alias) {
+                if old_worker.command == new_worker.command {
+                    unchanged.push(WorkerId::new(alias.clone()));
+                } else {
+                    changed.push(WorkerId::new(alias.clone()));
+                }
+            }
+        }
+
+        PlanDiff {
+            counts: PlanDiffCounts {
+                added: added.len(),
+                removed: removed.len(),
+                changed: changed.len(),
+                unchanged: unchanged.len(),
+            },
+            added,
+            removed,
+            changed,
+            unchanged,
+        }
+    }
+}
+
+fn workers_by_alias(workers: &[PlannedWorker]) -> BTreeMap<String, &PlannedWorker> {
+    workers
+        .iter()
+        .map(|worker| (worker.worker.id.as_str().to_string(), worker))
+        .collect()
 }
 
 impl CommandSpec {
@@ -479,5 +545,84 @@ mod tests {
             plan.workers[0].command.args.last().map(String::as_str),
             Some("99")
         );
+    }
+
+    #[test]
+    fn startup_plan_diff_reports_added_removed_and_changed_worker_aliases() {
+        let old = StartupPlan {
+            workers: vec![
+                PlannedWorker {
+                    worker: WorkerSpec {
+                        id: WorkerId::new("chat"),
+                        model: model("chat", "/models/chat-v1.gguf"),
+                        bind_host: "127.0.0.1".to_string(),
+                        port: 19000,
+                        context_size: 4096,
+                        backend: WorkerBackend::Cpu,
+                    },
+                    command: CommandSpec {
+                        program: PathBuf::from("llama-server"),
+                        args: vec!["--model".to_string(), "/models/chat-v1.gguf".to_string()],
+                        env: Vec::new(),
+                    },
+                },
+                PlannedWorker {
+                    worker: WorkerSpec {
+                        id: WorkerId::new("embed"),
+                        model: model("embed", "/models/embed.gguf"),
+                        bind_host: "127.0.0.1".to_string(),
+                        port: 19001,
+                        context_size: 4096,
+                        backend: WorkerBackend::Cpu,
+                    },
+                    command: CommandSpec {
+                        program: PathBuf::from("llama-server"),
+                        args: vec!["--model".to_string(), "/models/embed.gguf".to_string()],
+                        env: Vec::new(),
+                    },
+                },
+            ],
+        };
+        let new = StartupPlan {
+            workers: vec![
+                PlannedWorker {
+                    worker: WorkerSpec {
+                        id: WorkerId::new("chat"),
+                        model: model("chat", "/models/chat-v2.gguf"),
+                        bind_host: "127.0.0.1".to_string(),
+                        port: 19000,
+                        context_size: 4096,
+                        backend: WorkerBackend::Cpu,
+                    },
+                    command: CommandSpec {
+                        program: PathBuf::from("llama-server"),
+                        args: vec!["--model".to_string(), "/models/chat-v2.gguf".to_string()],
+                        env: Vec::new(),
+                    },
+                },
+                PlannedWorker {
+                    worker: WorkerSpec {
+                        id: WorkerId::new("coder"),
+                        model: model("coder", "/models/coder.gguf"),
+                        bind_host: "127.0.0.1".to_string(),
+                        port: 19001,
+                        context_size: 4096,
+                        backend: WorkerBackend::Cpu,
+                    },
+                    command: CommandSpec {
+                        program: PathBuf::from("llama-server"),
+                        args: vec!["--model".to_string(), "/models/coder.gguf".to_string()],
+                        env: Vec::new(),
+                    },
+                },
+            ],
+        };
+
+        let diff = old.diff(&new);
+
+        assert_eq!(diff.added, vec![WorkerId::new("coder")]);
+        assert_eq!(diff.removed, vec![WorkerId::new("embed")]);
+        assert_eq!(diff.changed, vec![WorkerId::new("chat")]);
+        assert_eq!(diff.unchanged, vec![]);
     }
 }

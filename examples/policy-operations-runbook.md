@@ -24,6 +24,12 @@ fields used in config:
 llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml
 ```
 
+Quota import rejects policies with blank subjects or teams,
+`requests_per_minute`, `tokens_per_day`, or `max_concurrency` values that are
+not greater than zero, or `allowed_models` entries that contain empty model
+aliases. Fix the policy file and repeat review instead of carrying invalid
+limits forward.
+
 Run `llmctl --config /etc/rs-llmctl/config.toml quota list` after import and
 attach the output to the change record.
 
@@ -51,7 +57,7 @@ the operator secret manager and distribute it through the approved channel.
 
 ## Server Plan Export
 
-Capture a server plan export before the service is started or restarted:
+Capture a server plan export before any production service activation change:
 
 ```bash
 llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
@@ -59,3 +65,26 @@ llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
 
 Review `server-plan.json` for the planned worker count, model aliases, ports,
 program path, arguments, and environment before approving the rollout.
+
+For policy-only changes, keep before/after plan artifacts and review the diff
+before approving the change record:
+
+```bash
+llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.before.json
+llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.after.json
+llmctl server plan-diff server-plan.before.json server-plan.after.json
+```
+
+## Retention Envelope Review
+
+Capture the retention plan as a verifiable envelope:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml audit retention plan --envelope > retention-plan-envelope.json
+llmctl --config /etc/rs-llmctl/config.toml data verify-envelope retention-plan-envelope.json
+```
+
+Attach `retention-plan-envelope.json` and the verification output to the change
+record. Review the envelope `metadata sha256`, confirm the verification hashes
+match, and confirm the payload keeps `dry_run` set to true and `deletes` set to
+false.

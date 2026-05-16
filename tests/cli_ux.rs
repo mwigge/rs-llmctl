@@ -80,6 +80,22 @@ fn read_config(path: &Path) -> String {
     fs::read_to_string(path).expect("read config")
 }
 
+fn assert_failure_stderr_contains(mut command: Command, needle: &str) {
+    let output = command.output().expect("run llmctl");
+    assert!(
+        !output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(needle),
+        "stderr did not contain {needle:?}:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -531,6 +547,119 @@ weight = 1
 }
 
 #[test]
+fn server_plan_diff_reports_alias_changes_without_echoing_command_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let old_plan = dir.path().join("old-plan.json");
+    let new_plan = dir.path().join("new-plan.json");
+    fs::write(
+        &old_plan,
+        serde_json::to_string_pretty(&json!({
+            "workers": [
+                {
+                    "worker": {
+                        "id": "chat",
+                        "model": { "alias": "chat", "path": "/models/chat-v1.gguf", "role": "chat", "weight": 1 },
+                        "bind_host": "127.0.0.1",
+                        "port": 19000,
+                        "context_size": 4096,
+                        "backend": { "type": "cpu" }
+                    },
+                    "command": {
+                        "program": "llama-server",
+                        "args": ["--model", "/models/chat-v1.gguf", "--api-key", "old-command-secret"],
+                        "env": [["LLAMA_TOKEN", "old-env-secret"]]
+                    }
+                },
+                {
+                    "worker": {
+                        "id": "embed",
+                        "model": { "alias": "embed", "path": "/models/embed.gguf", "role": "embedding", "weight": 1 },
+                        "bind_host": "127.0.0.1",
+                        "port": 19001,
+                        "context_size": 4096,
+                        "backend": { "type": "cpu" }
+                    },
+                    "command": {
+                        "program": "llama-server",
+                        "args": ["--model", "/models/embed.gguf"],
+                        "env": []
+                    }
+                }
+            ]
+        }))
+        .expect("serialize old plan"),
+    )
+    .expect("write old plan");
+    fs::write(
+        &new_plan,
+        serde_json::to_string_pretty(&json!({
+            "workers": [
+                {
+                    "worker": {
+                        "id": "chat",
+                        "model": { "alias": "chat", "path": "/models/chat-v2.gguf", "role": "chat", "weight": 1 },
+                        "bind_host": "127.0.0.1",
+                        "port": 19000,
+                        "context_size": 4096,
+                        "backend": { "type": "cpu" }
+                    },
+                    "command": {
+                        "program": "llama-server",
+                        "args": ["--model", "/models/chat-v2.gguf", "--api-key", "new-command-secret"],
+                        "env": [["LLAMA_TOKEN", "new-env-secret"]]
+                    }
+                },
+                {
+                    "worker": {
+                        "id": "coder",
+                        "model": { "alias": "coder", "path": "/models/coder.gguf", "role": "code", "weight": 1 },
+                        "bind_host": "127.0.0.1",
+                        "port": 19001,
+                        "context_size": 4096,
+                        "backend": { "type": "cpu" }
+                    },
+                    "command": {
+                        "program": "llama-server",
+                        "args": ["--model", "/models/coder.gguf"],
+                        "env": []
+                    }
+                }
+            ]
+        }))
+        .expect("serialize new plan"),
+    )
+    .expect("write new plan");
+
+    let mut plan_diff = llmctl();
+    plan_diff
+        .arg("server")
+        .arg("plan-diff")
+        .arg(&old_plan)
+        .arg(&new_plan);
+    let output = plan_diff.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let diff: Value = serde_json::from_str(&raw).expect("stdout is plan diff json");
+    assert_eq!(diff["added"], json!(["coder"]));
+    assert_eq!(diff["removed"], json!(["embed"]));
+    assert_eq!(diff["changed"], json!(["chat"]));
+    assert_eq!(diff["counts"]["added"], 1);
+    assert_eq!(diff["counts"]["removed"], 1);
+    assert_eq!(diff["counts"]["changed"], 1);
+    assert!(!raw.contains("old-command-secret"));
+    assert!(!raw.contains("new-command-secret"));
+    assert!(!raw.contains("old-env-secret"));
+    assert!(!raw.contains("new-env-secret"));
+}
+
+#[test]
 fn data_export_and_audit_monthly_are_scriptable_json_reports() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
@@ -700,6 +829,53 @@ retention-days = 30
     let raw = serde_json::to_string(&plan).expect("serialize plan");
     assert!(!raw.contains("secret"));
     assert!(!raw.contains("sha256"));
+}
+
+#[test]
+fn audit_retention_plan_envelope_wraps_payload_with_hash_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let envelope_path = dir.path().join("retention-plan-envelope.json");
+
+    let mut plan = llmctl();
+    plan.arg("--config")
+        .arg(&config)
+        .arg("audit")
+        .arg("retention")
+        .arg("plan")
+        .arg("--envelope");
+    let envelope = assert_success_json(plan);
+
+    assert_eq!(envelope["metadata"]["report_kind"], "retention_plan");
+    assert!(
+        envelope["metadata"]["sha256"]
+            .as_str()
+            .expect("sha256")
+            .len()
+            == 64
+    );
+    assert_eq!(envelope["payload"]["status"], "planned");
+    assert_eq!(envelope["payload"]["operation"], "audit_retention");
+    assert_eq!(envelope["payload"]["dry_run"], true);
+    assert_eq!(envelope["payload"]["deletes"], false);
+
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).expect("serialize envelope"),
+    )
+    .expect("write envelope");
+
+    let mut verify = llmctl();
+    verify
+        .arg("data")
+        .arg("verify-envelope")
+        .arg(&envelope_path);
+    let verified = assert_success_json(verify);
+
+    assert_eq!(verified["status"], "valid");
+    assert_eq!(verified["valid"], true);
+    assert_eq!(verified["expected_sha256"], envelope["metadata"]["sha256"]);
+    assert_eq!(verified["actual_sha256"], envelope["metadata"]["sha256"]);
 }
 
 #[test]
@@ -1175,6 +1351,206 @@ allowed_models = ["llama"]
     let saved = read_config(&config);
     assert!(saved.contains("subject = \"team-default\""));
     assert!(!saved.contains("subject = \"broken\""));
+}
+
+#[test]
+fn quota_import_rejects_invalid_json_policy_cases() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let cases = [
+        (
+            "duplicate-subject.json",
+            r#"
+{
+  "quotas": [
+    { "subject": "alice", "team": "platform", "requests_per_minute": 1, "tokens_per_day": 100, "max_concurrency": 1, "allowed_models": ["chat"] },
+    { "subject": "alice", "team": "research", "requests_per_minute": 2, "tokens_per_day": 200, "max_concurrency": 1, "allowed_models": ["chat"] }
+  ]
+}
+"#,
+            "duplicate subject",
+        ),
+        (
+            "duplicate-team.json",
+            r#"
+{
+  "quotas": [
+    { "subject": "alice", "team": "platform", "requests_per_minute": 1, "tokens_per_day": 100, "max_concurrency": 1, "allowed_models": ["chat"] },
+    { "subject": "bob", "team": "platform", "requests_per_minute": 2, "tokens_per_day": 200, "max_concurrency": 1, "allowed_models": ["chat"] }
+  ]
+}
+"#,
+            "duplicate team",
+        ),
+        (
+            "zero-limit.json",
+            r#"
+[
+  { "subject": "alice", "team": "platform", "requests_per_minute": 0, "tokens_per_day": 100, "max_concurrency": 1, "allowed_models": ["chat"] }
+]
+"#,
+            "requests_per_minute",
+        ),
+        (
+            "negative-limit.json",
+            r#"
+[
+  { "subject": "alice", "team": "platform", "requests_per_minute": -1, "tokens_per_day": 100, "max_concurrency": 1, "allowed_models": ["chat"] }
+]
+"#,
+            "expected u32",
+        ),
+        (
+            "overflow-limit.json",
+            r#"
+[
+  { "subject": "alice", "team": "platform", "requests_per_minute": 1, "tokens_per_day": 18446744073709551616, "max_concurrency": 1, "allowed_models": ["chat"] }
+]
+"#,
+            "expected u64",
+        ),
+        (
+            "whitespace-alias.json",
+            r#"
+[
+  { "subject": "alice", "team": "platform", "requests_per_minute": 1, "tokens_per_day": 100, "max_concurrency": 1, "allowed_models": ["   "] }
+]
+"#,
+            "allowed_models",
+        ),
+    ];
+
+    for (name, body, needle) in cases {
+        let policy = dir.path().join(name);
+        fs::write(&policy, body).expect("write policy");
+
+        let mut import = llmctl();
+        import
+            .arg("--config")
+            .arg(&config)
+            .arg("quota")
+            .arg("import")
+            .arg(&policy);
+        assert_failure_stderr_contains(import, needle);
+    }
+}
+
+#[test]
+fn quota_import_rejects_invalid_toml_policy_cases() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let cases = [
+        (
+            "duplicate-subject.toml",
+            r#"
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = 1
+tokens_per_day = 100
+max_concurrency = 1
+allowed_models = ["chat"]
+
+[[quotas]]
+subject = "alice"
+team = "research"
+requests_per_minute = 2
+tokens_per_day = 200
+max_concurrency = 1
+allowed_models = ["chat"]
+"#,
+            "duplicate subject",
+        ),
+        (
+            "duplicate-team.toml",
+            r#"
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = 1
+tokens_per_day = 100
+max_concurrency = 1
+allowed_models = ["chat"]
+
+[[quotas]]
+subject = "bob"
+team = "platform"
+requests_per_minute = 2
+tokens_per_day = 200
+max_concurrency = 1
+allowed_models = ["chat"]
+"#,
+            "duplicate team",
+        ),
+        (
+            "zero-limit.toml",
+            r#"
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = 1
+tokens_per_day = 0
+max_concurrency = 1
+allowed_models = ["chat"]
+"#,
+            "tokens_per_day",
+        ),
+        (
+            "negative-limit.toml",
+            r#"
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = -1
+tokens_per_day = 100
+max_concurrency = 1
+allowed_models = ["chat"]
+"#,
+            "expected u32",
+        ),
+        (
+            "overflow-limit.toml",
+            r#"
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = 1
+tokens_per_day = 18446744073709551616
+max_concurrency = 1
+allowed_models = ["chat"]
+"#,
+            "number too large",
+        ),
+        (
+            "whitespace-alias.toml",
+            r#"
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = 1
+tokens_per_day = 100
+max_concurrency = 1
+allowed_models = ["   "]
+"#,
+            "allowed_models",
+        ),
+    ];
+
+    for (name, body, needle) in cases {
+        let policy = dir.path().join(name);
+        fs::write(&policy, body).expect("write policy");
+
+        let mut import = llmctl();
+        import
+            .arg("--config")
+            .arg(&config)
+            .arg("quota")
+            .arg("import")
+            .arg(&policy);
+        assert_failure_stderr_contains(import, needle);
+    }
 }
 
 #[tokio::test]

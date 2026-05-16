@@ -98,7 +98,7 @@ fn docs_cover_ordered_deployment_operations() {
         "2. run the dry-run validation gate",
         "3. run the security audit",
         "4. run readiness checks",
-        "5. start the daemon under systemd",
+        "5. hand off service activation",
         "6. verify aqe/openai client access",
         "7. export the audit envelope",
     ];
@@ -120,7 +120,6 @@ fn docs_cover_ordered_deployment_operations() {
         "server check",
         "security check",
         "observe plan",
-        "systemctl enable --now llmctld.service",
         "openai_base_url=http://host:8765/v1",
         "data export --hours 24",
     ] {
@@ -143,11 +142,15 @@ fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
         "llmctl --config /etc/rs-llmctl/config.toml quota export > quotas.json",
         "llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json",
         "llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml",
+        "llmctl --config /etc/rs-llmctl/config.toml quota list",
         "llmctl security hash-key \"$LLMCTL_NEW_API_KEY\"",
         "[[security.api_keys]]",
         "sha256 = \"<sha256-from-hash-key>\"",
         "llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json",
         "server plan export",
+        "llmctl --config /etc/rs-llmctl/config.toml audit retention plan --envelope > retention-plan-envelope.json",
+        "llmctl --config /etc/rs-llmctl/config.toml data verify-envelope retention-plan-envelope.json",
+        "llmctl server plan-diff server-plan.before.json server-plan.after.json",
     ] {
         assert!(
             docs.contains(required),
@@ -167,6 +170,56 @@ fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
         assert!(
             !docs_lower.contains(forbidden),
             "policy operation docs should not advise plaintext key pattern `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn policy_runbook_documents_strict_passive_review_expectations() {
+    let docs = format!(
+        "{}\n{}",
+        read("README.md"),
+        read("examples/policy-operations-runbook.md")
+    );
+    let docs_lower = docs.to_lowercase();
+
+    for required in [
+        "quota import rejects policies with blank subjects or teams",
+        "requests_per_minute",
+        "tokens_per_day",
+        "max_concurrency",
+        "greater than zero",
+        "allowed_models",
+        "empty model",
+        "aliases",
+        "retention-plan-envelope.json",
+        "metadata sha256",
+        "dry_run",
+        "deletes",
+        "server-plan.before.json",
+        "server-plan.after.json",
+        "review the diff",
+        "approving",
+        "change record",
+    ] {
+        assert!(
+            docs_lower.contains(required),
+            "policy runbook docs should cover `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "systemctl start",
+        "systemctl enable",
+        "systemctl restart",
+        "systemctl reload",
+        "systemctl stop",
+        "service llmctld start",
+        "service llmctld restart",
+    ] {
+        assert!(
+            !docs_lower.contains(forbidden),
+            "policy runbook docs should stay passive and not include `{forbidden}`"
         );
     }
 }

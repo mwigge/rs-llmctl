@@ -86,8 +86,15 @@ enum ServerCommand {
     Run,
     Check,
     Plan,
+    PlanDiff(ServerPlanDiffArgs),
     Status,
     SecurityCheck,
+}
+
+#[derive(Debug, Args)]
+struct ServerPlanDiffArgs {
+    old_plan: PathBuf,
+    new_plan: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -264,7 +271,7 @@ enum AuditReportCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuditRetentionCommand {
-    Plan,
+    Plan(AuditRetentionPlanArgs),
 }
 
 #[derive(Debug, Args)]
@@ -280,6 +287,12 @@ struct AuditReportMonthlyArgs {
 #[derive(Debug, Args)]
 struct AuditReportRequestArgs {
     request_id: Uuid,
+    #[arg(long)]
+    envelope: bool,
+}
+
+#[derive(Debug, Args)]
+struct AuditRetentionPlanArgs {
     #[arg(long)]
     envelope: bool,
 }
@@ -378,6 +391,12 @@ async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
 }
 
 async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> Result<()> {
+    if let ServerCommand::PlanDiff(args) = command {
+        let old_plan = read_startup_plan(&args.old_plan).await?;
+        let new_plan = read_startup_plan(&args.new_plan).await?;
+        return emit(as_json, &old_plan.diff(&new_plan));
+    }
+
     let cfg = load_config(path).await?;
     match command {
         ServerCommand::Run => {
@@ -401,6 +420,7 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
             let plan = StartupPlan::from_config(&cfg);
             emit(as_json, &plan)
         }
+        ServerCommand::PlanDiff(_) => unreachable!("handled before config load"),
         ServerCommand::Status => {
             create_storage_dirs(&cfg.storage).await?;
             let storage = init_storage(&cfg.storage).await?;
@@ -755,9 +775,15 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
             }
         },
         AuditCommand::Retention { command } => match command {
-            AuditRetentionCommand::Plan => {
+            AuditRetentionCommand::Plan(args) => {
                 let report = audit_retention_plan(&cfg, &storage).await?;
-                emit(as_json, &report)
+                if args.envelope {
+                    let envelope =
+                        reporting::report_envelope(reporting::ReportKind::RetentionPlan, report)?;
+                    emit(as_json, &envelope)
+                } else {
+                    emit(as_json, &report)
+                }
             }
         },
         AuditCommand::Request(args) => {
@@ -846,6 +872,13 @@ async fn load_config(path: &Path) -> Result<Config> {
         .with_context(|| format!("load {}", path.display()))
 }
 
+async fn read_startup_plan(path: &Path) -> Result<StartupPlan> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse startup plan {}", path.display()))
+}
+
 async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
     if let Some(parent) = storage.db_path.parent() {
         fs::create_dir_all(parent).await?;
@@ -926,6 +959,8 @@ async fn load_quota_policy(path: &Path) -> Result<ImportedQuotaPolicy> {
 }
 
 fn validate_quota_policies(quotas: &[QuotaConfig]) -> Result<()> {
+    let mut subjects = BTreeMap::new();
+    let mut teams = BTreeMap::new();
     for (index, quota) in quotas.iter().enumerate() {
         if quota.subject.trim().is_empty() {
             bail!("quotas[{index}].subject must not be empty");
@@ -948,6 +983,18 @@ fn validate_quota_policies(quotas: &[QuotaConfig]) -> Result<()> {
             .any(|model| model.trim().is_empty())
         {
             bail!("quotas[{index}].allowed_models must not contain empty model aliases");
+        }
+        if let Some(first_index) = subjects.insert(quota.subject.as_str(), index) {
+            bail!(
+                "quotas[{index}].subject duplicates quotas[{first_index}].subject: duplicate subject {:?}",
+                quota.subject
+            );
+        }
+        if let Some(first_index) = teams.insert(quota.team.as_str(), index) {
+            bail!(
+                "quotas[{index}].team duplicates quotas[{first_index}].team: duplicate team {:?}",
+                quota.team
+            );
         }
     }
     Ok(())

@@ -178,13 +178,10 @@ traffic reaches the daemon:
    systemd-analyze verify /etc/systemd/system/llmctld.service
    ```
 
-5. Start the daemon under systemd only after the dry-run, security audit, and
-   readiness checks pass:
-
-   ```bash
-   systemctl enable --now llmctld.service
-   systemctl status llmctld.service
-   ```
+5. Hand off service activation only after the dry-run, security audit, and
+   readiness checks pass. Keep the release package documentation passive: the
+   operator change record should reference the approved activation procedure
+   instead of embedding service-control commands here.
 
 6. Verify AQE/OpenAI client access against the OpenAI-compatible endpoint with
    `OPENAI_BASE_URL=http://host:8765/v1` and the production API key scope
@@ -208,6 +205,16 @@ llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json
 llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml
 ```
 
+Quota import rejects policies with blank subjects or teams,
+`requests_per_minute`, `tokens_per_day`, or `max_concurrency` values that are
+not greater than zero, or `allowed_models` entries that contain empty model
+aliases. Treat those failures as policy review findings, not as runtime
+overrides. After import, capture the effective policy list:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml quota list
+```
+
 The add-key workflow hashes the operator-provided API key first and stores only
 the digest in config:
 
@@ -229,7 +236,7 @@ scopes = ["admin"]
 Do not place raw API key material in TOML. The `sha256` field is for the digest
 printed by `security hash-key`.
 
-Capture a server plan export before starting or restarting production services:
+Capture a server plan export before any production service activation change:
 
 ```bash
 llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
@@ -237,6 +244,25 @@ llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
 
 The plan artifact records the worker commands the daemon would launch and can be
 attached to the same change record as the quota import and key digest review.
+For policy changes, keep a before/after pair and review the diff before
+approving the rollout:
+
+```bash
+llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.before.json
+llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.after.json
+llmctl server plan-diff server-plan.before.json server-plan.after.json
+```
+
+Retention review should use the signed envelope form so the payload can be
+verified offline and attached to the change record:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml audit retention plan --envelope > retention-plan-envelope.json
+llmctl --config /etc/rs-llmctl/config.toml data verify-envelope retention-plan-envelope.json
+```
+
+Review the envelope `metadata sha256` against the verification output and
+confirm the payload keeps `dry_run` set to true and `deletes` set to false.
 See `examples/policy-operations-runbook.md` for a compact operator checklist.
 
 ## Enterprise Security Posture
