@@ -231,6 +231,200 @@ weight = 1
 }
 
 #[test]
+fn server_plan_exports_cpu_startup_plan_with_command_specs_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    let api_key_hash = sha256(b"server-plan-token");
+    let chat_path = model_dir.join("chat.gguf");
+    let coder_path = model_dir.join("coder.gguf");
+    let body = format!(
+        r#"
+mode = "cold-swap"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 19000
+llama_server = "/usr/local/bin/llama-server"
+context_size = 4096
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+api_keys = [
+  {{ id = "operator", sha256 = "{api_key_hash}", subject = "alice", team = "platform", scopes = ["admin"] }}
+]
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "nvidia"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[[models]]
+alias = "chat"
+path = "{}"
+role = "chat"
+weight = 1
+
+[[models]]
+alias = "coder"
+path = "{}"
+role = "code"
+weight = 1
+"#,
+        db_path.display(),
+        model_dir.display(),
+        chat_path.display(),
+        coder_path.display()
+    );
+    fs::write(&config, body).expect("write config");
+
+    let mut plan = llmctl();
+    plan.arg("--config").arg(&config).arg("server").arg("plan");
+    let output = plan.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let plan: Value = serde_json::from_str(&raw).expect("stdout is startup plan json");
+    assert_eq!(plan["workers"].as_array().expect("workers").len(), 2);
+    assert_eq!(plan["workers"][0]["worker"]["id"], "chat");
+    assert_eq!(plan["workers"][0]["worker"]["port"], 19000);
+    assert_eq!(plan["workers"][0]["worker"]["backend"]["type"], "cpu");
+    assert_eq!(
+        plan["workers"][0]["command"]["program"],
+        "/usr/local/bin/llama-server"
+    );
+    assert_eq!(
+        plan["workers"][0]["command"]["args"],
+        serde_json::json!([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "19000",
+            "--model",
+            chat_path.display().to_string(),
+            "--ctx-size",
+            "4096",
+            "--n-gpu-layers",
+            "0"
+        ])
+    );
+    assert_eq!(plan["workers"][0]["command"]["env"], serde_json::json!([]));
+    assert_eq!(plan["workers"][1]["worker"]["id"], "coder");
+    assert_eq!(plan["workers"][1]["worker"]["port"], 19001);
+    assert!(!raw.contains("server-plan-token"));
+    assert!(!raw.contains(&api_key_hash));
+}
+
+#[test]
+fn server_plan_exports_gpu_startup_plan_with_command_specs_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    let api_key_hash = sha256(b"gpu-server-plan-token");
+    let model_path = model_dir.join("gpu-chat.gguf");
+    let body = format!(
+        r#"
+mode = "hot-swap"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 19100
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+
+[[security.api_keys]]
+id = "operator"
+sha256 = "{api_key_hash}"
+subject = "bob"
+team = "platform"
+scopes = ["admin"]
+
+[resources]
+budget = 0.8
+cpu_only = false
+gpu_vendor = "nvidia"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[[models]]
+alias = "gpu-chat"
+path = "{}"
+role = "chat"
+weight = 1
+"#,
+        db_path.display(),
+        model_dir.display(),
+        model_path.display()
+    );
+    fs::write(&config, body).expect("write config");
+
+    let mut plan = llmctl();
+    plan.arg("--config").arg(&config).arg("server").arg("plan");
+    let output = plan.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let plan: Value = serde_json::from_str(&raw).expect("stdout is startup plan json");
+    assert_eq!(plan["workers"].as_array().expect("workers").len(), 1);
+    assert_eq!(plan["workers"][0]["worker"]["id"], "gpu-chat");
+    assert_eq!(
+        plan["workers"][0]["worker"]["backend"],
+        serde_json::json!({ "type": "nvidia", "gpu_layers": 99 })
+    );
+    assert_eq!(plan["workers"][0]["command"]["program"], "llama-server");
+    assert_eq!(
+        plan["workers"][0]["command"]["env"],
+        serde_json::json!([["GGML_CUDA_VISIBLE_DEVICES", "0"]])
+    );
+    assert_eq!(
+        plan["workers"][0]["command"]["args"],
+        serde_json::json!([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "19100",
+            "--model",
+            model_path.display().to_string(),
+            "--ctx-size",
+            "8192",
+            "--n-gpu-layers",
+            "99"
+        ])
+    );
+    assert!(!raw.contains("gpu-server-plan-token"));
+    assert!(!raw.contains(&api_key_hash));
+}
+
+#[test]
 fn data_export_and_audit_monthly_are_scriptable_json_reports() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
@@ -614,6 +808,153 @@ fn quota_status_and_report_are_scriptable_json() {
     assert!(report["usage_summary"].is_object());
 }
 
+#[test]
+fn quota_export_import_round_trips_json_and_preserves_config_fields() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut set = llmctl();
+    set.arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("set")
+        .arg("--subject")
+        .arg("alice")
+        .arg("--team")
+        .arg("platform")
+        .arg("--requests-per-minute")
+        .arg("3")
+        .arg("--tokens-per-day")
+        .arg("1000")
+        .arg("--model")
+        .arg("llama")
+        .arg("--model")
+        .arg("mistral");
+    assert_success_json(set);
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("export");
+    let exported = assert_success_json(export);
+    assert_eq!(exported["status"], "exported");
+    assert_eq!(exported["format"], "json");
+    assert_eq!(exported["count"], 1);
+    assert_eq!(exported["quotas"][0]["subject"], "alice");
+
+    let import_path = dir.path().join("quotas.json");
+    fs::write(
+        &import_path,
+        serde_json::to_vec_pretty(&exported).expect("json"),
+    )
+    .expect("write");
+
+    let before = read_config(&config);
+    assert!(before.contains("[server]"));
+    assert!(before.contains("worker_base_port = 18765"));
+
+    let mut replace = llmctl();
+    replace
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("set")
+        .arg("--subject")
+        .arg("bob")
+        .arg("--requests-per-minute")
+        .arg("9");
+    assert_success_json(replace);
+
+    let mut import = llmctl();
+    import
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("import")
+        .arg(&import_path);
+    let imported = assert_success_json(import);
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["format"], "json");
+    assert_eq!(imported["count"], 1);
+    assert_eq!(imported["quotas"][0]["subject"], "alice");
+
+    let saved = read_config(&config);
+    assert!(saved.contains("[server]"));
+    assert!(saved.contains("worker_base_port = 18765"));
+    assert!(saved.contains("subject = \"alice\""));
+    assert!(!saved.contains("subject = \"bob\""));
+}
+
+#[test]
+fn quota_import_accepts_toml_policy_file_and_validates_limits() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let policy = dir.path().join("quotas.toml");
+    fs::write(
+        &policy,
+        r#"
+[[quotas]]
+subject = "team-default"
+team = "platform"
+requests_per_minute = 10
+tokens_per_day = 2000
+max_concurrency = 2
+allowed_models = ["llama"]
+"#,
+    )
+    .expect("write policy");
+
+    let mut import = llmctl();
+    import
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("import")
+        .arg(&policy);
+    let imported = assert_success_json(import);
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["format"], "toml");
+    assert_eq!(imported["quotas"][0]["subject"], "team-default");
+
+    let invalid_policy = dir.path().join("invalid-quotas.toml");
+    fs::write(
+        &invalid_policy,
+        r#"
+[[quotas]]
+subject = "broken"
+team = "platform"
+requests_per_minute = 0
+tokens_per_day = 2000
+max_concurrency = 1
+allowed_models = ["llama"]
+"#,
+    )
+    .expect("write invalid policy");
+
+    let mut invalid = llmctl();
+    invalid
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("import")
+        .arg(&invalid_policy);
+    let output = invalid.output().expect("run llmctl");
+    assert!(
+        !output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requests_per_minute"));
+
+    let saved = read_config(&config);
+    assert!(saved.contains("subject = \"team-default\""));
+    assert!(!saved.contains("subject = \"broken\""));
+}
+
 #[tokio::test]
 async fn usage_chargeback_reports_json_with_team_and_actor_filters_without_secrets() {
     let dir = TempDir::new().expect("tempdir");
@@ -795,6 +1136,144 @@ fn security_hash_key_does_not_require_config_file() {
     let report = assert_success_json(hash);
     assert_eq!(report["sha256"], sha256(secret.as_bytes()));
     assert_eq!(report["metadata"]["input"], "argument");
+}
+
+#[test]
+fn security_add_key_inserts_and_updates_hashed_api_key_without_leaking_digest() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let digest = sha256(b"admin-token");
+    let replacement_digest = sha256(b"replacement-admin-token");
+
+    let mut add = llmctl();
+    add.arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("add-key")
+        .arg("--id")
+        .arg("operator")
+        .arg("--sha256")
+        .arg(&digest)
+        .arg("--subject")
+        .arg("alice")
+        .arg("--team")
+        .arg("platform")
+        .arg("--scope")
+        .arg("admin")
+        .arg("--scope")
+        .arg("models.read");
+    let output = add.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains(&digest));
+    assert!(!stderr.contains(&digest));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(report["status"], "saved");
+    assert_eq!(report["action"], "inserted");
+    assert_eq!(report["key"]["id"], "operator");
+    assert_eq!(report["key"]["subject"], "alice");
+    assert_eq!(report["key"]["team"], "platform");
+    assert_eq!(
+        report["key"]["scopes"],
+        serde_json::json!(["admin", "models.read"])
+    );
+    assert!(report["key"].get("sha256").is_none());
+
+    let saved = read_config(&config);
+    assert!(saved.contains("[[security.api-keys]]"));
+    let saved_toml: toml::Value = toml::from_str(&saved).expect("saved config is toml");
+    let keys = saved_toml["security"]["api-keys"]
+        .as_array()
+        .expect("api keys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["id"].as_str(), Some("operator"));
+    assert_eq!(keys[0]["sha256"].as_str(), Some(digest.as_str()));
+    assert_eq!(
+        keys[0]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .map(|scope| scope.as_str().expect("scope").to_string())
+            .collect::<Vec<_>>(),
+        vec!["admin".to_string(), "models.read".to_string()]
+    );
+
+    let mut update = llmctl();
+    update
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("add-key")
+        .arg("--id")
+        .arg("operator")
+        .arg("--sha256")
+        .arg(&replacement_digest)
+        .arg("--subject")
+        .arg("alice")
+        .arg("--team")
+        .arg("ml")
+        .arg("--scope")
+        .arg("chat");
+    let updated = assert_success_json(update);
+    assert_eq!(updated["action"], "updated");
+    assert_eq!(updated["api_keys"], 1);
+
+    let saved = read_config(&config);
+    assert!(!saved.contains(&format!("sha256 = \"{digest}\"")));
+    assert!(saved.contains(&format!("sha256 = \"{replacement_digest}\"")));
+    let saved_toml: toml::Value = toml::from_str(&saved).expect("saved config is toml");
+    assert_eq!(
+        saved_toml["security"]["api-keys"]
+            .as_array()
+            .expect("api keys")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn security_add_key_rejects_invalid_sha256_without_saving() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let before = read_config(&config);
+
+    let mut add = llmctl();
+    add.arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("add-key")
+        .arg("--id")
+        .arg("operator")
+        .arg("--sha256")
+        .arg("plain-secret")
+        .arg("--subject")
+        .arg("alice")
+        .arg("--team")
+        .arg("platform")
+        .arg("--scope")
+        .arg("admin");
+    let output = add.output().expect("run llmctl");
+    assert!(
+        !output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("plain-secret"));
+    assert!(!stderr.contains("plain-secret"));
+    assert!(stderr.contains("sha256 must be 64 hexadecimal characters"));
+    assert_eq!(read_config(&config), before);
 }
 
 #[test]

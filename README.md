@@ -192,6 +192,49 @@ traffic reaches the daemon:
    llmctl --config /etc/rs-llmctl/config.toml data export --hours 24
    ```
 
+## Policy Operations Runbook
+
+Quota policy can be moved between environments without editing unrelated server
+settings. Export the reviewed policy set from the source environment, then
+import it into the staged target config:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml quota export > quotas.json
+llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json
+llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml
+```
+
+The add-key workflow hashes the operator-provided API key first and stores only
+the digest in config:
+
+```bash
+llmctl security hash-key "$LLMCTL_NEW_API_KEY"
+```
+
+Add the returned digest to the reviewed config as a scoped key entry:
+
+```toml
+[[security.api_keys]]
+id = "ops-admin"
+sha256 = "<sha256-from-hash-key>"
+subject = "ops-admin"
+team = "platform"
+scopes = ["admin"]
+```
+
+Do not place raw API key material in TOML. The `sha256` field is for the digest
+printed by `security hash-key`.
+
+Capture a server plan export before starting or restarting production services:
+
+```bash
+llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
+```
+
+The plan artifact records the worker commands the daemon would launch and can be
+attached to the same change record as the quota import and key digest review.
+See `examples/policy-operations-runbook.md` for a compact operator checklist.
+
 ## Enterprise Security Posture
 
 `rs-llmctl` uses a PCI DSS v4.0.1-aligned baseline for enterprise deployments:
@@ -261,6 +304,10 @@ Quota commands:
 
 - `llmctl quota set --subject <id> --team <team> --model <alias>` upserts a
   quota policy in config.
+- `llmctl quota export` prints configured quota policies as a portable JSON
+  document.
+- `llmctl quota import <path>` replaces configured quota policies from a JSON
+  export or a TOML policy file.
 - `llmctl quota list` prints configured quota policies.
 
 Operations commands:

@@ -119,6 +119,21 @@ Ordered production deployment operations are part of the release-owned runbook:
 7. Export the audit envelope with `llmctl --config
    /etc/rs-llmctl/config.toml data export --hours 24`.
 
+Policy operation docs and examples must pin the commands used by regulated
+operators after initial deployment:
+
+- Quota policy export/import: `llmctl --config /etc/rs-llmctl/config.toml quota export > quotas.json`,
+  `llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json`,
+  and `llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml`.
+- Add-key workflow: run `llmctl security hash-key "$LLMCTL_NEW_API_KEY"` and
+  place only the returned digest in `[[security.api_keys]]`, for example
+  `sha256 = "<sha256-from-hash-key>"`.
+- Server plan export: capture `llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json`
+  before service start or restart so reviewers can inspect planned workers.
+
+Docs must not advise storing raw API key material in TOML or examples; config
+examples carry SHA-256 digests and `env:` references only.
+
 ## CLI Contract
 
 The Rust CLI keeps the operational command groups stable while the library
@@ -128,7 +143,8 @@ internals mature:
 - `server run`, `server check`, `server security-check`
 - `model install`, `model list`
 - `swap set`, `swap show`
-- `quota set`, `quota list`
+- `quota set`, `quota status`, `quota report`, `quota export`, `quota import`,
+  `quota list`
 - `observe snapshot`, `observe drift`, `observe usage`, `observe show`
 - `audit report monthly`, `audit report request`, `audit request`
 - `usage report`

@@ -129,6 +129,46 @@ fn docs_cover_ordered_deployment_operations() {
 }
 
 #[test]
+fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
+    let readme = read("README.md");
+    let rust_plan = read("llmctl-to-rust.md");
+    let runbook = read("examples/policy-operations-runbook.md");
+    let docs = format!("{readme}\n{rust_plan}\n{runbook}");
+    let docs_lower = docs.to_lowercase();
+
+    for required in [
+        "llmctl --config /etc/rs-llmctl/config.toml quota export > quotas.json",
+        "llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json",
+        "llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml",
+        "llmctl security hash-key \"$LLMCTL_NEW_API_KEY\"",
+        "[[security.api_keys]]",
+        "sha256 = \"<sha256-from-hash-key>\"",
+        "llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json",
+        "server plan export",
+    ] {
+        assert!(
+            docs.contains(required),
+            "policy operation docs should include `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "sha256 = \"sk-",
+        "api_key = \"sk-",
+        "api-key = \"sk-",
+        "secret = \"sk-",
+        "password = \"sk-",
+        "bearer sk-",
+        "authorization = \"bearer",
+    ] {
+        assert!(
+            !docs_lower.contains(forbidden),
+            "policy operation docs should not advise plaintext key pattern `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn systemd_template_documents_server_deployment_controls() {
     let unit = read("packaging/systemd/llmctld.service").to_lowercase();
 

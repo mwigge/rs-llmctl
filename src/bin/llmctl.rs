@@ -2,13 +2,16 @@ use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
-use rs_llmctl::config::{self, Config, Mode, ModelConfig, QuotaConfig, StorageConfig};
+use rs_llmctl::config::{
+    self, ApiKeyConfig, Config, Mode, ModelConfig, QuotaConfig, StorageConfig,
+};
 use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
 use rs_llmctl::observability::{Exporter, ObservabilityPlan};
 use rs_llmctl::quota::{self, Principal};
 use rs_llmctl::reporting;
 use rs_llmctl::storage::Storage;
-use serde::Serialize;
+use rs_llmctl::worker::StartupPlan;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -82,6 +85,7 @@ struct InitArgs {
 enum ServerCommand {
     Run,
     Check,
+    Plan,
     Status,
     SecurityCheck,
 }
@@ -138,6 +142,8 @@ enum QuotaCommand {
     Set(QuotaSetArgs),
     Status(QuotaStatusArgs),
     Report(ObserveWindowArgs),
+    Export,
+    Import(QuotaImportArgs),
     List,
 }
 
@@ -167,16 +173,36 @@ struct QuotaStatusArgs {
     team: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct QuotaImportArgs {
+    path: PathBuf,
+}
+
 #[derive(Debug, Subcommand)]
 enum SecurityCommand {
     Check,
     HashKey(SecurityHashKeyArgs),
+    AddKey(SecurityAddKeyArgs),
     AuditConfig(SecurityAuditConfigArgs),
 }
 
 #[derive(Debug, Args)]
 struct SecurityHashKeyArgs {
     secret: String,
+}
+
+#[derive(Debug, Args)]
+struct SecurityAddKeyArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    sha256: String,
+    #[arg(long)]
+    subject: String,
+    #[arg(long)]
+    team: String,
+    #[arg(long = "scope")]
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -353,6 +379,10 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
                 &json!({ "status": "ok", "config": path, "models": cfg.models.len(), "quotas": cfg.quotas.len() }),
             )
         }
+        ServerCommand::Plan => {
+            let plan = StartupPlan::from_config(&cfg);
+            emit(as_json, &plan)
+        }
         ServerCommand::Status => {
             create_storage_dirs(&cfg.storage).await?;
             let storage = init_storage(&cfg.storage).await?;
@@ -517,6 +547,31 @@ async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Res
                 }),
             )
         }
+        QuotaCommand::Export => emit(
+            as_json,
+            &json!({
+                "status": "exported",
+                "format": "json",
+                "count": cfg.quotas.len(),
+                "quotas": cfg.quotas
+            }),
+        ),
+        QuotaCommand::Import(args) => {
+            let imported = load_quota_policy(&args.path).await?;
+            validate_quota_policies(&imported.quotas)?;
+            cfg.quotas = imported.quotas;
+            config::save(path, &cfg).await?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "imported",
+                    "format": imported.format,
+                    "path": args.path,
+                    "count": cfg.quotas.len(),
+                    "quotas": cfg.quotas
+                }),
+            )
+        }
         QuotaCommand::List => emit(as_json, &cfg.quotas),
     }
 }
@@ -549,6 +604,35 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                         "encoding": "hex",
                         "input": "argument",
                         "purpose": "api-key"
+                    }
+                }),
+            )
+        }
+        SecurityCommand::AddKey(args) => {
+            let mut cfg = load_config(path).await?;
+            let sha256 = args.sha256.to_ascii_lowercase();
+            validate_add_key_args(&args.id, &sha256, &args.subject, &args.team)?;
+            let key = ApiKeyConfig {
+                id: args.id,
+                sha256,
+                subject: args.subject,
+                team: args.team,
+                scopes: args.scopes,
+            };
+            let action = upsert_api_key(&mut cfg.security.api_keys, key.clone());
+            config::save(path, &cfg).await?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "saved",
+                    "action": action,
+                    "api_keys": cfg.security.api_keys.len(),
+                    "key": {
+                        "id": key.id,
+                        "subject": key.subject,
+                        "team": key.team,
+                        "scopes": key.scopes,
+                        "sha256_present": true
                     }
                 }),
             )
@@ -728,6 +812,100 @@ fn upsert_quota(quotas: &mut Vec<QuotaConfig>, quota: QuotaConfig) {
     } else {
         quotas.push(quota);
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportedQuotaPolicy {
+    #[serde(default = "default_quota_policy_format")]
+    format: String,
+    #[serde(default)]
+    quotas: Vec<QuotaConfig>,
+}
+
+fn default_quota_policy_format() -> String {
+    "json".to_string()
+}
+
+async fn load_quota_policy(path: &Path) -> Result<ImportedQuotaPolicy> {
+    let body = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("read quota policy {}", path.display()))?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        let mut imported: ImportedQuotaPolicy =
+            toml::from_str(&body).with_context(|| format!("parse TOML {}", path.display()))?;
+        imported.format = "toml".to_string();
+        return Ok(imported);
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("parse JSON {}", path.display()))?;
+    if value.is_array() {
+        let quotas = serde_json::from_value(value)
+            .with_context(|| format!("parse quotas {}", path.display()))?;
+        Ok(ImportedQuotaPolicy {
+            format: "json".to_string(),
+            quotas,
+        })
+    } else {
+        let mut imported: ImportedQuotaPolicy = serde_json::from_value(value)
+            .with_context(|| format!("parse quotas {}", path.display()))?;
+        imported.format = "json".to_string();
+        Ok(imported)
+    }
+}
+
+fn validate_quota_policies(quotas: &[QuotaConfig]) -> Result<()> {
+    for (index, quota) in quotas.iter().enumerate() {
+        if quota.subject.trim().is_empty() {
+            bail!("quotas[{index}].subject must not be empty");
+        }
+        if quota.team.trim().is_empty() {
+            bail!("quotas[{index}].team must not be empty");
+        }
+        if quota.requests_per_minute == 0 {
+            bail!("quotas[{index}].requests_per_minute must be greater than zero");
+        }
+        if quota.tokens_per_day == 0 {
+            bail!("quotas[{index}].tokens_per_day must be greater than zero");
+        }
+        if quota.max_concurrency == 0 {
+            bail!("quotas[{index}].max_concurrency must be greater than zero");
+        }
+        if quota
+            .allowed_models
+            .iter()
+            .any(|model| model.trim().is_empty())
+        {
+            bail!("quotas[{index}].allowed_models must not contain empty model aliases");
+        }
+    }
+    Ok(())
+}
+
+fn upsert_api_key(keys: &mut Vec<ApiKeyConfig>, key: ApiKeyConfig) -> &'static str {
+    if let Some(existing) = keys.iter_mut().find(|existing| existing.id == key.id) {
+        *existing = key;
+        "updated"
+    } else {
+        keys.push(key);
+        "inserted"
+    }
+}
+
+fn validate_add_key_args(id: &str, sha256: &str, subject: &str, team: &str) -> Result<()> {
+    if id.trim().is_empty() {
+        bail!("id must not be empty");
+    }
+    if !is_sha256_hex(sha256) {
+        bail!("sha256 must be 64 hexadecimal characters");
+    }
+    if subject.trim().is_empty() {
+        bail!("subject must not be empty");
+    }
+    if team.trim().is_empty() {
+        bail!("team must not be empty");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
