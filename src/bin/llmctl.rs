@@ -257,6 +257,17 @@ struct AuditRequestArgs {
 #[derive(Debug, Subcommand)]
 enum UsageCommand {
     Report(ObserveWindowArgs),
+    Chargeback(UsageChargebackArgs),
+}
+
+#[derive(Debug, Args)]
+struct UsageChargebackArgs {
+    #[arg(long)]
+    hours: i64,
+    #[arg(long)]
+    team: Option<String>,
+    #[arg(long)]
+    actor: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -647,6 +658,7 @@ async fn usage_command(path: &Path, command: UsageCommand, as_json: bool) -> Res
     let storage = init_storage(&cfg.storage).await?;
     match command {
         UsageCommand::Report(args) => report_usage(&storage, args.hours, as_json).await,
+        UsageCommand::Chargeback(args) => report_chargeback(&storage, args, as_json).await,
     }
 }
 
@@ -1040,6 +1052,36 @@ async fn report_usage(storage: &Storage, hours: i64, as_json: bool) -> Result<()
     let (from, to) = window(hours);
     let summary = reporting::usage_summary(storage, from, to).await?;
     emit(as_json, &json!({ "hours": hours, "summary": summary }))
+}
+
+async fn report_chargeback(
+    storage: &Storage,
+    args: UsageChargebackArgs,
+    as_json: bool,
+) -> Result<()> {
+    let (from, to) = window(args.hours);
+    let report = reporting::chargeback_report_filtered(
+        storage,
+        from,
+        to,
+        args.team.as_deref(),
+        args.actor.as_deref(),
+    )
+    .await?;
+    emit(
+        as_json,
+        &json!({
+            "hours": args.hours,
+            "from": report.from,
+            "to": report.to,
+            "generated_at": Utc::now(),
+            "filters": {
+                "team": report.team,
+                "actor": report.actor
+            },
+            "usage_summary": report.usage_summary
+        }),
+    )
 }
 
 async fn show_observations(storage: &Storage, args: ObserveShowArgs, as_json: bool) -> Result<()> {

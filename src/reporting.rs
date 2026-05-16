@@ -17,6 +17,7 @@ pub enum ReportKind {
     PerRequestAudit,
     PerRequestData,
     DataExport,
+    Chargeback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +76,15 @@ pub struct PerRequestDataReport {
     pub usage_events: Vec<UsageEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
     pub observations: Vec<ObservationEvent>,
+    pub usage_summary: UsageSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChargebackReport {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub team: Option<String>,
+    pub actor: Option<String>,
     pub usage_summary: UsageSummary,
 }
 
@@ -180,6 +190,38 @@ pub async fn usage_summary(
     Ok(summarize_usage(&usage_events))
 }
 
+pub async fn chargeback_report(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<ChargebackReport> {
+    chargeback_report_filtered(storage, from, to, None, None).await
+}
+
+pub async fn chargeback_report_filtered(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    team: Option<&str>,
+    actor: Option<&str>,
+) -> Result<ChargebackReport> {
+    let mut usage_events = storage.usage_events_between(from, to).await?;
+    if let Some(team) = team {
+        usage_events.retain(|event| event.team == team);
+    }
+    if let Some(actor) = actor {
+        usage_events.retain(|event| event.actor == actor);
+    }
+
+    Ok(ChargebackReport {
+        from,
+        to,
+        team: team.map(str::to_string),
+        actor: actor.map(str::to_string),
+        usage_summary: summarize_usage(&usage_events),
+    })
+}
+
 pub async fn data_export(
     storage: &Storage,
     from: DateTime<Utc>,
@@ -230,6 +272,15 @@ pub async fn data_export_envelope(
 ) -> Result<ReportEnvelope<DataExport>> {
     let export = data_export(storage, from, to).await?;
     report_envelope(ReportKind::DataExport, export)
+}
+
+pub async fn chargeback_report_envelope(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<ReportEnvelope<ChargebackReport>> {
+    let report = chargeback_report(storage, from, to).await?;
+    report_envelope(ReportKind::Chargeback, report)
 }
 
 pub fn report_envelope<T>(report_kind: ReportKind, payload: T) -> Result<ReportEnvelope<T>>
@@ -729,6 +780,49 @@ mod tests {
         assert_eq!(
             export_envelope.metadata.sha256,
             canonical_sha256(&export_envelope.payload)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builds_chargeback_report_for_usage_window() -> Result<()> {
+        let storage = Storage::in_memory().await?;
+        let from = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        let mut platform_llama =
+            usage_event(Uuid::new_v4(), "llama", "alice", "platform", 10, 20, 100);
+        platform_llama.at = from;
+        storage.insert_usage_event(&platform_llama).await?;
+
+        let mut research_mistral =
+            usage_event(Uuid::new_v4(), "mistral", "bob", "research", 5, 5, 200);
+        research_mistral.at = from + chrono::Duration::days(1);
+        storage.insert_usage_event(&research_mistral).await?;
+
+        let mut outside_window =
+            usage_event(Uuid::new_v4(), "llama", "carol", "platform", 100, 100, 500);
+        outside_window.at = to;
+        storage.insert_usage_event(&outside_window).await?;
+
+        let report = chargeback_report(&storage, from, to).await?;
+
+        assert_eq!(report.from, from);
+        assert_eq!(report.to, to);
+        assert_eq!(report.usage_summary.request_count, 2);
+        assert_eq!(report.usage_summary.total_tokens, 40);
+        assert_eq!(report.usage_summary.average_latency_ms, Some(150.0));
+        assert_eq!(report.usage_summary.by_team[0].key, "platform");
+        assert_eq!(report.usage_summary.by_team[0].total_tokens, 30);
+        assert_eq!(report.usage_summary.by_actor[0].key, "alice");
+        assert_eq!(report.usage_summary.by_model[1].key, "mistral");
+
+        let envelope = chargeback_report_envelope(&storage, from, to).await?;
+        assert_eq!(envelope.metadata.report_kind, ReportKind::Chargeback);
+        assert_eq!(envelope.payload, report);
+        assert_eq!(
+            envelope.metadata.sha256,
+            canonical_sha256(&envelope.payload)?
         );
         Ok(())
     }

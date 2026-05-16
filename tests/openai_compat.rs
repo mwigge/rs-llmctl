@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use rs_llmctl::config::{ApiKeyConfig, Config, Mode, ModelConfig, QuotaConfig};
@@ -296,6 +297,74 @@ async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage(
 }
 
 #[tokio::test]
+async fn chat_completions_streaming_passthrough_returns_sse_and_records_zero_token_usage_status() {
+    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
+    let mut cfg = config_with_models(vec![model("llama")]);
+    cfg.server.llama_server = upstream;
+    let (app, storage) = test_app_with_storage(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "llama",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .expect("generated request id");
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body");
+    let body = String::from_utf8(bytes.to_vec()).expect("utf8 stream");
+    assert_eq!(
+        body,
+        concat!(
+            "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"llama\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"po\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"llama\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ng\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+    );
+
+    let upstream_request = upstream_requests.recv().await.expect("upstream request");
+    assert_eq!(upstream_request["model"], "llama");
+    assert_eq!(upstream_request["stream"], true);
+
+    let usage_events = storage
+        .usage_events_for_request(request_id)
+        .await
+        .expect("usage events");
+    assert_eq!(usage_events.len(), 1);
+    assert_eq!(usage_events[0].input_tokens, 0);
+    assert_eq!(usage_events[0].output_tokens, 0);
+    assert_eq!(usage_events[0].status, "ok");
+}
+
+#[tokio::test]
 async fn chat_completions_rejects_missing_auth() {
     let app = test_app(config_with_models(vec![model("llama")])).await;
 
@@ -454,8 +523,20 @@ async fn spawn_mock_upstream() -> (String, mpsc::Receiver<Value>) {
 async fn mock_chat_completion(
     State(tx): State<mpsc::Sender<Value>>,
     Json(request): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     tx.send(request.clone()).await.expect("record request");
+    if request["stream"].as_bool() == Some(true) {
+        return (
+            [("content-type", "text/event-stream")],
+            concat!(
+                "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"llama\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"po\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"llama\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ng\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        )
+            .into_response();
+    }
+
     Json(json!({
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -472,4 +553,5 @@ async fn mock_chat_completion(
             "total_tokens": 8
         }
     }))
+    .into_response()
 }

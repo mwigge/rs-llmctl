@@ -72,6 +72,22 @@ install -D -m 0644 packaging/systemd/llmctld.service /etc/systemd/system/llmctld
 install -d -m 0750 -o llmctl -g llmctl /etc/rs-llmctl /var/lib/rs-llmctl/models /var/log/rs-llmctl
 ```
 
+Stage a reviewed starter config explicitly before validation. The helper prints
+the selected example and requires the operator to type `COPY` before it writes
+`TARGET=/etc/rs-llmctl/config.toml`:
+
+```bash
+packaging/stage-config.sh production-external-bind
+TARGET=/etc/rs-llmctl/config.toml packaging/stage-config.sh cpu-only
+```
+
+Available profiles are `cpu-only`, `gpu-amd`, `gpu-auto`, `gpu-metal`,
+`gpu-nvidia`, `local-dev`, and `production-external-bind`. This config staging
+flow is offline and passive: it copies only the reviewed TOML file.
+It does not start or enable services. Run it with privileges appropriate for writing
+`/etc/rs-llmctl/config.toml`, or set `TARGET` to a package-root path for
+review in CI or image builds.
+
 The production daemon template is `packaging/systemd/llmctld.service`. It
 starts `/usr/local/bin/llmctld --config ${LLMCTL_CONFIG}` with
 `LLMCTL_CONFIG=/etc/rs-llmctl/config.toml`, runs as the dedicated `llmctl`

@@ -1,9 +1,13 @@
+use chrono::{Duration, Utc};
+use rs_llmctl::audit::UsageEvent;
+use rs_llmctl::storage::Storage;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 fn llmctl() -> Command {
     Command::new(env!("CARGO_BIN_EXE_llmctl"))
@@ -77,6 +81,28 @@ fn read_config(path: &Path) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn usage_event(
+    model: &str,
+    actor: &str,
+    team: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    latency_ms: u64,
+) -> UsageEvent {
+    UsageEvent {
+        id: Uuid::new_v4(),
+        request_id: Uuid::new_v4(),
+        at: Utc::now(),
+        model: model.to_string(),
+        actor: actor.to_string(),
+        team: team.to_string(),
+        input_tokens,
+        output_tokens,
+        latency_ms,
+        status: "ok".to_string(),
+    }
 }
 
 #[test]
@@ -586,6 +612,116 @@ fn quota_status_and_report_are_scriptable_json() {
     assert_eq!(report["policies"].as_array().expect("policies").len(), 1);
     assert!(report["decisions"].is_array());
     assert!(report["usage_summary"].is_object());
+}
+
+#[tokio::test]
+async fn usage_chargeback_reports_json_with_team_and_actor_filters_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    let api_key_hash = sha256(b"chargeback-secret-token");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "127.0.0.1:8080"
+context_size = 8192
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+
+[[security.api_keys]]
+id = "operator"
+sha256 = "{api_key_hash}"
+subject = "alice"
+team = "platform"
+scopes = ["admin"]
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[observability]
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let storage = Storage::connect(&db_path).await.expect("connect storage");
+    storage
+        .insert_usage_event(&usage_event("llama", "alice", "platform", 10, 20, 100))
+        .await
+        .expect("insert alice usage");
+    storage
+        .insert_usage_event(&usage_event("llama", "bob", "platform", 1, 2, 50))
+        .await
+        .expect("insert bob usage");
+    storage
+        .insert_usage_event(&usage_event("mistral", "alice", "research", 4, 5, 150))
+        .await
+        .expect("insert research usage");
+    let mut old_usage = usage_event("llama", "alice", "platform", 100, 100, 500);
+    old_usage.at = Utc::now() - Duration::hours(3);
+    storage
+        .insert_usage_event(&old_usage)
+        .await
+        .expect("insert old usage");
+
+    let mut chargeback = llmctl();
+    chargeback
+        .arg("--config")
+        .arg(&config)
+        .arg("usage")
+        .arg("chargeback")
+        .arg("--hours")
+        .arg("1")
+        .arg("--team")
+        .arg("platform")
+        .arg("--actor")
+        .arg("alice");
+    let output = chargeback.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let report: Value = serde_json::from_str(&raw).expect("stdout is json");
+
+    assert_eq!(report["hours"], 1);
+    assert!(report["from"].is_string());
+    assert!(report["to"].is_string());
+    assert!(report["generated_at"].is_string());
+    assert_eq!(report["filters"]["team"], "platform");
+    assert_eq!(report["filters"]["actor"], "alice");
+    assert_eq!(report["usage_summary"]["request_count"], 1);
+    assert_eq!(report["usage_summary"]["input_tokens"], 10);
+    assert_eq!(report["usage_summary"]["output_tokens"], 20);
+    assert_eq!(report["usage_summary"]["total_tokens"], 30);
+    assert_eq!(report["usage_summary"]["by_team"][0]["key"], "platform");
+    assert_eq!(report["usage_summary"]["by_actor"][0]["key"], "alice");
+    assert_eq!(report["usage_summary"]["by_model"][0]["key"], "llama");
+    assert!(report.get("usage_events").is_none());
+    assert!(!raw.contains("chargeback-secret-token"));
+    assert!(!raw.contains(&api_key_hash));
 }
 
 #[test]

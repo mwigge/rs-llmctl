@@ -213,6 +213,77 @@ fn install_validation_artifact_is_safe_offline_and_pins_release_checks() {
 }
 
 #[test]
+fn config_staging_artifact_requires_operator_review_and_pins_examples() {
+    let script_path = "packaging/stage-config.sh";
+    let script = read(script_path);
+    let mode = fs::metadata(script_path)
+        .unwrap_or_else(|err| panic!("metadata {script_path}: {err}"))
+        .permissions()
+        .mode();
+
+    assert_ne!(mode & 0o111, 0, "{script_path} should be executable");
+
+    for required in [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "TARGET=${TARGET:-/etc/rs-llmctl/config.toml}",
+        "EXAMPLES_DIR=${EXAMPLES_DIR:-examples}",
+        "case \"${profile}\" in",
+        "cpu-only|gpu-amd|gpu-auto|gpu-metal|gpu-nvidia|local-dev|production-external-bind)",
+        "printf 'Review %s before installing to %s",
+        "read -r confirmation",
+        "\"COPY\"",
+        "install -D -m 0640 \"${source}\" \"${TARGET}\"",
+        "No service has been started or enabled.",
+    ] {
+        assert!(
+            script.contains(required),
+            "{script_path} should include `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "curl ",
+        "wget ",
+        "apt ",
+        "dnf ",
+        "yum ",
+        "pacman ",
+        "systemctl start",
+        "systemctl enable",
+        "systemctl restart",
+        "cargo install",
+        "llmctld ",
+        "llmctl ",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "{script_path} should stay offline/passive and not include `{forbidden}`"
+        );
+    }
+
+    let readme = read("README.md");
+    for required in [
+        "packaging/stage-config.sh production-external-bind",
+        "TARGET=/etc/rs-llmctl/config.toml",
+        "type `COPY`",
+        "does not start or enable services",
+        "cpu-only",
+        "gpu-amd",
+        "gpu-auto",
+        "gpu-metal",
+        "gpu-nvidia",
+        "local-dev",
+        "production-external-bind",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README should document config staging detail `{required}`"
+        );
+    }
+}
+
+#[test]
 fn release_checksum_artifact_generation_is_pinned() {
     let workflow = read(".github/workflows/ci.yml");
 
