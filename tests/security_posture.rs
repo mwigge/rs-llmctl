@@ -1,7 +1,9 @@
 use rs_llmctl::config::{
     self, ApiKeyConfig, Config, ObservabilityExporterConfig, OtlpProtocol, ServerConfig,
 };
-use rs_llmctl::observability::{Exporter, ObservabilityPlan};
+use rs_llmctl::observability::{sanitize_otel_attributes, Exporter, ObservabilityPlan};
+use serde_json::json;
+use std::collections::BTreeMap;
 
 fn hashed_key() -> ApiKeyConfig {
     ApiKeyConfig {
@@ -104,6 +106,56 @@ fn production_security_rejects_empty_api_key_scopes() {
 }
 
 #[test]
+fn production_security_rejects_ambiguous_api_key_identity() {
+    let mut cfg = Config::default();
+    cfg.security.production = true;
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        id: " ".to_string(),
+        ..hashed_key()
+    }];
+
+    let err = config::validate_production_security(&cfg).expect_err("blank key id rejected");
+    assert!(
+        err.to_string().contains("api key id must not be empty"),
+        "unexpected error: {err}"
+    );
+
+    cfg.security.api_keys = vec![
+        hashed_key(),
+        ApiKeyConfig {
+            subject: "other".to_string(),
+            ..hashed_key()
+        },
+    ];
+    let err = config::validate_production_security(&cfg).expect_err("duplicate key id rejected");
+    assert!(
+        err.to_string().contains("declared more than once"),
+        "unexpected error: {err}"
+    );
+
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        subject: "".to_string(),
+        ..hashed_key()
+    }];
+    let err = config::validate_production_security(&cfg).expect_err("blank subject rejected");
+    assert!(
+        err.to_string().contains("must declare a subject"),
+        "unexpected error: {err}"
+    );
+
+    cfg.security.api_keys = vec![ApiKeyConfig {
+        team: " ".to_string(),
+        ..hashed_key()
+    }];
+    let err = config::validate_production_security(&cfg).expect_err("blank team rejected");
+    assert!(
+        err.to_string().contains("must declare a team"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn config_rejects_plaintext_secret_fields() {
     let body = r#"
 [security]
@@ -140,6 +192,35 @@ fn production_security_rejects_plaintext_observability_secrets() {
         "env:OTEL_EXPORTER_OTLP_HEADERS".to_string(),
     );
     config::validate_production_security(&cfg).expect("env secret reference is allowed");
+}
+
+#[test]
+fn observability_attribute_sanitizer_redacts_exporter_and_request_secrets() {
+    let attrs: BTreeMap<_, _> = [
+        (
+            "collector.header.authorization".to_string(),
+            json!("Bearer collector-secret"),
+        ),
+        ("request.prompt".to_string(), json!("private prompt text")),
+        ("message.content".to_string(), json!("private message text")),
+        (
+            "cache.path".to_string(),
+            json!("/home/operator/.cache/model.gguf"),
+        ),
+        ("quota.allowed".to_string(), json!(true)),
+    ]
+    .into();
+
+    let sanitized = sanitize_otel_attributes(attrs);
+
+    assert_eq!(
+        sanitized.get("collector.header.authorization"),
+        Some(&json!("[REDACTED]"))
+    );
+    assert_eq!(sanitized.get("request.prompt"), Some(&json!("[REDACTED]")));
+    assert_eq!(sanitized.get("message.content"), Some(&json!("[REDACTED]")));
+    assert_eq!(sanitized.get("cache.path"), Some(&json!("[REDACTED]")));
+    assert_eq!(sanitized.get("quota.allowed"), Some(&json!(true)));
 }
 
 #[test]

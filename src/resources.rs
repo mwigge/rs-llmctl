@@ -6,13 +6,27 @@ use std::process::Command;
 use sysinfo::System;
 
 const DEFAULT_BUDGET_FRACTION: f64 = 0.80;
+const MIN_SAFE_BUDGET_FRACTION: f64 = 0.10;
+const MAX_SAFE_BUDGET_FRACTION: f64 = 0.95;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GpuVendor {
     Nvidia,
     Amd,
+    Apple,
     Unknown,
+}
+
+impl GpuVendor {
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "nvidia" | "cuda" => Some(Self::Nvidia),
+            "amd" | "rocm" | "hip" => Some(Self::Amd),
+            "apple" | "metal" => Some(Self::Apple),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +52,26 @@ pub struct BudgetPlan {
     pub cpu_threads: usize,
     pub memory_budget_bytes: u64,
     pub gpu_budgets: Vec<GpuBudget>,
+    pub limits: ResourceLimitPlan,
+    pub findings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuBudget {
+    pub vendor: GpuVendor,
+    pub name: String,
+    pub vram_budget_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceLimitPlan {
+    pub cpu_quota_percent: u32,
+    pub memory_max_bytes: u64,
+    pub gpu_vram_budgets: Vec<GpuVramBudgetMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuVramBudgetMetadata {
     pub vendor: GpuVendor,
     pub name: String,
     pub vram_budget_bytes: u64,
@@ -65,7 +95,7 @@ pub fn snapshot(config: &ResourceConfig) -> ResourceSnapshot {
         return snapshot;
     }
 
-    match config.gpu_vendor.as_str() {
+    match config.gpu_vendor.trim().to_ascii_lowercase().as_str() {
         "nvidia" => snapshot.gpus.extend(nvidia_smi_gpus()),
         "amd" => snapshot.gpus.extend(amd_gpus()),
         "auto" | "" => {
@@ -74,31 +104,48 @@ pub fn snapshot(config: &ResourceConfig) -> ResourceSnapshot {
                 snapshot.gpus.extend(amd_gpus());
             }
         }
+        "apple" | "metal" => {}
         _ => {}
     }
     snapshot
 }
 
 pub fn budget_plan(snapshot: &ResourceSnapshot, requested_fraction: f64) -> BudgetPlan {
-    let budget_fraction = normalized_budget_fraction(requested_fraction);
+    let (budget_fraction, findings) = normalized_budget_fraction(requested_fraction);
+    let memory_budget_bytes = bytes_fraction(snapshot.available_memory_bytes, budget_fraction);
+    let gpu_budgets: Vec<_> = snapshot
+        .gpus
+        .iter()
+        .map(|gpu| GpuBudget {
+            vendor: gpu.vendor.clone(),
+            name: gpu.name.clone(),
+            vram_budget_bytes: bytes_fraction(
+                gpu.free_vram_bytes.unwrap_or(gpu.total_vram_bytes),
+                budget_fraction,
+            ),
+        })
+        .collect();
+    let gpu_vram_budgets = gpu_budgets
+        .iter()
+        .map(|budget| GpuVramBudgetMetadata {
+            vendor: budget.vendor.clone(),
+            name: budget.name.clone(),
+            vram_budget_bytes: budget.vram_budget_bytes,
+        })
+        .collect();
     BudgetPlan {
         budget_fraction,
         cpu_threads: ((snapshot.cpu_threads as f64) * budget_fraction)
             .floor()
             .max(1.0) as usize,
-        memory_budget_bytes: bytes_fraction(snapshot.available_memory_bytes, budget_fraction),
-        gpu_budgets: snapshot
-            .gpus
-            .iter()
-            .map(|gpu| GpuBudget {
-                vendor: gpu.vendor.clone(),
-                name: gpu.name.clone(),
-                vram_budget_bytes: bytes_fraction(
-                    gpu.free_vram_bytes.unwrap_or(gpu.total_vram_bytes),
-                    budget_fraction,
-                ),
-            })
-            .collect(),
+        memory_budget_bytes,
+        gpu_budgets,
+        limits: ResourceLimitPlan {
+            cpu_quota_percent: cpu_quota_percent(snapshot.cpu_threads, budget_fraction),
+            memory_max_bytes: memory_budget_bytes,
+            gpu_vram_budgets,
+        },
+        findings,
     }
 }
 
@@ -246,12 +293,36 @@ fn read_first_u64(paths: &[impl AsRef<Path>]) -> Option<u64> {
     })
 }
 
-fn normalized_budget_fraction(value: f64) -> f64 {
-    if value.is_finite() && value > 0.0 && value <= 1.0 {
-        value
-    } else {
-        DEFAULT_BUDGET_FRACTION
+fn normalized_budget_fraction(value: f64) -> (f64, Vec<String>) {
+    if !value.is_finite() || value <= 0.0 {
+        return (
+            DEFAULT_BUDGET_FRACTION,
+            vec!["resource budget must be finite and greater than zero".to_string()],
+        );
     }
+    if value < MIN_SAFE_BUDGET_FRACTION {
+        return (
+            DEFAULT_BUDGET_FRACTION,
+            vec![format!(
+                "resource budget {value:.2} is below safe minimum {MIN_SAFE_BUDGET_FRACTION:.2}"
+            )],
+        );
+    }
+    if value > MAX_SAFE_BUDGET_FRACTION {
+        return (
+            DEFAULT_BUDGET_FRACTION,
+            vec![format!(
+                "resource budget {value:.2} exceeds safe maximum {MAX_SAFE_BUDGET_FRACTION:.2}"
+            )],
+        );
+    }
+    (value, Vec::new())
+}
+
+fn cpu_quota_percent(cpu_threads: usize, fraction: f64) -> u32 {
+    ((cpu_threads.max(1) as f64) * fraction * 100.0)
+        .round()
+        .max(1.0) as u32
 }
 
 fn bytes_fraction(bytes: u64, fraction: f64) -> u64 {
@@ -280,15 +351,34 @@ mod tests {
         assert_eq!(plan.budget_fraction, 0.80);
         assert_eq!(plan.memory_budget_bytes, 8_000);
         assert_eq!(plan.cpu_threads, 6);
+        assert_eq!(plan.limits.cpu_quota_percent, 640);
+        assert_eq!(plan.limits.memory_max_bytes, 8_000);
+        assert_eq!(
+            plan.findings,
+            vec!["resource budget must be finite and greater than zero".to_string()]
+        );
         assert!(plan.gpu_budgets.is_empty());
+        assert!(plan.limits.gpu_vram_budgets.is_empty());
+    }
+
+    #[test]
+    fn rejects_unsafe_budget_fraction_above_safe_bound() {
+        let snapshot = cpu_only_snapshot(16_000, 10_000, 8);
+        let plan = budget_plan(&snapshot, 1.0);
+        assert_eq!(plan.budget_fraction, 0.80);
+        assert_eq!(plan.limits.cpu_quota_percent, 640);
+        assert!(plan
+            .findings
+            .iter()
+            .any(|finding| finding == "resource budget 1.00 exceeds safe maximum 0.95"));
     }
 
     #[test]
     fn parses_nvidia_smi_csv() {
-        let gpus = parse_nvidia_smi_csv("NVIDIA T1000, 4096, 3072\nRTX 6000, 24576, 20000\n");
+        let gpus = parse_nvidia_smi_csv("NVIDIA T100, 4096, 3072\nRTX 6000, 24576, 20000\n");
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].vendor, GpuVendor::Nvidia);
-        assert_eq!(gpus[0].name, "NVIDIA T1000");
+        assert_eq!(gpus[0].name, "NVIDIA T100");
         assert_eq!(gpus[0].total_vram_bytes, 4096 * 1024 * 1024);
         assert_eq!(gpus[0].free_vram_bytes, Some(3072 * 1024 * 1024));
     }
@@ -311,6 +401,16 @@ mod tests {
         assert_eq!(plan.cpu_threads, 6);
         assert_eq!(plan.memory_budget_bytes, 16_000);
         assert_eq!(plan.gpu_budgets[0].vram_budget_bytes, 5_000);
+        assert_eq!(plan.limits.cpu_quota_percent, 600);
+        assert_eq!(plan.limits.memory_max_bytes, 16_000);
+        assert_eq!(
+            plan.limits.gpu_vram_budgets,
+            vec![GpuVramBudgetMetadata {
+                vendor: GpuVendor::Amd,
+                name: "card0".to_string(),
+                vram_budget_bytes: 5_000,
+            }]
+        );
     }
 
     #[test]
@@ -319,5 +419,17 @@ mod tests {
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, GpuVendor::Amd);
         assert_eq!(gpus[0].total_vram_bytes, 8192 * 1024 * 1024);
+    }
+
+    #[test]
+    fn recognizes_configured_apple_metal_gpu_vendor() {
+        assert_eq!(
+            GpuVendor::from_config_value("metal"),
+            Some(GpuVendor::Apple)
+        );
+        assert_eq!(
+            GpuVendor::from_config_value("apple"),
+            Some(GpuVendor::Apple)
+        );
     }
 }

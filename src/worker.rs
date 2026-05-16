@@ -1,8 +1,10 @@
 use crate::config::{Config, ModelConfig, ResourceConfig, ServerConfig};
+use futures_util::future::{BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 const DEFAULT_GPU_LAYERS: u32 = 99;
 
@@ -268,6 +270,230 @@ pub enum WorkerState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStatus {
+    pub worker_id: WorkerId,
+    pub pid: Option<u32>,
+    pub state: WorkerState,
+    pub restart_count: u32,
+    pub last_error: Option<String>,
+}
+
+impl WorkerStatus {
+    fn new(worker_id: WorkerId) -> Self {
+        Self {
+            worker_id,
+            pid: None,
+            state: WorkerState::Stopped,
+            restart_count: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnedWorker {
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRunnerError {
+    message: String,
+}
+
+impl WorkerRunnerError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for WorkerRunnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkerRunnerError {}
+
+impl From<std::io::Error> for WorkerRunnerError {
+    fn from(value: std::io::Error) -> Self {
+        Self::new(value.to_string())
+    }
+}
+
+pub trait WorkerRunner {
+    fn spawn<'a>(
+        &'a mut self,
+        planned: &'a PlannedWorker,
+    ) -> BoxFuture<'a, Result<SpawnedWorker, WorkerRunnerError>>;
+
+    fn stop<'a>(
+        &'a mut self,
+        worker_id: &'a WorkerId,
+    ) -> BoxFuture<'a, Result<(), WorkerRunnerError>>;
+}
+
+#[derive(Debug, Default)]
+pub struct TokioWorkerRunner {
+    children: BTreeMap<WorkerId, Child>,
+}
+
+impl TokioWorkerRunner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl WorkerRunner for TokioWorkerRunner {
+    fn spawn<'a>(
+        &'a mut self,
+        planned: &'a PlannedWorker,
+    ) -> BoxFuture<'a, Result<SpawnedWorker, WorkerRunnerError>> {
+        async move {
+            let child = planned.command.clone().into_tokio_command().spawn()?;
+            let pid = child.id().unwrap_or_default();
+            self.children.insert(planned.worker.id.clone(), child);
+            Ok(SpawnedWorker { pid })
+        }
+        .boxed()
+    }
+
+    fn stop<'a>(
+        &'a mut self,
+        worker_id: &'a WorkerId,
+    ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
+        async move {
+            if let Some(mut child) = self.children.remove(worker_id) {
+                child.kill().await?;
+            }
+
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkerSupervisor<R> {
+    runner: R,
+    statuses: BTreeMap<WorkerId, WorkerStatus>,
+}
+
+impl<R> WorkerSupervisor<R> {
+    pub fn new(runner: R) -> Self {
+        Self {
+            runner,
+            statuses: BTreeMap::new(),
+        }
+    }
+
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    pub fn statuses(&self) -> Vec<WorkerStatus> {
+        self.statuses.values().cloned().collect()
+    }
+}
+
+impl<R: WorkerRunner> WorkerSupervisor<R> {
+    pub async fn start_all(&mut self, plan: &StartupPlan) -> Vec<WorkerStatus> {
+        for planned in &plan.workers {
+            self.start(planned).await;
+        }
+
+        self.statuses()
+    }
+
+    pub async fn start(&mut self, planned: &PlannedWorker) -> WorkerStatus {
+        let worker_id = planned.worker.id.clone();
+        let restart_count = self
+            .statuses
+            .get(&worker_id)
+            .map(|status| status.restart_count)
+            .unwrap_or_default();
+
+        self.statuses.insert(
+            worker_id.clone(),
+            WorkerStatus {
+                worker_id: worker_id.clone(),
+                pid: None,
+                state: WorkerState::Starting,
+                restart_count,
+                last_error: None,
+            },
+        );
+
+        match self.runner.spawn(planned).await {
+            Ok(spawned) => self.update_status(&worker_id, |status| {
+                status.pid = Some(spawned.pid);
+                status.state = WorkerState::Ready;
+                status.last_error = None;
+            }),
+            Err(error) => self.update_status(&worker_id, |status| {
+                status.pid = None;
+                status.state = WorkerState::Failed;
+                status.last_error = Some(error.to_string());
+            }),
+        }
+    }
+
+    pub async fn drain(&mut self, worker_id: &WorkerId) -> WorkerStatus {
+        self.update_status(worker_id, |status| {
+            status.state = WorkerState::Draining;
+            status.last_error = None;
+        })
+    }
+
+    pub async fn stop(&mut self, worker_id: &WorkerId) -> WorkerStatus {
+        self.update_status(worker_id, |status| {
+            status.state = WorkerState::Stopping;
+            status.last_error = None;
+        });
+
+        match self.runner.stop(worker_id).await {
+            Ok(()) => self.update_status(worker_id, |status| {
+                status.pid = None;
+                status.state = WorkerState::Stopped;
+                status.last_error = None;
+            }),
+            Err(error) => self.update_status(worker_id, |status| {
+                status.state = WorkerState::Failed;
+                status.last_error = Some(error.to_string());
+            }),
+        }
+    }
+
+    pub async fn restart(&mut self, planned: &PlannedWorker) -> WorkerStatus {
+        let worker_id = planned.worker.id.clone();
+        let stopped = self.stop(&worker_id).await;
+        if stopped.state == WorkerState::Failed {
+            return stopped;
+        }
+
+        self.update_status(&worker_id, |status| {
+            status.restart_count = status.restart_count.saturating_add(1);
+        });
+
+        self.start(planned).await
+    }
+
+    fn update_status(
+        &mut self,
+        worker_id: &WorkerId,
+        update: impl FnOnce(&mut WorkerStatus),
+    ) -> WorkerStatus {
+        let status = self
+            .statuses
+            .entry(worker_id.clone())
+            .or_insert_with(|| WorkerStatus::new(worker_id.clone()));
+        update(status);
+        status.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleStep {
     pub worker_id: WorkerId,
     pub target: WorkerState,
@@ -315,6 +541,7 @@ impl SwapPlan {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
+    use futures_util::future::{ready, BoxFuture, FutureExt};
     use std::path::PathBuf;
 
     fn model(alias: &str, path: &str) -> ModelConfig {
@@ -323,6 +550,61 @@ mod tests {
             path: PathBuf::from(path),
             role: "chat".to_string(),
             weight: 0,
+        }
+    }
+
+    fn planned_worker(alias: &str) -> PlannedWorker {
+        let worker = WorkerSpec {
+            id: WorkerId::new(alias),
+            model: model(alias, &format!("/models/{alias}.gguf")),
+            bind_host: "127.0.0.1".to_string(),
+            port: 19000,
+            context_size: 4096,
+            backend: WorkerBackend::Cpu,
+        };
+        let command = CommandSpec {
+            program: PathBuf::from("llama-server"),
+            args: vec!["--model".to_string(), format!("/models/{alias}.gguf")],
+            env: vec![("API_TOKEN".to_string(), "super-secret".to_string())],
+        };
+
+        PlannedWorker { worker, command }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeRunner {
+        next_pid: u32,
+        fail_spawn_for: Vec<WorkerId>,
+        fail_stop_for: Vec<WorkerId>,
+        spawned: Vec<WorkerId>,
+        stopped: Vec<WorkerId>,
+    }
+
+    impl WorkerRunner for FakeRunner {
+        fn spawn<'a>(
+            &'a mut self,
+            planned: &'a PlannedWorker,
+        ) -> BoxFuture<'a, Result<SpawnedWorker, WorkerRunnerError>> {
+            self.spawned.push(planned.worker.id.clone());
+            if self.fail_spawn_for.contains(&planned.worker.id) {
+                return ready(Err(WorkerRunnerError::new("spawn failed"))).boxed();
+            }
+
+            let pid = self.next_pid;
+            self.next_pid += 1;
+            ready(Ok(SpawnedWorker { pid })).boxed()
+        }
+
+        fn stop<'a>(
+            &'a mut self,
+            worker_id: &'a WorkerId,
+        ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
+            self.stopped.push(worker_id.clone());
+            if self.fail_stop_for.contains(worker_id) {
+                return ready(Err(WorkerRunnerError::new("stop failed"))).boxed();
+            }
+
+            ready(Ok(())).boxed()
         }
     }
 
@@ -426,6 +708,116 @@ mod tests {
         .build();
         assert_eq!(metal.args.last().map(String::as_str), Some("48"));
         assert_eq!(metal.env, vec![("GGML_METAL".into(), "1".into())]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_starts_all_workers_and_reports_runtime_status() {
+        let plan = StartupPlan {
+            workers: vec![planned_worker("chat"), planned_worker("coder")],
+        };
+        let runner = FakeRunner {
+            next_pid: 5000,
+            ..FakeRunner::default()
+        };
+        let mut supervisor = WorkerSupervisor::new(runner);
+
+        let statuses = supervisor.start_all(&plan).await;
+
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].worker_id, WorkerId::new("chat"));
+        assert_eq!(statuses[0].pid, Some(5000));
+        assert_eq!(statuses[0].state, WorkerState::Ready);
+        assert_eq!(statuses[0].restart_count, 0);
+        assert_eq!(statuses[0].last_error, None);
+        assert_eq!(statuses[1].worker_id, WorkerId::new("coder"));
+        assert_eq!(statuses[1].pid, Some(5001));
+        assert_eq!(statuses[1].state, WorkerState::Ready);
+    }
+
+    #[tokio::test]
+    async fn supervisor_records_spawn_failures_without_leaking_command_env() {
+        let plan = StartupPlan {
+            workers: vec![planned_worker("chat")],
+        };
+        let runner = FakeRunner {
+            fail_spawn_for: vec![WorkerId::new("chat")],
+            ..FakeRunner::default()
+        };
+        let mut supervisor = WorkerSupervisor::new(runner);
+
+        let statuses = supervisor.start_all(&plan).await;
+        let status_json = serde_json::to_string(&statuses[0]).expect("serialize status");
+
+        assert_eq!(statuses[0].worker_id, WorkerId::new("chat"));
+        assert_eq!(statuses[0].pid, None);
+        assert_eq!(statuses[0].state, WorkerState::Failed);
+        assert_eq!(statuses[0].last_error.as_deref(), Some("spawn failed"));
+        assert!(!status_json.contains("API_TOKEN"));
+        assert!(!status_json.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_drains_and_stops_running_workers() {
+        let worker = planned_worker("chat");
+        let plan = StartupPlan {
+            workers: vec![worker.clone()],
+        };
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 7000,
+            ..FakeRunner::default()
+        });
+        supervisor.start_all(&plan).await;
+
+        let drained = supervisor.drain(&worker.worker.id).await;
+        let stopped = supervisor.stop(&worker.worker.id).await;
+
+        assert_eq!(drained.state, WorkerState::Draining);
+        assert_eq!(drained.pid, Some(7000));
+        assert_eq!(stopped.state, WorkerState::Stopped);
+        assert_eq!(stopped.pid, None);
+    }
+
+    #[tokio::test]
+    async fn supervisor_restart_stops_then_starts_worker_and_increments_count() {
+        let worker = planned_worker("chat");
+        let plan = StartupPlan {
+            workers: vec![worker.clone()],
+        };
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 8000,
+            ..FakeRunner::default()
+        });
+        supervisor.start_all(&plan).await;
+
+        let restarted = supervisor.restart(&worker).await;
+
+        assert_eq!(restarted.worker_id, WorkerId::new("chat"));
+        assert_eq!(restarted.pid, Some(8001));
+        assert_eq!(restarted.state, WorkerState::Ready);
+        assert_eq!(restarted.restart_count, 1);
+        assert_eq!(supervisor.runner().stopped, vec![WorkerId::new("chat")]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_restart_does_not_spawn_when_stop_fails() {
+        let worker = planned_worker("chat");
+        let plan = StartupPlan {
+            workers: vec![worker.clone()],
+        };
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 9000,
+            fail_stop_for: vec![WorkerId::new("chat")],
+            ..FakeRunner::default()
+        });
+        supervisor.start_all(&plan).await;
+
+        let restarted = supervisor.restart(&worker).await;
+
+        assert_eq!(restarted.state, WorkerState::Failed);
+        assert_eq!(restarted.pid, Some(9000));
+        assert_eq!(restarted.restart_count, 0);
+        assert_eq!(restarted.last_error.as_deref(), Some("stop failed"));
+        assert_eq!(supervisor.runner().spawned, vec![WorkerId::new("chat")]);
     }
 
     #[test]

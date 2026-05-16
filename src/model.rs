@@ -1,6 +1,7 @@
 use crate::config::ModelConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
+use reqwest::header::{HeaderValue, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -48,7 +49,34 @@ pub struct InstalledModel {
     pub sha256: String,
     pub bytes: u64,
     pub source: ModelSource,
+    pub source_kind: ModelInstallSourceKind,
+    pub verification: ModelInstallVerification,
     pub config: ModelConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelInstallSourceKind {
+    Local,
+    Offline,
+    Download,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInstallVerification {
+    pub sha256_required: bool,
+    pub expected_sha256: Option<String>,
+    pub actual_sha256: Option<String>,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInstallPlan {
+    pub alias: String,
+    pub source_kind: ModelInstallSourceKind,
+    pub source_url: Option<String>,
+    pub cache_dir: PathBuf,
+    pub verification: ModelInstallVerification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,8 +169,40 @@ pub fn source_url(source: &ModelSource) -> Result<Option<String>> {
     }
 }
 
-pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> {
+pub fn install_plan(req: &ModelInstallRequest) -> Result<ModelInstallPlan> {
     validate_alias(&req.alias)?;
+    let source_kind = match &req.source {
+        ModelSource::LocalPath { .. } => ModelInstallSourceKind::Local,
+        ModelSource::DirectUrl { .. } | ModelSource::HuggingFace { .. } => {
+            ModelInstallSourceKind::Download
+        }
+    };
+    let expected_sha256 = req
+        .expected_sha256
+        .as_ref()
+        .map(|expected| normalized_sha256(expected))
+        .transpose()?;
+    let sha256_required = source_kind == ModelInstallSourceKind::Download;
+    if sha256_required && expected_sha256.is_none() {
+        bail!("expected_sha256 is required for downloaded model sources");
+    }
+
+    Ok(ModelInstallPlan {
+        alias: req.alias.clone(),
+        source_kind,
+        source_url: source_url(&req.source)?,
+        cache_dir: req.cache_dir.clone(),
+        verification: ModelInstallVerification {
+            sha256_required,
+            expected_sha256,
+            actual_sha256: None,
+            verified: false,
+        },
+    })
+}
+
+pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> {
+    let plan = install_plan(req)?;
     fs::create_dir_all(&req.cache_dir)
         .await
         .with_context(|| format!("create model cache {}", req.cache_dir.display()))?;
@@ -151,22 +211,33 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         ModelSource::LocalPath { path } => {
             register_local_model(path, &req.cache_dir, req.copy_to_cache).await?
         }
-        ModelSource::DirectUrl { url } => download_model(url, &req.cache_dir, &req.alias).await?,
+        ModelSource::DirectUrl { url } => {
+            let expected = plan
+                .verification
+                .expected_sha256
+                .as_deref()
+                .expect("download plan requires expected sha256");
+            download_model(url, &req.cache_dir, &req.alias, expected).await?
+        }
         ModelSource::HuggingFace {
             repo,
             filename,
             revision,
         } => {
             let url = huggingface_download_url(repo, filename, revision)?;
-            download_model(&url, &req.cache_dir, filename).await?
+            let expected = plan
+                .verification
+                .expected_sha256
+                .as_deref()
+                .expect("download plan requires expected sha256");
+            download_model(&url, &req.cache_dir, filename, expected).await?
         }
     };
 
     ensure_gguf_path(&path)?;
     let sha256 = sha256_file(&path).await?;
-    if let Some(expected) = &req.expected_sha256 {
-        let expected = expected.to_ascii_lowercase();
-        if sha256 != expected {
+    if let Some(expected) = &plan.verification.expected_sha256 {
+        if sha256 != *expected {
             bail!(
                 "sha256 mismatch for {}: expected {expected}, got {sha256}",
                 path.display()
@@ -183,6 +254,11 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         role: req.role.clone(),
         weight: req.weight,
     };
+    let verification = ModelInstallVerification {
+        actual_sha256: Some(sha256.clone()),
+        verified: plan.verification.expected_sha256.is_some(),
+        ..plan.verification
+    };
 
     Ok(InstalledModel {
         alias: req.alias.clone(),
@@ -190,6 +266,8 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         sha256,
         bytes,
         source: req.source.clone(),
+        source_kind: plan.source_kind,
+        verification,
         config,
     })
 }
@@ -215,8 +293,7 @@ pub async fn install_offline_manifest(
     let mut installed = Vec::with_capacity(manifest.models.len());
     for entry in &manifest.models {
         validate_alias(&entry.alias)?;
-        let expected = entry.sha256.to_ascii_lowercase();
-        validate_sha256(&expected)?;
+        let expected = normalized_sha256(&entry.sha256)?;
         let path = resolve_manifest_path(base_dir, &entry.path);
         ensure_gguf_path(&path)?;
         let metadata = fs::metadata(&path)
@@ -244,9 +321,16 @@ pub async fn install_offline_manifest(
         installed.push(InstalledModel {
             alias: entry.alias.clone(),
             path,
-            sha256,
+            sha256: sha256.clone(),
             bytes: metadata.len(),
             source,
+            source_kind: ModelInstallSourceKind::Offline,
+            verification: ModelInstallVerification {
+                sha256_required: true,
+                expected_sha256: Some(expected),
+                actual_sha256: Some(sha256),
+                verified: true,
+            },
             config,
         });
     }
@@ -285,7 +369,13 @@ pub async fn register_local_model(
     Ok(destination)
 }
 
-pub async fn download_model(url: &str, cache_dir: &Path, name_hint: &str) -> Result<PathBuf> {
+pub async fn download_model(
+    url: &str,
+    cache_dir: &Path,
+    name_hint: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf> {
+    let expected_sha256 = normalized_sha256(expected_sha256)?;
     fs::create_dir_all(cache_dir)
         .await
         .with_context(|| format!("create model cache {}", cache_dir.display()))?;
@@ -293,28 +383,83 @@ pub async fn download_model(url: &str, cache_dir: &Path, name_hint: &str) -> Res
     let destination = unique_destination(cache_dir, filename.as_ref());
     let partial = destination.with_extension("part");
 
-    let response = reqwest::get(url)
+    let partial_len = match fs::metadata(&partial).await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        _ => 0,
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.get(url);
+    if partial_len > 0 {
+        request = request.header(
+            RANGE,
+            HeaderValue::from_str(&format!("bytes={partial_len}-"))
+                .context("build resumable download range header")?,
+        );
+    }
+
+    let response = request
+        .send()
         .await
         .with_context(|| format!("download model from {url}"))?
         .error_for_status()
         .with_context(|| format!("download model from {url}"))?;
-    let mut output = fs::File::create(&partial)
-        .await
-        .with_context(|| format!("create partial download {}", partial.display()))?;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        output
-            .write_all(&chunk.with_context(|| format!("read model download from {url}"))?)
+    let append_partial =
+        partial_len > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut output = if append_partial {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&partial)
             .await
-            .with_context(|| format!("write partial download {}", partial.display()))?;
+            .with_context(|| format!("open partial download {}", partial.display()))?
+    } else {
+        fs::File::create(&partial)
+            .await
+            .with_context(|| format!("create partial download {}", partial.display()))?
+    };
+    let mut stream = response.bytes_stream();
+    let write_result: Result<()> = async {
+        while let Some(chunk) = stream.next().await {
+            output
+                .write_all(&chunk.with_context(|| format!("read model download from {url}"))?)
+                .await
+                .with_context(|| format!("write partial download {}", partial.display()))?;
+        }
+        output
+            .flush()
+            .await
+            .with_context(|| format!("flush partial download {}", partial.display()))?;
+        Ok(())
     }
-    output.flush().await?;
+    .await;
     drop(output);
-    fs::rename(&partial, &destination)
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&partial).await;
+        return Err(err);
+    }
+
+    verify_downloaded_model(&partial, &destination, &expected_sha256).await?;
+    Ok(destination)
+}
+
+async fn verify_downloaded_model(
+    partial: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<()> {
+    ensure_gguf_path(destination)?;
+    let expected_sha256 = normalized_sha256(expected_sha256)?;
+    let sha256 = sha256_file(partial).await?;
+    if sha256 != expected_sha256 {
+        let _ = fs::remove_file(partial).await;
+        bail!(
+            "sha256 mismatch for {}: expected {expected_sha256}, got {sha256}",
+            destination.display()
+        );
+    }
+    fs::rename(partial, destination)
         .await
         .with_context(|| format!("move {} to {}", partial.display(), destination.display()))?;
-    ensure_gguf_path(&destination)?;
-    Ok(destination)
+    Ok(())
 }
 
 pub async fn sha256_file(path: &Path) -> Result<String> {
@@ -397,6 +542,12 @@ fn validate_sha256(value: &str) -> Result<()> {
         "sha256 must be 64 hexadecimal characters"
     );
     Ok(())
+}
+
+fn normalized_sha256(value: &str) -> Result<String> {
+    let normalized = value.to_ascii_lowercase();
+    validate_sha256(&normalized)?;
+    Ok(normalized)
 }
 
 fn resolve_manifest_path(base_dir: &Path, path: &Path) -> PathBuf {
@@ -491,6 +642,12 @@ sha256 = "{expected}"
         assert_eq!(installed[0].path, model);
         assert_eq!(installed[0].config.role, "chat");
         assert_eq!(installed[0].config.weight, 0);
+        assert_eq!(installed[0].source_kind, ModelInstallSourceKind::Offline);
+        assert_eq!(
+            installed[0].verification.expected_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(installed[0].verification.verified);
     }
 
     #[tokio::test]
@@ -561,6 +718,107 @@ sha256 = "{expected}"
             url,
             "https://huggingface.co/org/repo/resolve/main/model.gguf?download=true"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_direct_download_without_expected_sha_before_network() {
+        let dir = tempdir().unwrap();
+        let err = install_model(&ModelInstallRequest {
+            alias: "tiny".to_string(),
+            source: ModelSource::DirectUrl {
+                url: "http://127.0.0.1:9/tiny.gguf".to_string(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: "chat".to_string(),
+            weight: 0,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("expected_sha256 is required for downloaded model sources"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_huggingface_download_without_expected_sha_before_network() {
+        let dir = tempdir().unwrap();
+        let err = install_model(&ModelInstallRequest {
+            alias: "tiny".to_string(),
+            source: ModelSource::HuggingFace {
+                repo: "org/repo".to_string(),
+                filename: "tiny.gguf".to_string(),
+                revision: "main".to_string(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: "chat".to_string(),
+            weight: 0,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("expected_sha256 is required for downloaded model sources"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_removes_partial_and_keeps_final_absent() {
+        let dir = tempdir().unwrap();
+        let final_path = dir.path().join("tiny.gguf");
+        let partial = final_path.with_extension("part");
+        fs::write(&partial, b"downloaded-bytes").await.unwrap();
+
+        let err = verify_downloaded_model(&partial, &final_path, &"0".repeat(64))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        assert!(!partial.exists(), "partial download should be cleaned up");
+        assert!(!final_path.exists(), "final model should not exist");
+    }
+
+    #[tokio::test]
+    async fn plans_sources_with_distinct_verification_requirements() {
+        let dir = tempdir().unwrap();
+        let local = install_plan(&ModelInstallRequest {
+            alias: "tiny".to_string(),
+            source: ModelSource::LocalPath {
+                path: dir.path().join("tiny.gguf"),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: "chat".to_string(),
+            weight: 0,
+        })
+        .unwrap();
+        assert_eq!(local.source_kind, ModelInstallSourceKind::Local);
+        assert!(!local.verification.sha256_required);
+
+        let download = install_plan(&ModelInstallRequest {
+            alias: "tiny".to_string(),
+            source: ModelSource::DirectUrl {
+                url: "https://example.com/tiny.gguf".to_string(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: Some("0".repeat(64)),
+            role: "chat".to_string(),
+            weight: 0,
+        })
+        .unwrap();
+        assert_eq!(download.source_kind, ModelInstallSourceKind::Download);
+        assert!(download.verification.sha256_required);
     }
 
     #[test]

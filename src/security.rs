@@ -1,5 +1,6 @@
 use crate::config::{ApiKeyConfig, Config};
 use anyhow::Result;
+use std::collections::BTreeSet;
 
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
     validate_api_keys_are_hashes(&cfg.security.api_keys)?;
@@ -29,7 +30,24 @@ fn validate_no_plaintext_observability_secrets(cfg: &Config) -> Result<()> {
 }
 
 fn validate_api_keys_are_hashes(keys: &[ApiKeyConfig]) -> Result<()> {
+    let mut ids = BTreeSet::new();
     for key in keys {
+        anyhow::ensure!(!key.id.trim().is_empty(), "api key id must not be empty");
+        anyhow::ensure!(
+            ids.insert(key.id.as_str()),
+            "api key `{}` is declared more than once",
+            key.id
+        );
+        anyhow::ensure!(
+            !key.subject.trim().is_empty(),
+            "api key `{}` must declare a subject",
+            key.id
+        );
+        anyhow::ensure!(
+            !key.team.trim().is_empty(),
+            "api key `{}` must declare a team",
+            key.id
+        );
         anyhow::ensure!(
             is_sha256_hex(&key.sha256),
             "api key `{}` must be stored as a sha256 hex digest",
