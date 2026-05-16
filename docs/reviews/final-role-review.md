@@ -56,11 +56,11 @@ documented TLS termination or mTLS evidence, environment-backed collector
 secrets, audit trails, retention controls, SBOM/checksum/signing scripts, and
 security/audit/compliance CLI evidence.
 
-For EU CRA Article 14, the product provides incident evidence commands,
-reporting timelines, audit/data envelopes, SBOM, checksums, signatures, and
-release provenance fields. Article 14 obligations apply from 2026-09-11, so the
-current product is evidence-ready but not a substitute for the manufacturer's
-external reporting process.
+For EU CRA Article 14, the product treats the obligations as active production
+controls now. It provides incident evidence commands, reporting timelines,
+audit/data envelopes, SBOM, checksums, signatures, and release provenance
+fields. The product is not a substitute for the manufacturer's external
+reporting process.
 
 ## Observability
 

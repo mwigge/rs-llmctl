@@ -1015,7 +1015,9 @@ fn compliance_evidence(cfg: &Config) -> serde_json::Value {
             ]
         },
         "cra_article_14": {
-            "regulatory_start_date": "2026-09-11",
+            "regulation": "Regulation (EU) 2024/2847",
+            "operational_status": "active_control",
+            "control_assumption": "treat CRA Article 14 obligations as live for all production operations",
             "early_warning_due": "within_24_hours",
             "vulnerability_notification_due": "within_72_hours",
             "final_vulnerability_report_due": "within_14_days_after_mitigation",

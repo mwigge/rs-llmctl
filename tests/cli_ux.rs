@@ -1859,8 +1859,12 @@ fn compliance_evidence_reports_cra_pci_and_release_integrity() {
     let evidence = assert_success_json(evidence);
 
     assert_eq!(
-        evidence["cra_article_14"]["regulatory_start_date"],
-        "2026-09-11"
+        evidence["cra_article_14"]["operational_status"],
+        "active_control"
+    );
+    assert_eq!(
+        evidence["cra_article_14"]["control_assumption"],
+        "treat CRA Article 14 obligations as live for all production operations"
     );
     assert_eq!(
         evidence["pci_dss"]["baseline"],

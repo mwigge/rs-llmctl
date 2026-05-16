@@ -17,8 +17,9 @@ envelope commands when it needs payload hashing.
 
 ## CRA Article 14 Process
 
-EU Cyber Resilience Act reporting obligations start on 2026-09-11. The built-in
-evidence command records the expected timelines:
+`rs-llmctl` treats EU Cyber Resilience Act Article 14 as an active production
+control for all releases and operations. The built-in evidence command records
+the operating timelines:
 
 - early warning within 24 hours;
 - vulnerability notification within 72 hours;
