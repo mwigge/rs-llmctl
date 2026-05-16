@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use hmac::{Hmac, Mac};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{
     self, ApiKeyConfig, Config, DataFabricFormat, EventFormat, LogFormat, Mode, ModelConfig,
@@ -77,6 +78,18 @@ enum Command {
         #[command(subcommand)]
         command: AiopsCommand,
     },
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
+    Lineage {
+        #[command(subcommand)]
+        command: LineageCommand,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
     Compliance {
         #[command(subcommand)]
         command: ComplianceCommand,
@@ -144,6 +157,8 @@ enum CliDataFormat {
     Json,
     Jsonl,
     ArrowJson,
+    ArrowIpc,
+    Parquet,
 }
 
 #[derive(Debug, Subcommand)]
@@ -414,6 +429,114 @@ enum DataCommand {
 #[derive(Debug, Subcommand)]
 enum AiopsCommand {
     Gaps,
+    SloPlan(AiopsSloPlanArgs),
+    IncidentTemplate(AiopsIncidentTemplateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    Run(EvalRunArgs),
+    List,
+    Report,
+}
+
+#[derive(Debug, Subcommand)]
+enum LineageCommand {
+    Record(LineageRecordArgs),
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    Bundle(PolicyBundleArgs),
+    VerifyBundle(PolicyVerifyBundleArgs),
+    LegalHoldPlan(PolicyLegalHoldPlanArgs),
+}
+
+#[derive(Debug, Args)]
+struct AiopsSloPlanArgs {
+    #[arg(long, default_value_t = 99.0)]
+    availability_percent: f64,
+    #[arg(long, default_value_t = 2_000)]
+    latency_p95_ms: u64,
+    #[arg(long, default_value_t = 1.0)]
+    error_rate_percent: f64,
+}
+
+#[derive(Debug, Args)]
+struct AiopsIncidentTemplateArgs {
+    #[arg(long, default_value = "undetermined")]
+    severity: String,
+    #[arg(long, default_value = "operations")]
+    team: String,
+}
+
+#[derive(Debug, Args)]
+struct EvalRunArgs {
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    suite: String,
+    #[arg(long)]
+    score: f64,
+    #[arg(long)]
+    baseline: Option<f64>,
+    #[arg(long)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct LineageRecordArgs {
+    #[arg(long, value_enum)]
+    kind: LineageKind,
+    #[arg(long)]
+    id: String,
+    #[arg(long = "parent")]
+    parents: Vec<String>,
+    #[arg(long)]
+    sha256: Option<String>,
+    #[arg(long)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
+enum LineageKind {
+    Prompt,
+    Corpus,
+    EmbeddingIndex,
+    Model,
+    Release,
+}
+
+#[derive(Debug, Args)]
+struct PolicyBundleArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    signing_key_env: String,
+}
+
+#[derive(Debug, Args)]
+struct PolicyVerifyBundleArgs {
+    path: PathBuf,
+    #[arg(long)]
+    signing_key_env: String,
+}
+
+#[derive(Debug, Args)]
+struct PolicyLegalHoldPlanArgs {
+    #[arg(long, value_enum)]
+    dataset: DataContractDataset,
+    #[arg(long)]
+    case_id: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -437,6 +560,8 @@ struct DataExportArgs {
     dataset: DataDataset,
     #[arg(long, value_enum, default_value_t = DataExportFormat::Json)]
     format: DataExportFormat,
+    #[arg(long)]
+    output: Option<PathBuf>,
     #[arg(long)]
     envelope: bool,
 }
@@ -480,6 +605,8 @@ enum DataExportFormat {
     Json,
     Jsonl,
     ArrowJson,
+    ArrowIpc,
+    Parquet,
 }
 
 #[derive(Debug, Args)]
@@ -504,6 +631,9 @@ async fn main() -> Result<()> {
         Command::Usage { command } => usage_command(&config_path, command, cli.json).await,
         Command::Data { command } => data_command(&config_path, command, cli.json).await,
         Command::Aiops { command } => aiops_command(command, cli.json).await,
+        Command::Eval { command } => eval_command(&config_path, command, cli.json).await,
+        Command::Lineage { command } => lineage_command(&config_path, command, cli.json).await,
+        Command::Policy { command } => policy_command(command, cli.json).await,
         Command::Compliance { command } => {
             compliance_command(&config_path, command, cli.json).await
         }
@@ -1111,7 +1241,8 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
                 emit(as_json, &report)
             } else {
                 let report = reporting::data_export(&storage, from, to).await?;
-                let output = format_data_export(report, args.dataset, args.format)?;
+                let output =
+                    format_data_export(report, args.dataset, args.format, args.output.as_deref())?;
                 emit(as_json, &output)
             }
         }
@@ -1152,6 +1283,7 @@ fn format_data_export(
     report: reporting::DataExport,
     dataset: DataDataset,
     format: DataExportFormat,
+    output: Option<&Path>,
 ) -> Result<serde_json::Value> {
     let rows = dataset_rows(&report, dataset)?;
     let dataset_name = dataset.as_str();
@@ -1191,6 +1323,39 @@ fn format_data_export(
             })),
             "rows": rows
         })),
+        DataExportFormat::ArrowIpc => {
+            let path = output.ok_or_else(|| {
+                anyhow::anyhow!("data export --format arrow-ipc requires --output")
+            })?;
+            let contract = contract.ok_or_else(|| {
+                anyhow::anyhow!("data export --format arrow-ipc requires a concrete --dataset")
+            })?;
+            let row_count = rs_llmctl::data_fabric::write_arrow_ipc(path, &contract, &rows)?;
+            Ok(json!({
+                "format": "arrow-ipc",
+                "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
+                "dataset": dataset_name,
+                "path": path,
+                "rows": row_count,
+                "arrow_schema": contract.arrow_schema
+            }))
+        }
+        DataExportFormat::Parquet => {
+            let path = output
+                .ok_or_else(|| anyhow::anyhow!("data export --format parquet requires --output"))?;
+            let contract = contract.ok_or_else(|| {
+                anyhow::anyhow!("data export --format parquet requires a concrete --dataset")
+            })?;
+            let row_count = rs_llmctl::data_fabric::write_parquet(path, &contract, &rows)?;
+            Ok(json!({
+                "format": "parquet",
+                "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
+                "dataset": dataset_name,
+                "path": path,
+                "rows": row_count,
+                "arrow_schema": contract.arrow_schema
+            }))
+        }
     }
 }
 
@@ -1342,6 +1507,8 @@ fn dataset_rows(
 async fn aiops_command(command: AiopsCommand, as_json: bool) -> Result<()> {
     match command {
         AiopsCommand::Gaps => emit(as_json, &aiops_gaps_report()),
+        AiopsCommand::SloPlan(args) => emit(as_json, &slo_plan(args)),
+        AiopsCommand::IncidentTemplate(args) => emit(as_json, &incident_template(args)),
     }
 }
 
@@ -1352,36 +1519,332 @@ fn aiops_gaps_report() -> serde_json::Value {
             "typed production/local config profiles",
             "SSE, log, event, OTel, and data-fabric config fields",
             "schema-versioned contracts for security, observability, usage, user, finops, model, drift, and audit datasets",
-            "domain-filtered JSON, JSONL, and Arrow-schema JSON exports",
+            "domain-filtered JSON, JSONL, Arrow-schema JSON, Arrow IPC, and Parquet exports",
             "CRA Article 14 active-control evidence and PCI DSS aligned reporting commands",
             "OpenAI-compatible model and chat serving, local search, recommendations, quotas, and worker lifecycle controls"
         ],
         "gaps": [
             {
-                "area": "data-fabric",
-                "gap": "native Arrow IPC and Parquet file writers are not bundled yet",
-                "next_control": "add an explicit arrow/parquet feature with golden-file compatibility tests"
-            },
-            {
                 "area": "model-quality",
-                "gap": "model eval suites, golden prompts, and baseline comparison history need first-class commands",
-                "next_control": "add llmctl eval run/list/report and persist results by model version"
+                "gap": "eval execution is operator-supplied today; built-in prompt runners are not bundled",
+                "next_control": "add optional suite runners that execute golden prompts against configured endpoints"
             },
             {
                 "area": "lineage",
-                "gap": "prompt, dataset, embedding index, and model provenance are reported indirectly",
-                "next_control": "add lineage records tied to requests, RAG corpora, model manifests, and releases"
+                "gap": "lineage records are file-backed; runtime request-to-lineage joins are not automatic yet",
+                "next_control": "attach lineage ids to serving requests, RAG corpora, model manifests, and releases"
             },
             {
                 "area": "operations",
-                "gap": "SLOs, alert rules, and incident records are not yet generated from config",
-                "next_control": "add aiops slo plan and incident evidence envelopes"
+                "gap": "SLO and incident templates are generated, but alert-manager specific renderers are not bundled",
+                "next_control": "add Prometheus/Alertmanager and Grafana dashboard renderers"
             },
             {
                 "area": "governance",
-                "gap": "policy-as-code deployment gates and legal-hold retention overrides are not complete",
-                "next_control": "add signed policy bundles and retention/legal-hold scopes per dataset"
+                "gap": "policy bundles use HMAC-SHA256; asymmetric signing and transparency log publication are not bundled",
+                "next_control": "add Sigstore/minisign support and append-only policy publication"
             }
+        ]
+    })
+}
+
+fn slo_plan(args: AiopsSloPlanArgs) -> serde_json::Value {
+    json!({
+        "schema_version": 1,
+        "kind": "slo-plan",
+        "generated_at": Utc::now(),
+        "slos": {
+            "availability_percent": args.availability_percent,
+            "latency_p95_ms": args.latency_p95_ms,
+            "error_rate_percent": args.error_rate_percent
+        },
+        "alert_rules": [
+            {
+                "name": "llmctl_high_error_rate",
+                "expr": format!("rate(llmctl_requests_total{{status=\"error\"}}[5m]) / rate(llmctl_requests_total[5m]) > {}", args.error_rate_percent / 100.0),
+                "for": "10m",
+                "severity": "page"
+            },
+            {
+                "name": "llmctl_high_latency_p95",
+                "expr": format!("histogram_quantile(0.95, rate(llmctl_request_latency_ms_bucket[5m])) > {}", args.latency_p95_ms),
+                "for": "15m",
+                "severity": "ticket"
+            }
+        ],
+        "evidence_commands": [
+            "llmctl observe plan",
+            "llmctl usage report --hours 24",
+            "llmctl compliance evidence"
+        ]
+    })
+}
+
+async fn eval_command(path: &Path, command: EvalCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    let path = state_file(&cfg, "eval-runs.jsonl")?;
+    match command {
+        EvalCommand::Run(args) => {
+            let record = json!({
+                "schema_version": 1,
+                "id": Uuid::new_v4(),
+                "at": Utc::now(),
+                "model": args.model,
+                "suite": args.suite,
+                "score": args.score,
+                "baseline": args.baseline,
+                "delta": args.baseline.map(|baseline| args.score - baseline),
+                "notes": args.notes
+            });
+            append_jsonl(&path, &record).await?;
+            emit(as_json, &record)
+        }
+        EvalCommand::List => emit(
+            as_json,
+            &json!({
+                "schema_version": 1,
+                "path": path,
+                "runs": read_jsonl(&path).await?
+            }),
+        ),
+        EvalCommand::Report => {
+            let runs = read_jsonl(&path).await?;
+            emit(as_json, &eval_report(&runs))
+        }
+    }
+}
+
+async fn lineage_command(path: &Path, command: LineageCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    let path = state_file(&cfg, "lineage-records.jsonl")?;
+    match command {
+        LineageCommand::Record(args) => {
+            let record = json!({
+                "schema_version": 1,
+                "id": args.id,
+                "kind": args.kind,
+                "parents": args.parents,
+                "sha256": args.sha256,
+                "source": args.source,
+                "recorded_at": Utc::now()
+            });
+            append_jsonl(&path, &record).await?;
+            emit(as_json, &record)
+        }
+        LineageCommand::List => emit(
+            as_json,
+            &json!({
+                "schema_version": 1,
+                "path": path,
+                "records": read_jsonl(&path).await?
+            }),
+        ),
+    }
+}
+
+async fn policy_command(command: PolicyCommand, as_json: bool) -> Result<()> {
+    match command {
+        PolicyCommand::Bundle(args) => {
+            let policy = fs::read_to_string(&args.input)
+                .await
+                .with_context(|| format!("read policy {}", args.input.display()))?;
+            let policy_value: serde_json::Value =
+                if args.input.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+                    let value: toml::Value = toml::from_str(&policy)
+                        .with_context(|| format!("parse TOML {}", args.input.display()))?;
+                    serde_json::to_value(value)?
+                } else {
+                    serde_json::from_str(&policy)
+                        .with_context(|| format!("parse JSON {}", args.input.display()))?
+                };
+            let payload = json!({
+                "schema_version": 1,
+                "kind": "policy-bundle",
+                "name": args.name,
+                "created_at": Utc::now(),
+                "policy": policy_value
+            });
+            let signature = hmac_signature(&args.signing_key_env, &payload)?;
+            let bundle = json!({
+                "metadata": {
+                    "algorithm": "hmac-sha256",
+                    "key_source": format!("env:{}", args.signing_key_env),
+                    "signature": signature
+                },
+                "payload": payload
+            });
+            fs::write(&args.output, serde_json::to_vec_pretty(&bundle)?)
+                .await
+                .with_context(|| format!("write {}", args.output.display()))?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "created",
+                    "path": args.output,
+                    "algorithm": "hmac-sha256",
+                    "signature": signature
+                }),
+            )
+        }
+        PolicyCommand::VerifyBundle(args) => {
+            let bytes = fs::read(&args.path)
+                .await
+                .with_context(|| format!("read {}", args.path.display()))?;
+            let bundle: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", args.path.display()))?;
+            let payload = bundle
+                .get("payload")
+                .ok_or_else(|| anyhow::anyhow!("policy bundle missing payload"))?;
+            let expected = bundle
+                .pointer("/metadata/signature")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("policy bundle missing signature"))?;
+            let actual = hmac_signature(&args.signing_key_env, payload)?;
+            emit(
+                as_json,
+                &json!({
+                    "status": if expected.eq_ignore_ascii_case(&actual) { "valid" } else { "invalid" },
+                    "valid": expected.eq_ignore_ascii_case(&actual),
+                    "path": args.path,
+                    "algorithm": "hmac-sha256"
+                }),
+            )
+        }
+        PolicyCommand::LegalHoldPlan(args) => emit(
+            as_json,
+            &json!({
+                "schema_version": 1,
+                "kind": "legal-hold-plan",
+                "generated_at": Utc::now(),
+                "dataset": DatasetKind::from(args.dataset).as_str(),
+                "case_id": args.case_id,
+                "reason": args.reason,
+                "retention": {
+                    "override": "hold_until_released",
+                    "applies_to_dataset": true
+                },
+                "operator_steps": [
+                    "attach this plan to the case record",
+                    "exclude dataset scope from automated retention pruning",
+                    "generate monthly audit and data export envelopes while hold is active",
+                    "record signed release of hold before retention resumes"
+                ]
+            }),
+        ),
+    }
+}
+
+fn eval_report(runs: &[serde_json::Value]) -> serde_json::Value {
+    let mut by_model: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for run in runs {
+        if let (Some(model), Some(score)) = (
+            run.get("model").and_then(serde_json::Value::as_str),
+            run.get("score").and_then(serde_json::Value::as_f64),
+        ) {
+            by_model.entry(model.to_string()).or_default().push(score);
+        }
+    }
+    let models = by_model
+        .into_iter()
+        .map(|(model, scores)| {
+            let count = scores.len() as f64;
+            let average_score = if count == 0.0 {
+                None
+            } else {
+                Some(scores.iter().sum::<f64>() / count)
+            };
+            json!({
+                "model": model,
+                "runs": scores.len(),
+                "average_score": average_score
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 1,
+        "kind": "eval-report",
+        "generated_at": Utc::now(),
+        "run_count": runs.len(),
+        "models": models
+    })
+}
+
+async fn append_jsonl(path: &Path, value: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let mut existing = match fs::read_to_string(path).await {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    existing.push_str(&serde_json::to_string(value)?);
+    existing.push('\n');
+    fs::write(path, existing)
+        .await
+        .with_context(|| format!("write {}", path.display()))
+}
+
+async fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let body = match fs::read_to_string(path).await {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).context("parse jsonl record"))
+        .collect()
+}
+
+fn state_file(cfg: &Config, name: &str) -> Result<PathBuf> {
+    let dir = cfg
+        .storage
+        .db_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("storage db_path has no parent directory"))?;
+    Ok(dir.join(name))
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn hmac_signature(key_env: &str, payload: &serde_json::Value) -> Result<String> {
+    let key = std::env::var(key_env).with_context(|| format!("read signing key env {key_env}"))?;
+    let canonical = reporting::canonical_json(payload)?;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes())?;
+    mac.update(canonical.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn incident_template(args: AiopsIncidentTemplateArgs) -> serde_json::Value {
+    json!({
+        "schema_version": 1,
+        "kind": "incident-evidence-template",
+        "generated_at": Utc::now(),
+        "severity": args.severity,
+        "team": args.team,
+        "cra_article_14": {
+            "operational_status": "active_control",
+            "early_warning_due": "within_24_hours",
+            "vulnerability_notification_due": "within_72_hours",
+            "final_vulnerability_report_due": "within_14_days_after_mitigation"
+        },
+        "sections": [
+            "summary",
+            "timeline",
+            "affected_models",
+            "affected_users_or_teams",
+            "security_impact",
+            "data_impact",
+            "mitigation",
+            "evidence"
+        ],
+        "evidence_commands": [
+            "llmctl security audit-config",
+            "llmctl audit report monthly --envelope",
+            "llmctl data export --envelope",
+            "llmctl lineage list",
+            "llmctl eval report"
         ]
     })
 }
@@ -2058,6 +2521,8 @@ impl From<CliDataFormat> for DataFabricFormat {
             CliDataFormat::Json => DataFabricFormat::Json,
             CliDataFormat::Jsonl => DataFabricFormat::Jsonl,
             CliDataFormat::ArrowJson => DataFabricFormat::ArrowJson,
+            CliDataFormat::ArrowIpc => DataFabricFormat::ArrowIpc,
+            CliDataFormat::Parquet => DataFabricFormat::Parquet,
         }
     }
 }

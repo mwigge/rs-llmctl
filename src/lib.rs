@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod config;
 pub mod contracts;
+pub mod data_fabric;
 pub mod integrations;
 pub mod model;
 pub mod observability;

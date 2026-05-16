@@ -322,6 +322,8 @@ pub enum DataFabricFormat {
     Json,
     Jsonl,
     ArrowJson,
+    ArrowIpc,
+    Parquet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

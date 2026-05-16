@@ -2004,6 +2004,54 @@ async fn data_export_filters_finops_as_arrow_json() {
         .any(|row| row["team"] == "platform" && row["total_tokens"] == 25));
 }
 
+#[tokio::test]
+async fn data_export_writes_arrow_ipc_and_parquet_files() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let db_path = dir.path().join("llmctl.db");
+    let storage = Storage::connect(&db_path).await.expect("connect storage");
+    storage
+        .insert_usage_event(&usage_event("qwen", "alice", "platform", 10, 15, 120))
+        .await
+        .expect("insert usage");
+
+    let arrow_path = dir.path().join("finops.arrow");
+    let mut arrow = llmctl();
+    arrow
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--dataset")
+        .arg("finops")
+        .arg("--format")
+        .arg("arrow-ipc")
+        .arg("--output")
+        .arg(&arrow_path);
+    let arrow = assert_success_json(arrow);
+    assert_eq!(arrow["format"], "arrow-ipc");
+    assert_eq!(arrow["dataset"], "finops");
+    assert!(fs::metadata(&arrow_path).expect("arrow metadata").len() > 0);
+
+    let parquet_path = dir.path().join("finops.parquet");
+    let mut parquet = llmctl();
+    parquet
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--dataset")
+        .arg("finops")
+        .arg("--format")
+        .arg("parquet")
+        .arg("--output")
+        .arg(&parquet_path);
+    let parquet = assert_success_json(parquet);
+    assert_eq!(parquet["format"], "parquet");
+    assert_eq!(parquet["rows"], 3);
+    assert!(fs::metadata(&parquet_path).expect("parquet metadata").len() > 0);
+}
+
 #[test]
 fn aiops_gaps_reports_remaining_platform_capabilities() {
     let mut gaps = llmctl();
@@ -2021,6 +2069,111 @@ fn aiops_gaps_reports_remaining_platform_capabilities() {
         .expect("gaps")
         .iter()
         .any(|item| item["area"] == "model-quality"));
+}
+
+#[test]
+fn eval_lineage_slo_and_signed_policy_bundle_are_scriptable() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut eval_run = llmctl();
+    eval_run
+        .arg("--config")
+        .arg(&config)
+        .arg("eval")
+        .arg("run")
+        .arg("--model")
+        .arg("qwen")
+        .arg("--suite")
+        .arg("golden-code")
+        .arg("--score")
+        .arg("0.91")
+        .arg("--baseline")
+        .arg("0.85");
+    let eval_run = assert_success_json(eval_run);
+    assert_eq!(eval_run["model"], "qwen");
+    assert_eq!(eval_run["delta"], 0.06000000000000005);
+
+    let mut eval_report = llmctl();
+    eval_report
+        .arg("--config")
+        .arg(&config)
+        .arg("eval")
+        .arg("report");
+    let eval_report = assert_success_json(eval_report);
+    assert_eq!(eval_report["run_count"], 1);
+    assert_eq!(eval_report["models"][0]["model"], "qwen");
+
+    let mut lineage = llmctl();
+    lineage
+        .arg("--config")
+        .arg(&config)
+        .arg("lineage")
+        .arg("record")
+        .arg("--kind")
+        .arg("model")
+        .arg("--id")
+        .arg("qwen")
+        .arg("--parent")
+        .arg("corpus:internal-docs");
+    let lineage = assert_success_json(lineage);
+    assert_eq!(lineage["kind"], "model");
+    assert_eq!(lineage["parents"][0], "corpus:internal-docs");
+
+    let mut slo = llmctl();
+    slo.arg("aiops")
+        .arg("slo-plan")
+        .arg("--availability-percent")
+        .arg("99.5")
+        .arg("--latency-p95-ms")
+        .arg("1500");
+    let slo = assert_success_json(slo);
+    assert_eq!(slo["kind"], "slo-plan");
+    assert!(slo["alert_rules"].as_array().expect("alert rules").len() >= 2);
+
+    let policy = dir.path().join("policy.json");
+    fs::write(&policy, r#"{"quotas":{"team":"platform"}}"#).expect("write policy");
+    let bundle = dir.path().join("policy-bundle.json");
+    let mut create_bundle = llmctl();
+    create_bundle
+        .arg("policy")
+        .arg("bundle")
+        .arg("--name")
+        .arg("platform")
+        .arg("--input")
+        .arg(&policy)
+        .arg("--output")
+        .arg(&bundle)
+        .arg("--signing-key-env")
+        .arg("LLMCTL_TEST_SIGNING_KEY")
+        .env("LLMCTL_TEST_SIGNING_KEY", "test-signing-key");
+    let created = assert_success_json(create_bundle);
+    assert_eq!(created["status"], "created");
+
+    let mut verify_bundle = llmctl();
+    verify_bundle
+        .arg("policy")
+        .arg("verify-bundle")
+        .arg(&bundle)
+        .arg("--signing-key-env")
+        .arg("LLMCTL_TEST_SIGNING_KEY")
+        .env("LLMCTL_TEST_SIGNING_KEY", "test-signing-key");
+    let verified = assert_success_json(verify_bundle);
+    assert_eq!(verified["valid"], true);
+
+    let mut legal_hold = llmctl();
+    legal_hold
+        .arg("policy")
+        .arg("legal-hold-plan")
+        .arg("--dataset")
+        .arg("audit")
+        .arg("--case-id")
+        .arg("case-123")
+        .arg("--reason")
+        .arg("regulatory review");
+    let legal_hold = assert_success_json(legal_hold);
+    assert_eq!(legal_hold["dataset"], "audit");
+    assert_eq!(legal_hold["retention"]["override"], "hold_until_released");
 }
 
 #[test]

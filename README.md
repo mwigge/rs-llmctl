@@ -282,13 +282,28 @@ llmctl --config /etc/rs-llmctl/config.toml data contracts --dataset finops
 llmctl --config /etc/rs-llmctl/config.toml data export --dataset security --format json
 llmctl --config /etc/rs-llmctl/config.toml data export --dataset observability --format jsonl
 llmctl --config /etc/rs-llmctl/config.toml data export --dataset finops --format arrow-json
+llmctl --config /etc/rs-llmctl/config.toml data export --dataset finops --format arrow-ipc --output finops.arrow
+llmctl --config /etc/rs-llmctl/config.toml data export --dataset finops --format parquet --output finops.parquet
+llmctl --config /etc/rs-llmctl/config.toml eval run --model qwen --suite golden-code --score 0.91 --baseline 0.85
+llmctl --config /etc/rs-llmctl/config.toml lineage record --kind model --id qwen --parent corpus:internal-docs
+llmctl aiops slo-plan
+llmctl aiops incident-template --severity high --team platform
 llmctl aiops gaps
 ```
 
-The current Arrow path is `arrow-json`: rows plus an Arrow-compatible schema
-description. That gives operators one contract surface for security,
-observability, user, finops, model, drift, and audit data today, while leaving
-native Arrow IPC and Parquet writers as a tracked platform gap.
+The data fabric gives operators one contract surface for security,
+observability, user, finops, model, drift, and audit data. JSON and JSONL are
+available for simple scripts, `arrow-json` exposes the schema and rows, and
+native Arrow IPC/Parquet writers produce files for analytics systems.
+
+Policy bundles can be signed and verified with HMAC-SHA256 key material from
+the environment:
+
+```bash
+llmctl policy bundle --name platform --input policy.json --output policy-bundle.json --signing-key-env LLMCTL_POLICY_KEY
+llmctl policy verify-bundle policy-bundle.json --signing-key-env LLMCTL_POLICY_KEY
+llmctl policy legal-hold-plan --dataset audit --case-id case-123 --reason "regulatory review"
+```
 
 Compliance evidence is available through `llmctl compliance evidence`, with
 focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.

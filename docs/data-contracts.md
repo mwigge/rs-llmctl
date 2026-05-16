@@ -33,6 +33,8 @@ llmctl data export --hours 24 --dataset security --format json
 llmctl data export --hours 24 --dataset observability --format jsonl
 llmctl data export --hours 24 --dataset finops --format arrow-json
 llmctl data export --hours 24 --dataset drift --format arrow-json
+llmctl data export --hours 24 --dataset finops --format arrow-ipc --output finops.arrow
+llmctl data export --hours 24 --dataset finops --format parquet --output finops.parquet
 ```
 
 Formats:
@@ -40,11 +42,12 @@ Formats:
 - `json`: one JSON object with metadata and `rows`;
 - `jsonl`: one JSON object with pre-rendered JSONL `lines`;
 - `arrow-json`: rows plus the dataset `arrow_schema`.
+- `arrow-ipc`: a native Arrow IPC file written to `--output`;
+- `parquet`: a native Parquet file written to `--output`.
 
-`arrow-json` is intentionally honest about what it is: an Arrow-compatible
-schema description and JSON rows. Native Arrow IPC and Parquet writers are
-tracked as platform gaps, because those need dependency and compatibility
-decisions that should be tested with golden files.
+Binary exports require a concrete `--dataset` so the writer can apply a stable
+schema. `--dataset all` remains JSON-only because it is an envelope-style
+object, not one rectangular table.
 
 ## Canonical Evidence
 

@@ -20,7 +20,13 @@ enough telemetry to operate the service like production infrastructure.
 - CRA Article 14 active-control evidence, PCI DSS aligned evidence, release
   integrity checks, and report envelopes.
 - Local search and recommendation endpoints for AI-developer workflows.
-- Schema-versioned data contracts and domain filtered exports.
+- Schema-versioned data contracts and domain filtered JSON, JSONL,
+  Arrow-schema JSON, native Arrow IPC, and Parquet exports.
+- Eval run persistence and model quality baseline reports.
+- Lineage records for prompts, corpora, embedding indexes, models, and
+  releases.
+- Generated SLO plans, alert rule templates, and incident evidence templates.
+- HMAC-signed policy bundles and legal-hold retention plans per dataset.
 
 ## Current Gaps
 
@@ -30,22 +36,25 @@ Run the machine-readable gap report:
 llmctl aiops gaps
 ```
 
-The tracked gaps are:
+The tracked gaps are now narrower:
 
-- Native Arrow IPC and Parquet writers for the data fabric.
-- First-class model eval suites, golden prompts, and baseline comparison
-  history.
-- Stronger lineage for prompts, RAG corpora, embeddings, model manifests, and
-  releases.
-- Generated SLOs, alert rules, and incident evidence envelopes.
-- Signed policy-as-code bundles and legal-hold retention scopes per dataset.
+- Built-in eval runners for golden prompts; today operators record eval scores
+  and baselines through `llmctl eval run`.
+- Runtime request-to-lineage joins; today lineage is an operator-controlled
+  record stream through `llmctl lineage record`.
+- Prometheus/Alertmanager and Grafana-specific renderers; today `aiops
+  slo-plan` emits portable alert templates.
+- Asymmetric signing and transparency log publication for policy bundles;
+  today bundles use HMAC-SHA256 with key material supplied through an
+  environment variable.
 
 ## Practical Next Step
 
 For a small internal platform, the next high-value path is:
 
-1. Add native Arrow/Parquet export behind an optional feature.
-2. Add `llmctl eval run/list/report` and store model quality baselines.
-3. Add lineage records for model, prompt, corpus, and release provenance.
-4. Generate SLO and alert templates from config.
-5. Add signed policy bundles that gate production rollout.
+1. Add optional built-in eval execution against configured model endpoints.
+2. Attach lineage IDs directly to serving, RAG, model import, and release
+   events.
+3. Add Prometheus/Alertmanager and Grafana renderers.
+4. Add Sigstore or minisign support for policy bundles.
+5. Publish policy-bundle and incident evidence hashes to an append-only log.
