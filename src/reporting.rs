@@ -33,6 +33,17 @@ pub struct ReportEnvelope<T> {
     pub payload: T,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvelopeVerification {
+    pub status: String,
+    pub valid: bool,
+    pub expected_sha256: Option<String>,
+    pub actual_sha256: Option<String>,
+    pub report_kind: Option<String>,
+    pub schema_version: Option<u64>,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonthlyAuditReport {
     pub year: i32,
@@ -244,6 +255,58 @@ where
     Ok(serde_json::to_string(&canonicalize_value(value))?)
 }
 
+pub fn verify_envelope_value(envelope: &Value) -> Result<EnvelopeVerification> {
+    let metadata = match envelope.get("metadata").and_then(Value::as_object) {
+        Some(metadata) => metadata,
+        None => {
+            return Ok(invalid_envelope(
+                None,
+                None,
+                None,
+                "missing metadata object",
+            ))
+        }
+    };
+    let payload = match envelope.get("payload") {
+        Some(payload) => payload,
+        None => {
+            return Ok(invalid_envelope(
+                expected_sha256(metadata),
+                report_kind(metadata),
+                schema_version(metadata),
+                "missing payload",
+            ))
+        }
+    };
+    let expected = match expected_sha256(metadata) {
+        Some(expected) => expected,
+        None => {
+            return Ok(invalid_envelope(
+                None,
+                report_kind(metadata),
+                schema_version(metadata),
+                "missing metadata sha256",
+            ))
+        }
+    };
+    let actual = canonical_sha256(payload)?;
+    let valid = expected.eq_ignore_ascii_case(&actual);
+
+    Ok(EnvelopeVerification {
+        status: if valid { "valid" } else { "invalid" }.to_string(),
+        valid,
+        expected_sha256: Some(expected),
+        actual_sha256: Some(actual),
+        report_kind: report_kind(metadata),
+        schema_version: schema_version(metadata),
+        reason: if valid {
+            None
+        } else {
+            Some("payload sha256 mismatch".to_string())
+        },
+    })
+}
+
 pub fn summarize_usage(events: &[UsageEvent]) -> UsageSummary {
     let mut summary = UsageSummary::default();
     let mut by_model = BTreeMap::new();
@@ -337,6 +400,41 @@ fn average(total: u64, count: u64) -> Option<f64> {
     } else {
         Some(total as f64 / count as f64)
     }
+}
+
+fn invalid_envelope(
+    expected_sha256: Option<String>,
+    report_kind: Option<String>,
+    schema_version: Option<u64>,
+    reason: &str,
+) -> EnvelopeVerification {
+    EnvelopeVerification {
+        status: "invalid".to_string(),
+        valid: false,
+        expected_sha256,
+        actual_sha256: None,
+        report_kind,
+        schema_version,
+        reason: Some(reason.to_string()),
+    }
+}
+
+fn expected_sha256(metadata: &Map<String, Value>) -> Option<String> {
+    metadata
+        .get("sha256")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn report_kind(metadata: &Map<String, Value>) -> Option<String> {
+    metadata
+        .get("report_kind")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn schema_version(metadata: &Map<String, Value>) -> Option<u64> {
+    metadata.get("schema_version").and_then(Value::as_u64)
 }
 
 fn report_envelope_at<T>(
@@ -462,6 +560,51 @@ mod tests {
 
         assert_ne!(first.metadata.generated_at, second.metadata.generated_at);
         assert_eq!(first.metadata.sha256, second.metadata.sha256);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_envelope_value_accepts_matching_payload_hash() -> Result<()> {
+        let payload = json!({"month": 5, "year": 2026});
+        let envelope = json!({
+            "metadata": {
+                "report_kind": "monthly_audit",
+                "generated_at": "2026-05-16T12:00:00Z",
+                "schema_version": 1,
+                "sha256": canonical_sha256(&payload)?
+            },
+            "payload": payload
+        });
+
+        let verified = verify_envelope_value(&envelope)?;
+
+        assert!(verified.valid);
+        assert_eq!(verified.status, "valid");
+        assert_eq!(verified.report_kind.as_deref(), Some("monthly_audit"));
+        assert_eq!(verified.schema_version, Some(1));
+        assert_eq!(verified.reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_envelope_value_rejects_tampered_payload_hash() -> Result<()> {
+        let original = json!({"request_count": 1});
+        let envelope = json!({
+            "metadata": {
+                "report_kind": "data_export",
+                "generated_at": "2026-05-16T12:00:00Z",
+                "schema_version": 1,
+                "sha256": canonical_sha256(&original)?
+            },
+            "payload": {"request_count": 2}
+        });
+
+        let verified = verify_envelope_value(&envelope)?;
+
+        assert!(!verified.valid);
+        assert_eq!(verified.status, "invalid");
+        assert_eq!(verified.reason.as_deref(), Some("payload sha256 mismatch"));
+        assert_ne!(verified.expected_sha256, verified.actual_sha256);
         Ok(())
     }
 

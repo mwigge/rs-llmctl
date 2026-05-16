@@ -2,6 +2,7 @@ use crate::audit::{AuditEvent, UsageEvent};
 use crate::config::{Config, Mode, ModelConfig};
 use crate::quota::{check_quota, Principal};
 use crate::storage::{QuotaDecisionRecord, Storage};
+use crate::worker::StartupPlan;
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -15,6 +16,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
@@ -63,15 +65,7 @@ async fn livez() -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
-    let storage_ready = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(state.storage.pool())
-        .await
-        .is_ok();
-    let status = if storage_ready {
-        "ready"
-    } else {
-        "unavailable"
-    };
+    let storage_ready = storage_ready(&state.storage).await;
     let http_status = if storage_ready {
         StatusCode::OK
     } else {
@@ -80,17 +74,53 @@ async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
 
     (
         http_status,
-        Json(json!({
-            "status": status,
-            "models": {
-                "configured": state.cfg.models.len()
-            },
-            "storage": {
-                "ready": storage_ready
-            }
-        })),
+        Json(readiness_status_for(&state.cfg, storage_ready)),
     )
         .into_response()
+}
+
+pub async fn readiness_status(cfg: &Config, storage: &Storage) -> Value {
+    readiness_status_for(cfg, storage_ready(storage).await)
+}
+
+fn readiness_status_for(cfg: &Config, storage_ready: bool) -> Value {
+    let aliases: Vec<_> = routed_models(cfg)
+        .into_iter()
+        .map(|model| model.alias.as_str())
+        .collect();
+    let worker_plan = StartupPlan::from_config(cfg);
+
+    json!({
+        "status": if storage_ready { "ready" } else { "unavailable" },
+        "mode": cfg.mode,
+        "models": {
+            "configured": aliases.len(),
+            "aliases": aliases
+        },
+        "workers": {
+            "planned": worker_plan.workers.len()
+        },
+        "storage": {
+            "ready": storage_ready
+        },
+        "auth": {
+            "required": cfg.security.require_auth
+        },
+        "external_bind": {
+            "enabled": cfg.security.bind_external || is_external_host(&cfg.server.host)
+        }
+    })
+}
+
+async fn storage_ready(storage: &Storage) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(storage.pool())
+        .await
+        .is_ok()
+}
+
+fn is_external_host(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
@@ -817,18 +847,68 @@ impl From<&ModelConfig> for ModelObject {
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
+    serve_with_shutdown(cfg, shutdown_signal()).await
+}
+
+pub async fn serve_with_shutdown<S>(cfg: Config, shutdown: S) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let storage = Storage::connect(&cfg.storage.db_path).await?;
-    serve_with_storage(cfg, storage).await
+    serve_with_storage_and_shutdown(cfg, storage, shutdown).await
 }
 
 pub async fn serve_with_storage(cfg: Config, storage: Storage) -> Result<()> {
+    serve_with_storage_and_shutdown(cfg, storage, shutdown_signal()).await
+}
+
+pub async fn serve_with_storage_and_shutdown<S>(
+    cfg: Config,
+    storage: Storage,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     axum::serve(listener, router(cfg, storage))
+        .with_graceful_shutdown(shutdown)
         .await
         .context("serve HTTP API")
+}
+
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install Ctrl-C signal handler");
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to install terminate signal handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 #[cfg(test)]
@@ -945,6 +1025,26 @@ mod tests {
 
         assert_eq!(resolved.requested_alias, "light");
         assert_eq!(resolved.upstream_alias, "heavy-a");
+    }
+
+    #[tokio::test]
+    async fn serve_with_storage_and_shutdown_exits_when_shutdown_future_completes() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let mut cfg = Config::default();
+        cfg.server.port = 0;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(serve_with_storage_and_shutdown(cfg, storage, async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server exits after shutdown")
+            .expect("server task joins");
+
+        result.expect("server result");
     }
 
     #[test]

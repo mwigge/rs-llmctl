@@ -30,3 +30,12 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release --bins
+
+      - name: Generate release checksums
+        run: packaging/generate-checksums.sh
+
+      - name: Upload release checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-checksums
+          path: SHA256SUMS

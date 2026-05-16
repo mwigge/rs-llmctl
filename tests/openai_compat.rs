@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
-use rs_llmctl::config::{ApiKeyConfig, Config, ModelConfig, QuotaConfig};
+use rs_llmctl::config::{ApiKeyConfig, Config, Mode, ModelConfig, QuotaConfig};
 use rs_llmctl::server;
 use rs_llmctl::storage::Storage;
 use serde_json::{json, Value};
@@ -85,7 +85,9 @@ async fn livez_reports_process_liveness_without_auth() {
 
 #[tokio::test]
 async fn readyz_reports_model_count_and_storage_without_leaking_config_details() {
-    let cfg = config_with_models(vec![model("llama"), model("embed")]);
+    let mut cfg = config_with_models(vec![model("llama"), model("embed")]);
+    cfg.mode = Mode::HotSwap;
+    cfg.security.bind_external = true;
     let api_key_hash = cfg.security.api_keys[0].sha256.clone();
     let model_path = cfg.models[0].path.display().to_string();
     let app = test_app(cfg).await;
@@ -106,8 +108,13 @@ async fn readyz_reports_model_count_and_storage_without_leaking_config_details()
         .expect("response body");
     let body: Value = serde_json::from_slice(&bytes).expect("json response");
     assert_eq!(body["status"], "ready");
+    assert_eq!(body["mode"], "hot-swap");
     assert_eq!(body["models"]["configured"], 2);
+    assert_eq!(body["models"]["aliases"], json!(["embed", "llama"]));
+    assert_eq!(body["workers"]["planned"], 2);
     assert_eq!(body["storage"]["ready"], true);
+    assert_eq!(body["auth"]["required"], true);
+    assert_eq!(body["external_bind"]["enabled"], true);
 
     let raw_body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
     assert!(!raw_body.contains(TOKEN));

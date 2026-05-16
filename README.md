@@ -50,9 +50,18 @@ The package publishes two binary entry points from `Cargo.toml`:
 Before cutting an archive or installer, run `cargo build --release --bins` and
 package the resulting `target/release/llmctl` and `target/release/llmctld`
 binaries together with this README, the release notes, license metadata, and an
-example production config. Package checks should fail if either binary name
-changes because downstream automation, systemd units, and air-gapped install
-runbooks address those names directly.
+example production config. Generate and publish checksums for the release
+binaries:
+
+```bash
+packaging/generate-checksums.sh
+sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS
+```
+
+CI runs the checksum script after the release build and uploads `SHA256SUMS` as
+the `release-checksums` artifact. Package checks should fail if either binary
+name changes because downstream automation, systemd units, and air-gapped
+install runbooks address those names directly.
 
 Server packages should install the release binaries at stable paths:
 

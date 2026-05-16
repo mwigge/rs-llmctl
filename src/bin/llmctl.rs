@@ -80,6 +80,7 @@ struct InitArgs {
 enum ServerCommand {
     Run,
     Check,
+    Status,
     SecurityCheck,
 }
 
@@ -252,6 +253,7 @@ enum UsageCommand {
 #[derive(Debug, Subcommand)]
 enum DataCommand {
     Export(DataExportArgs),
+    VerifyEnvelope(DataVerifyEnvelopeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -260,6 +262,11 @@ struct DataExportArgs {
     hours: i64,
     #[arg(long)]
     envelope: bool,
+}
+
+#[derive(Debug, Args)]
+struct DataVerifyEnvelopeArgs {
+    path: PathBuf,
 }
 
 #[tokio::main]
@@ -325,6 +332,12 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
                 as_json,
                 &json!({ "status": "ok", "config": path, "models": cfg.models.len(), "quotas": cfg.quotas.len() }),
             )
+        }
+        ServerCommand::Status => {
+            create_storage_dirs(&cfg.storage).await?;
+            let storage = init_storage(&cfg.storage).await?;
+            let status = rs_llmctl::server::readiness_status(&cfg, &storage).await;
+            emit(as_json, &status)
         }
         ServerCommand::SecurityCheck => {
             config::validate_production_security(&cfg)?;
@@ -608,10 +621,10 @@ async fn usage_command(path: &Path, command: UsageCommand, as_json: bool) -> Res
 }
 
 async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Result<()> {
-    let cfg = load_config(path).await?;
-    let storage = init_storage(&cfg.storage).await?;
     match command {
         DataCommand::Export(args) => {
+            let cfg = load_config(path).await?;
+            let storage = init_storage(&cfg.storage).await?;
             let (from, to) = window(args.hours);
             if args.envelope {
                 let report = reporting::data_export_envelope(&storage, from, to).await?;
@@ -620,6 +633,22 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
                 let report = reporting::data_export(&storage, from, to).await?;
                 emit(as_json, &report)
             }
+        }
+        DataCommand::VerifyEnvelope(args) => {
+            let envelope_bytes = fs::read(&args.path)
+                .await
+                .with_context(|| format!("read {}", args.path.display()))?;
+            let envelope: serde_json::Value = serde_json::from_slice(&envelope_bytes)
+                .with_context(|| format!("parse {}", args.path.display()))?;
+            let verification = reporting::verify_envelope_value(&envelope)?;
+            let mut output = serde_json::to_value(verification)?;
+            if let Some(object) = output.as_object_mut() {
+                object.insert(
+                    "path".to_string(),
+                    serde_json::Value::String(args.path.display().to_string()),
+                );
+            }
+            emit(as_json, &output)
         }
     }
 }

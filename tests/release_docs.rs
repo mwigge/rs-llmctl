@@ -206,3 +206,61 @@ fn install_validation_artifact_is_safe_offline_and_pins_release_checks() {
         "README should document the install validation script"
     );
 }
+
+#[test]
+fn release_checksum_artifact_generation_is_pinned() {
+    let workflow = read(".github/workflows/ci.yml");
+
+    for required in [
+        "packaging/generate-checksums.sh",
+        "SHA256SUMS",
+        "actions/upload-artifact@v4",
+        "release-checksums",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "CI workflow should include `{required}`"
+        );
+    }
+
+    let script_path = "packaging/generate-checksums.sh";
+    let script = read(script_path);
+    let mode = fs::metadata(script_path)
+        .unwrap_or_else(|err| panic!("metadata {script_path}: {err}"))
+        .permissions()
+        .mode();
+
+    assert_ne!(mode & 0o111, 0, "{script_path} should be executable");
+
+    for required in [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS",
+        "test -x target/release/llmctl",
+        "test -x target/release/llmctld",
+    ] {
+        assert!(
+            script.contains(required),
+            "{script_path} should include `{required}`"
+        );
+    }
+
+    for forbidden in ["curl ", "wget ", "apt ", "dnf ", "yum ", "pacman "] {
+        assert!(
+            !script.contains(forbidden),
+            "{script_path} should stay offline and not include `{forbidden}`"
+        );
+    }
+
+    let readme = read("README.md");
+    for required in [
+        "packaging/generate-checksums.sh",
+        "sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS",
+        "SHA256SUMS",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README should document `{required}`"
+        );
+    }
+}

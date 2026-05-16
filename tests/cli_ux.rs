@@ -60,6 +60,17 @@ fn assert_success_json(mut command: Command) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout is json")
 }
 
+fn assert_json_output(mut command: Command) -> Value {
+    let output = command.output().expect("run llmctl");
+    assert!(
+        !output.stdout.is_empty(),
+        "status: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout is json")
+}
+
 fn read_config(path: &Path) -> String {
     fs::read_to_string(path).expect("read config")
 }
@@ -102,6 +113,95 @@ fn swap_set_persists_hot_and_cold_modes_as_json() {
     let shown = assert_success_json(show);
     assert_eq!(shown["mode"], "cold-swap");
     assert_eq!(shown["models"], 0);
+}
+
+#[test]
+fn server_status_reports_readiness_details_without_secret_config_values() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    let api_key_hash = sha256(b"server-status-token");
+    let secret_path = model_dir.join("chat.gguf");
+    let body = format!(
+        r#"
+mode = "hot-swap"
+
+[server]
+host = "0.0.0.0"
+port = 8765
+worker_base_port = 18765
+llama_server = "127.0.0.1:8080"
+context_size = 8192
+
+[security]
+production = false
+require_auth = true
+bind_external = true
+api_keys = [
+  {{ id = "operator", sha256 = "{api_key_hash}", subject = "alice", team = "platform", scopes = ["admin"] }}
+]
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[observability]
+
+[[models]]
+alias = "chat"
+path = "{}"
+role = "chat"
+weight = 1
+
+[[models]]
+alias = "embed"
+path = "{}"
+role = "embedding"
+weight = 1
+"#,
+        db_path.display(),
+        model_dir.display(),
+        secret_path.display(),
+        model_dir.join("embed.gguf").display()
+    );
+    fs::write(&config, body).expect("write config");
+
+    let mut status = llmctl();
+    status
+        .arg("--config")
+        .arg(&config)
+        .arg("server")
+        .arg("status");
+    let output = status.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let status: Value = serde_json::from_str(&raw).expect("stdout is json");
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["mode"], "hot-swap");
+    assert_eq!(status["models"]["configured"], 2);
+    assert_eq!(
+        status["models"]["aliases"],
+        serde_json::json!(["chat", "embed"])
+    );
+    assert_eq!(status["workers"]["planned"], 2);
+    assert_eq!(status["storage"]["ready"], true);
+    assert_eq!(status["auth"]["required"], true);
+    assert_eq!(status["external_bind"]["enabled"], true);
+    assert!(!raw.contains("server-status-token"));
+    assert!(!raw.contains(&api_key_hash));
+    assert!(!raw.contains(&secret_path.display().to_string()));
 }
 
 #[test]
@@ -230,6 +330,81 @@ fn report_envelopes_keep_payloads_and_include_metadata_hashes() {
     assert_eq!(export["metadata"]["report_kind"], "data_export");
     assert!(export["metadata"]["sha256"].is_string());
     assert!(export["payload"]["audit_events"].is_array());
+}
+
+#[test]
+fn data_verify_envelope_accepts_valid_offline_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let envelope_path = dir.path().join("export-envelope.json");
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--hours")
+        .arg("1")
+        .arg("--envelope");
+    let envelope = assert_success_json(export);
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).expect("serialize envelope"),
+    )
+    .expect("write envelope");
+
+    let mut verify = llmctl();
+    verify
+        .arg("data")
+        .arg("verify-envelope")
+        .arg(&envelope_path);
+    let verified = assert_success_json(verify);
+
+    assert_eq!(verified["status"], "valid");
+    assert_eq!(verified["valid"], true);
+    assert_eq!(
+        verified["path"].as_str().expect("path"),
+        envelope_path.to_string_lossy()
+    );
+    assert_eq!(verified["expected_sha256"], envelope["metadata"]["sha256"]);
+    assert_eq!(verified["actual_sha256"], envelope["metadata"]["sha256"]);
+}
+
+#[test]
+fn data_verify_envelope_reports_tampered_payload_hash_mismatch() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let envelope_path = dir.path().join("tampered-envelope.json");
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--hours")
+        .arg("1")
+        .arg("--envelope");
+    let mut envelope = assert_success_json(export);
+    envelope["payload"]["usage_summary"]["request_count"] = Value::from(99);
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).expect("serialize envelope"),
+    )
+    .expect("write envelope");
+
+    let mut verify = llmctl();
+    verify
+        .arg("data")
+        .arg("verify-envelope")
+        .arg(&envelope_path);
+    let verified = assert_json_output(verify);
+
+    assert_eq!(verified["status"], "invalid");
+    assert_eq!(verified["valid"], false);
+    assert_eq!(verified["expected_sha256"], envelope["metadata"]["sha256"]);
+    assert_ne!(verified["actual_sha256"], envelope["metadata"]["sha256"]);
 }
 
 #[test]

@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         "starting daemon"
     );
 
-    rs_llmctl::server::serve(cfg).await
+    rs_llmctl::server::serve_with_shutdown(cfg, rs_llmctl::server::shutdown_signal()).await
 }
 
 fn init_tracing(json_logs: bool) {
