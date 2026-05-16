@@ -46,6 +46,76 @@ async fn lists_openai_compatible_models() {
 }
 
 #[tokio::test]
+async fn healthz_remains_compatible() {
+    let app = test_app(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn livez_reports_process_liveness_without_auth() {
+    let app = test_app(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn readyz_reports_model_count_and_storage_without_leaking_config_details() {
+    let cfg = config_with_models(vec![model("llama"), model("embed")]);
+    let api_key_hash = cfg.security.api_keys[0].sha256.clone();
+    let model_path = cfg.models[0].path.display().to_string();
+    let app = test_app(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("json response");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["models"]["configured"], 2);
+    assert_eq!(body["storage"]["ready"], true);
+
+    let raw_body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+    assert!(!raw_body.contains(TOKEN));
+    assert!(!raw_body.contains(&api_key_hash));
+    assert!(!raw_body.contains(&model_path));
+}
+
+#[tokio::test]
 async fn chat_completions_non_streaming_passthrough_returns_upstream_response() {
     let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
     let mut cfg = config_with_models(vec![model("llama")]);

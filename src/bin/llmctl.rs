@@ -166,6 +166,13 @@ struct QuotaStatusArgs {
 #[derive(Debug, Subcommand)]
 enum SecurityCommand {
     Check,
+    AuditConfig(SecurityAuditConfigArgs),
+}
+
+#[derive(Debug, Args)]
+struct SecurityAuditConfigArgs {
+    #[arg(long)]
+    systemd_unit: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -493,6 +500,10 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                 }),
             )
         }
+        SecurityCommand::AuditConfig(args) => {
+            let report = audit_config_report(path, &cfg, args.systemd_unit.as_deref()).await?;
+            emit(as_json, &report)
+        }
     }
 }
 
@@ -702,6 +713,163 @@ fn observability_plan_json(plan: ObservabilityPlan) -> serde_json::Value {
         "resource_attributes": plan.resource_attributes,
         "exporter": exporter
     })
+}
+
+async fn audit_config_report(
+    path: &Path,
+    cfg: &Config,
+    systemd_unit: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let external_bind = cfg.security.bind_external || is_external_host(&cfg.server.host);
+    let key_reports: Vec<_> = cfg
+        .security
+        .api_keys
+        .iter()
+        .map(|key| {
+            json!({
+                "id": key.id,
+                "subject": key.subject,
+                "team": key.team,
+                "scopes": key.scopes,
+                "sha256_present": !key.sha256.is_empty(),
+                "sha256_valid": is_sha256_hex(&key.sha256)
+            })
+        })
+        .collect();
+    let hashed_api_keys = cfg
+        .security
+        .api_keys
+        .iter()
+        .all(|key| is_sha256_hex(&key.sha256));
+    let secret_headers: Vec<_> = cfg
+        .observability
+        .exporter
+        .headers
+        .iter()
+        .filter(|(name, _)| is_sensitive_name(name))
+        .map(|(name, value)| {
+            let value_source = if value.starts_with("env:") {
+                "env"
+            } else {
+                "plaintext"
+            };
+            json!({
+                "name": name,
+                "value_source": value_source,
+                "reference": if value.starts_with("env:") { Some(value.as_str()) } else { None }
+            })
+        })
+        .collect();
+    let systemd = systemd_audit(systemd_unit).await?;
+
+    let mut findings = Vec::new();
+    if !hashed_api_keys {
+        findings.push("api keys must be stored as sha256 hex digests".to_string());
+    }
+    if (cfg.security.production || external_bind)
+        && (!cfg.security.require_auth || cfg.security.api_keys.is_empty())
+    {
+        findings.push("external/production serving requires authentication".to_string());
+    }
+    if cfg
+        .observability
+        .exporter
+        .headers
+        .iter()
+        .any(|(name, value)| is_sensitive_name(name) && !value.starts_with("env:"))
+    {
+        findings.push("observability secret headers must use environment references".to_string());
+    }
+    if cfg.audit.retention_days == 0 {
+        findings.push("audit retention must be greater than zero days".to_string());
+    }
+    if systemd_unit.is_some()
+        && (!systemd["present"].as_bool().unwrap_or(false)
+            || !systemd["has_exec_start"].as_bool().unwrap_or(false))
+    {
+        findings.push("systemd unit template is missing or incomplete".to_string());
+    }
+
+    Ok(json!({
+        "status": if findings.is_empty() { "ok" } else { "warning" },
+        "config": path,
+        "external_bind": {
+            "enabled": external_bind,
+            "host": cfg.server.host,
+            "port": cfg.server.port,
+            "declared": cfg.security.bind_external
+        },
+        "auth": {
+            "production": cfg.security.production,
+            "require_auth": cfg.security.require_auth,
+            "api_key_count": cfg.security.api_keys.len(),
+            "hashed_api_keys": hashed_api_keys,
+            "keys": key_reports
+        },
+        "observability": {
+            "endpoint_configured": cfg.observability.exporter.endpoint.is_some() || cfg.observability.otlp_endpoint.is_some(),
+            "secret_header_count": secret_headers.len(),
+            "secret_headers": secret_headers
+        },
+        "audit": {
+            "retention_days": cfg.audit.retention_days,
+            "report_directory": cfg.audit.report_directory,
+            "report_formats": cfg.audit.report_formats,
+            "monthly_reports": cfg.audit.monthly_reports
+        },
+        "systemd": systemd,
+        "findings": findings
+    }))
+}
+
+async fn systemd_audit(systemd_unit: Option<&Path>) -> Result<serde_json::Value> {
+    let Some(path) = systemd_unit else {
+        return Ok(json!({
+            "checked": false,
+            "present": false,
+            "path": null,
+            "has_service_section": false,
+            "has_exec_start": false,
+            "mentions_llmctld": false
+        }));
+    };
+
+    match fs::read_to_string(path).await {
+        Ok(body) => Ok(json!({
+            "checked": true,
+            "present": true,
+            "path": path,
+            "has_service_section": body.contains("[Service]"),
+            "has_exec_start": body.lines().any(|line| line.trim_start().starts_with("ExecStart=")),
+            "mentions_llmctld": body.contains("llmctld")
+        })),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(json!({
+            "checked": true,
+            "present": false,
+            "path": path,
+            "has_service_section": false,
+            "has_exec_start": false,
+            "mentions_llmctld": false
+        })),
+        Err(err) => Err(err).with_context(|| format!("read systemd unit {}", path.display())),
+    }
+}
+
+fn is_external_host(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("authorization")
+        || name.contains("api-key")
+        || name.contains("apikey")
+        || name.contains("token")
+        || name.contains("secret")
 }
 
 fn model_source(source: &str) -> ModelSource {

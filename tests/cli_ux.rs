@@ -366,3 +366,197 @@ fn security_check_and_observe_plan_are_top_level_json_commands() {
     assert_eq!(plan["logs_enabled"], true);
     assert_eq!(plan["exporter"]["type"], "none");
 }
+
+#[test]
+fn security_audit_config_reports_scriptable_posture_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("prod.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    let unit_path = dir.path().join("llmctld.service");
+    fs::write(
+        &unit_path,
+        r#"
+[Unit]
+Description=rs-llmctl
+
+[Service]
+ExecStart=/usr/local/bin/llmctld --config /etc/rs-llmctl/config.toml
+"#,
+    )
+    .expect("write unit");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[server]
+host = "0.0.0.0"
+port = 8765
+worker_base_port = 18765
+llama_server = "127.0.0.1:8080"
+context_size = 8192
+
+[security]
+production = true
+require_auth = true
+bind_external = true
+
+[[security.api_keys]]
+id = "operator"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+subject = "operator"
+team = "platform"
+scopes = ["admin"]
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[observability]
+
+[observability.exporter]
+endpoint = "https://otel.example.test/v1/traces"
+headers = {{ authorization = "env:OTEL_AUTH", "x-tenant" = "platform" }}
+
+[audit]
+retention-days = 90
+report-directory = "/var/log/rs-llmctl/audit"
+report-formats = ["json"]
+monthly-reports = true
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut audit = llmctl();
+    audit
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("audit-config")
+        .arg("--systemd-unit")
+        .arg(&unit_path);
+    let report = assert_success_json(audit);
+
+    assert_eq!(report["status"], "ok");
+    assert_eq!(
+        report["config"].as_str().expect("config path"),
+        config.to_string_lossy()
+    );
+    assert_eq!(report["external_bind"]["enabled"], true);
+    assert_eq!(report["external_bind"]["host"], "0.0.0.0");
+    assert_eq!(report["auth"]["require_auth"], true);
+    assert_eq!(report["auth"]["api_key_count"], 1);
+    assert_eq!(report["auth"]["hashed_api_keys"], true);
+    assert_eq!(report["auth"]["keys"][0]["id"], "operator");
+    assert_eq!(report["auth"]["keys"][0]["sha256_present"], true);
+    assert!(report["auth"]["keys"][0].get("sha256").is_none());
+    assert_eq!(
+        report["observability"]["secret_headers"][0]["value_source"],
+        "env"
+    );
+    assert_eq!(
+        report["observability"]["secret_headers"][0]["reference"],
+        "env:OTEL_AUTH"
+    );
+    assert_eq!(report["audit"]["retention_days"], 90);
+    assert_eq!(report["audit"]["monthly_reports"], true);
+    assert_eq!(report["systemd"]["checked"], true);
+    assert_eq!(report["systemd"]["present"], true);
+    assert_eq!(report["systemd"]["has_exec_start"], true);
+
+    let output = serde_json::to_string(&report).expect("serialize report");
+    assert!(!output.contains("0123456789abcdef"));
+}
+
+#[test]
+fn security_audit_config_marks_invalid_scriptable_posture() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("bad.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    fs::write(
+        &config,
+        format!(
+            r#"
+mode = "single"
+
+[server]
+host = "0.0.0.0"
+port = 8765
+worker_base_port = 18765
+llama_server = "127.0.0.1:8080"
+context_size = 8192
+
+[security]
+production = true
+require_auth = false
+bind_external = true
+
+[[security.api_keys]]
+id = "plain"
+sha256 = "not-a-hash"
+subject = "operator"
+team = "platform"
+scopes = []
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[observability]
+
+[observability.exporter]
+headers = {{ authorization = "Bearer plaintext" }}
+
+[audit]
+retention-days = 0
+"#,
+            db_path.display(),
+            model_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut audit = llmctl();
+    audit
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("audit-config");
+    let report = assert_success_json(audit);
+
+    assert_eq!(report["status"], "warning");
+    assert_eq!(report["external_bind"]["enabled"], true);
+    assert_eq!(report["auth"]["require_auth"], false);
+    assert_eq!(report["auth"]["hashed_api_keys"], false);
+    assert_eq!(
+        report["observability"]["secret_headers"][0]["value_source"],
+        "plaintext"
+    );
+    assert_eq!(report["audit"]["retention_days"], 0);
+    assert_eq!(report["systemd"]["checked"], false);
+    assert!(report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .any(|finding| finding == "external/production serving requires authentication"));
+
+    let output = serde_json::to_string(&report).expect("serialize report");
+    assert!(!output.contains("Bearer plaintext"));
+    assert!(!output.contains("not-a-hash"));
+}

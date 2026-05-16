@@ -40,6 +40,8 @@ pub fn router(cfg: Config, storage: Storage) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(
@@ -54,6 +56,41 @@ pub fn router(cfg: Config, storage: Storage) -> Router {
 
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+async fn livez() -> impl IntoResponse {
+    Json(json!({ "status": "ok" }))
+}
+
+async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
+    let storage_ready = sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(state.storage.pool())
+        .await
+        .is_ok();
+    let status = if storage_ready {
+        "ready"
+    } else {
+        "unavailable"
+    };
+    let http_status = if storage_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        http_status,
+        Json(json!({
+            "status": status,
+            "models": {
+                "configured": state.cfg.models.len()
+            },
+            "storage": {
+                "ready": storage_ready
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {

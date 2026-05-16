@@ -95,6 +95,24 @@ External bind requires the full production baseline before enablement:
 usage reporting, resource budget limits, and the approved observability
 collector endpoint.
 
+Ordered production deployment operations are part of the release-owned runbook:
+
+1. Import the offline install manifest with `llmctl --config
+   /etc/rs-llmctl/config.toml model import-manifest ./manifest.toml`.
+2. Run the dry-run validation gate with `llmctl --config
+   /etc/rs-llmctl/config.toml server check`.
+3. Run the security audit with `llmctl --config
+   /etc/rs-llmctl/config.toml security check`.
+4. Run readiness checks with `llmctl --config /etc/rs-llmctl/config.toml
+   observe plan` and `systemd-analyze verify
+   /etc/systemd/system/llmctld.service`.
+5. Start the daemon under systemd with `systemctl enable --now
+   llmctld.service`.
+6. Verify AQE/OpenAI client access with
+   `OPENAI_BASE_URL=http://host:8765/v1`.
+7. Export the audit envelope with `llmctl --config
+   /etc/rs-llmctl/config.toml data export --hours 24`.
+
 ## CLI Contract
 
 The Rust CLI keeps the operational command groups stable while the library

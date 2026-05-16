@@ -72,11 +72,15 @@ user/group, and grants write access only to `/var/lib/rs-llmctl` and
 Dry-run validation for a staged server should run before enabling systemd:
 
 ```bash
-llmctl --config /etc/rs-llmctl/config.toml server check
-llmctl --config /etc/rs-llmctl/config.toml security check
-llmctl --config /etc/rs-llmctl/config.toml observe plan
-systemd-analyze verify /etc/systemd/system/llmctld.service
+packaging/validate-install.sh
 ```
+
+The validation script is safe to run offline: it performs the daemon dry-run
+startup plan, runs `security check`, prints the `observe plan`, and verifies the
+systemd unit only when `systemd-analyze` is available. It does not start or
+enable services, install packages, download models, or contact remote
+endpoints. Override staged paths or binary locations with `CONFIG=...`,
+`UNIT=...`, `LLMCTL=...`, or `LLMCTLD=...` when validating a package root.
 
 External bind is a release-blocking deployment control, not a packaging default.
 Before setting `server.host = "0.0.0.0"` or `security.bind-external = true`,
@@ -107,6 +111,55 @@ sha256 = "hex-encoded-sha256"
 Relative paths resolve from the manifest directory. Include `sha256` whenever a
 bundle is copied across trust boundaries so the install rejects unexpected model
 bytes before registration.
+
+## Ordered Deployment Operations
+
+Production deployments should follow this order so every gate is captured before
+traffic reaches the daemon:
+
+1. Import the offline install manifest after staging the approved bundle under
+   `/var/lib/rs-llmctl/models`:
+
+   ```bash
+   llmctl --config /etc/rs-llmctl/config.toml model import-manifest ./manifest.toml
+   ```
+
+2. Run the dry-run validation gate without starting the daemon:
+
+   ```bash
+   llmctl --config /etc/rs-llmctl/config.toml server check
+   ```
+
+3. Run the security audit for production/external-bind controls:
+
+   ```bash
+   llmctl --config /etc/rs-llmctl/config.toml security check
+   ```
+
+4. Run readiness checks for observability and the systemd unit:
+
+   ```bash
+   llmctl --config /etc/rs-llmctl/config.toml observe plan
+   systemd-analyze verify /etc/systemd/system/llmctld.service
+   ```
+
+5. Start the daemon under systemd only after the dry-run, security audit, and
+   readiness checks pass:
+
+   ```bash
+   systemctl enable --now llmctld.service
+   systemctl status llmctld.service
+   ```
+
+6. Verify AQE/OpenAI client access against the OpenAI-compatible endpoint with
+   `OPENAI_BASE_URL=http://host:8765/v1` and the production API key scope
+   intended for the client.
+
+7. Export the audit envelope for the deployment window:
+
+   ```bash
+   llmctl --config /etc/rs-llmctl/config.toml data export --hours 24
+   ```
 
 ## Enterprise Security Posture
 
