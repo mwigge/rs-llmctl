@@ -270,6 +270,50 @@ fn docs_pin_enterprise_reporting_and_client_safe_metadata() {
 }
 
 #[test]
+fn docs_pin_server_storage_router_and_aqe_contract_controls() {
+    let docs = format!(
+        "{}\n{}",
+        read("README.md"),
+        read("examples/policy-operations-runbook.md")
+    );
+    let docs_lower = docs.to_lowercase();
+    let docs_flat = normalize_doc_text(&docs_lower);
+
+    for required in [
+        "external database storage with postgres",
+        "database url",
+        "redacted",
+        "migration plan",
+        "admission/backpressure limits",
+        "upstream timeout budgets",
+        "non-secret failure responses",
+        "stable 429/504 errors",
+        "integration aqe-contract",
+        "openai paths",
+        "required auth scopes",
+        "safe response headers",
+        "quota/team reporting fields",
+        "model aliases",
+    ] {
+        assert!(
+            docs_flat.contains(required),
+            "server storage/router/AQE docs should cover `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "database passwords",
+        "raw connection secrets",
+        "upstream urls, prompts, file paths, api keys, or bearer tokens",
+    ] {
+        assert!(
+            docs_flat.contains(forbidden),
+            "docs should explicitly forbid `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn systemd_template_documents_server_deployment_controls() {
     let unit = read("packaging/systemd/llmctld.service").to_lowercase();
 

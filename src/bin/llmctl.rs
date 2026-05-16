@@ -5,6 +5,7 @@ use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{
     self, ApiKeyConfig, Config, Mode, ModelConfig, QuotaConfig, StorageConfig,
 };
+use rs_llmctl::integrations;
 use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
 use rs_llmctl::observability::{Exporter, ObservabilityPlan};
 use rs_llmctl::quota::{self, Principal};
@@ -68,6 +69,10 @@ enum Command {
     Data {
         #[command(subcommand)]
         command: DataCommand,
+    },
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
     },
 }
 
@@ -333,6 +338,11 @@ enum DataCommand {
     VerifyEnvelope(DataVerifyEnvelopeArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum IntegrationCommand {
+    AqeContract,
+}
+
 #[derive(Debug, Args)]
 struct DataExportArgs {
     #[arg(long, default_value_t = 24)]
@@ -362,6 +372,9 @@ async fn main() -> Result<()> {
         Command::Audit { command } => audit_command(&config_path, command, cli.json).await,
         Command::Usage { command } => usage_command(&config_path, command, cli.json).await,
         Command::Data { command } => data_command(&config_path, command, cli.json).await,
+        Command::Integration { command } => {
+            integration_command(&config_path, command, cli.json).await
+        }
     }
 }
 
@@ -864,6 +877,19 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
                 );
             }
             emit(as_json, &output)
+        }
+    }
+}
+
+async fn integration_command(
+    path: &Path,
+    command: IntegrationCommand,
+    as_json: bool,
+) -> Result<()> {
+    let cfg = load_config(path).await?;
+    match command {
+        IntegrationCommand::AqeContract => {
+            emit(as_json, &integrations::aqe_governance_contract(&cfg))
         }
     }
 }

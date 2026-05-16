@@ -10,12 +10,15 @@ use rs_llmctl::storage::Storage;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const TOKEN: &str = "test-token";
+type SharedRelease = std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>;
+type BlockingUpstreamState = (mpsc::Sender<Value>, SharedRelease);
 
 #[tokio::test]
 async fn lists_openai_compatible_models() {
@@ -580,9 +583,88 @@ async fn chat_completions_returns_429_when_quota_denies_model() {
     );
 }
 
+#[tokio::test]
+async fn chat_completions_returns_429_when_admission_limit_is_full_without_leaking_details() {
+    let (upstream, mut upstream_requests, release_upstream) = spawn_blocking_upstream().await;
+    let mut cfg = config_with_models(vec![model("llama")]);
+    cfg.server.llama_server = upstream;
+    let app =
+        test_app_with_limits(cfg, server::ServingLimits::new(1, Duration::from_secs(30))).await;
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request()).await.expect("first response") }
+    });
+    upstream_requests
+        .recv()
+        .await
+        .expect("first upstream request");
+
+    let response = app.oneshot(chat_request()).await.expect("second response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_response_headers_do_not_leak(
+        response.headers(),
+        &[
+            "127.0.0.1",
+            "/v1/chat/completions",
+            TOKEN,
+            &cfg_api_key_hash(),
+        ],
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "rate_limit_exceeded");
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(body["error"]["message"], "server is busy; retry later");
+    assert!(
+        upstream_requests.try_recv().is_err(),
+        "admission denial must not reach upstream"
+    );
+
+    release_upstream.send(()).expect("release upstream");
+    let first_response = first.await.expect("first task");
+    assert_eq!(first_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn chat_completions_returns_sanitized_504_when_upstream_times_out() {
+    let (upstream, mut upstream_requests, _release_upstream) = spawn_blocking_upstream().await;
+    let mut cfg = config_with_models(vec![model("llama")]);
+    cfg.server.llama_server = upstream;
+    let app = test_app_with_limits(
+        cfg,
+        server::ServingLimits::new(4, Duration::from_millis(25)),
+    )
+    .await;
+
+    let response = app.oneshot(chat_request()).await.expect("response");
+
+    upstream_requests.recv().await.expect("upstream request");
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_response_headers_do_not_leak(
+        response.headers(),
+        &[
+            "127.0.0.1",
+            "/v1/chat/completions",
+            "hello",
+            TOKEN,
+            &cfg_api_key_hash(),
+        ],
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "timeout");
+    assert_eq!(body["error"]["code"], "timeout");
+    assert_eq!(body["error"]["message"], "upstream request timed out");
+}
+
 async fn test_app(cfg: Config) -> Router {
     let storage = Storage::in_memory().await.expect("storage");
     server::router(cfg, storage)
+}
+
+async fn test_app_with_limits(cfg: Config, limits: server::ServingLimits) -> Router {
+    let storage = Storage::in_memory().await.expect("storage");
+    server::router_with_serving_limits(cfg, storage, limits)
 }
 
 async fn test_app_with_storage(cfg: Config) -> (Router, Storage) {
@@ -643,6 +725,19 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json response")
 }
 
+fn chat_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", bearer())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "llama", "messages": [{"role": "user", "content": "hello"}]})
+                .to_string(),
+        ))
+        .unwrap()
+}
+
 async fn spawn_mock_upstream() -> (String, mpsc::Receiver<Value>) {
     let (tx, rx) = mpsc::channel(4);
     let app = Router::new()
@@ -656,6 +751,47 @@ async fn spawn_mock_upstream() -> (String, mpsc::Receiver<Value>) {
         axum::serve(listener, app).await.expect("serve upstream");
     });
     (format!("http://{addr}"), rx)
+}
+
+async fn spawn_blocking_upstream() -> (String, mpsc::Receiver<Value>, oneshot::Sender<()>) {
+    let (request_tx, request_rx) = mpsc::channel(4);
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let release_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State((request_tx, release_rx)): State<BlockingUpstreamState>,
+                 Json(request): Json<Value>| async move {
+                    request_tx.send(request).await.expect("record request");
+                    let release = release_rx.lock().await.take();
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                    Json(json!({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "model": "llama",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "pong"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                },
+            ),
+        )
+        .with_state((request_tx, release_rx));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve upstream");
+    });
+    (format!("http://{addr}"), request_rx, release_tx)
 }
 
 async fn mock_chat_completion(

@@ -1,14 +1,237 @@
 use crate::audit::{AuditEvent, ObservationEvent, UsageEvent};
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, StorageConfig};
 use crate::quota::{Principal, QuotaDecision};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
+use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageBackend {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SqlDialect {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageConnectionPlan {
+    pub backend: StorageBackend,
+    target: String,
+    display_target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMigrationPlan {
+    dialect: SqlDialect,
+    statements: Vec<String>,
+}
+
+impl StorageConnectionPlan {
+    pub fn from_config(config: &StorageConfig) -> Result<Self> {
+        if let Some(database_url) = config.database_url.as_deref() {
+            let backend = backend_for_url(database_url)?;
+            return Ok(Self {
+                backend,
+                target: database_url.to_string(),
+                display_target: redact_database_url(database_url),
+            });
+        }
+
+        let backend = config.backend.unwrap_or(StorageBackend::Sqlite);
+        match backend {
+            StorageBackend::Sqlite => Ok(Self {
+                backend,
+                target: config.db_path.display().to_string(),
+                display_target: config.db_path.display().to_string(),
+            }),
+            StorageBackend::Postgres => {
+                bail!("postgres storage requires storage.database-url")
+            }
+        }
+    }
+
+    pub fn dialect(&self) -> SqlDialect {
+        match self.backend {
+            StorageBackend::Sqlite => SqlDialect::Sqlite,
+            StorageBackend::Postgres => SqlDialect::Postgres,
+        }
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn display_target(&self) -> &str {
+        &self.display_target
+    }
+}
+
+impl fmt::Display for StorageConnectionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.backend {
+            StorageBackend::Sqlite => write!(f, "sqlite database {}", self.display_target),
+            StorageBackend::Postgres => write!(f, "postgres database {}", self.display_target),
+        }
+    }
+}
+
+impl StorageMigrationPlan {
+    pub fn new(dialect: SqlDialect) -> Self {
+        Self {
+            dialect,
+            statements: migration_statements(dialect),
+        }
+    }
+
+    pub fn dialect(&self) -> SqlDialect {
+        self.dialect
+    }
+
+    pub fn statements(&self) -> &[String] {
+        &self.statements
+    }
+}
+
+fn backend_for_url(database_url: &str) -> Result<StorageBackend> {
+    let Some((scheme, _)) = database_url.split_once(':') else {
+        bail!("storage.database-url must include a URL scheme");
+    };
+
+    match scheme {
+        "sqlite" => Ok(StorageBackend::Sqlite),
+        "postgres" | "postgresql" => Ok(StorageBackend::Postgres),
+        other => bail!("unsupported storage database-url scheme `{other}`"),
+    }
+}
+
+fn redact_database_url(database_url: &str) -> String {
+    let Some((scheme, rest)) = database_url.split_once("://") else {
+        return database_url.to_string();
+    };
+    let Some((authority, tail)) = rest.split_once('/') else {
+        return redact_authority_url(scheme, rest, "");
+    };
+    redact_authority_url(scheme, authority, &format!("/{tail}"))
+}
+
+fn redact_authority_url(scheme: &str, authority: &str, tail: &str) -> String {
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return format!("{scheme}://{authority}{tail}");
+    };
+    let redacted_userinfo = match userinfo.split_once(':') {
+        Some((user, _password)) => format!("{user}:[REDACTED]"),
+        None => userinfo.to_string(),
+    };
+    format!("{scheme}://{redacted_userinfo}@{host}{tail}")
+}
+
+fn migration_statements(dialect: SqlDialect) -> Vec<String> {
+    let bool_type = match dialect {
+        SqlDialect::Sqlite => "INTEGER",
+        SqlDialect::Postgres => "BOOLEAN",
+    };
+    let float_type = match dialect {
+        SqlDialect::Sqlite => "REAL",
+        SqlDialect::Postgres => "DOUBLE PRECISION",
+    };
+
+    vec![
+        r#"
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT,
+                at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                team TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                detail_json TEXT NOT NULL
+            )
+            "#
+        .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_at ON audit_events(at)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_request_id ON audit_events(request_id)"
+            .to_string(),
+        r#"
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT NOT NULL,
+                at TEXT NOT NULL,
+                model TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                team TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                status TEXT NOT NULL
+            )
+            "#
+        .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_usage_events_at ON usage_events(at)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_usage_events_request_id ON usage_events(request_id)"
+            .to_string(),
+        format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS observation_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT,
+                at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                source TEXT NOT NULL,
+                value {float_type} NOT NULL,
+                unit TEXT NOT NULL,
+                attributes_json TEXT NOT NULL
+            )
+            "#
+        ),
+        "CREATE INDEX IF NOT EXISTS idx_observation_events_at ON observation_events(at)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_observation_events_request_id ON observation_events(request_id)"
+            .to_string(),
+        r#"
+            CREATE TABLE IF NOT EXISTS model_inventory (
+                alias TEXT PRIMARY KEY NOT NULL,
+                path TEXT NOT NULL,
+                role TEXT NOT NULL,
+                weight INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#
+        .to_string(),
+        format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS quota_decisions (
+                id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT,
+                at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                team TEXT NOT NULL,
+                model TEXT NOT NULL,
+                allowed {bool_type} NOT NULL,
+                reason TEXT NOT NULL,
+                policy_json TEXT NOT NULL
+            )
+            "#
+        ),
+        "CREATE INDEX IF NOT EXISTS idx_quota_decisions_at ON quota_decisions(at)".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_quota_decisions_request_id ON quota_decisions(request_id)"
+            .to_string(),
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -104,125 +327,10 @@ impl Storage {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT,
-                at TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                team TEXT NOT NULL,
-                action TEXT NOT NULL,
-                resource TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                detail_json TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_events_at ON audit_events(at)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_request_id ON audit_events(request_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS usage_events (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT NOT NULL,
-                at TEXT NOT NULL,
-                model TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                team TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                latency_ms INTEGER NOT NULL,
-                status TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_events_at ON usage_events(at)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_usage_events_request_id ON usage_events(request_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS observation_events (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT,
-                at TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                model TEXT NOT NULL,
-                source TEXT NOT NULL,
-                value REAL NOT NULL,
-                unit TEXT NOT NULL,
-                attributes_json TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        for statement in StorageMigrationPlan::new(SqlDialect::Sqlite).statements() {
+            sqlx::query(statement).execute(&self.pool).await?;
+        }
         add_column_if_missing(&self.pool, "observation_events", "request_id TEXT").await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_observation_events_at ON observation_events(at)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_observation_events_request_id ON observation_events(request_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS model_inventory (
-                alias TEXT PRIMARY KEY NOT NULL,
-                path TEXT NOT NULL,
-                role TEXT NOT NULL,
-                weight INTEGER NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS quota_decisions (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT,
-                at TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                team TEXT NOT NULL,
-                model TEXT NOT NULL,
-                allowed INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                policy_json TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_quota_decisions_at ON quota_decisions(at)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_quota_decisions_request_id ON quota_decisions(request_id)")
-            .execute(&self.pool)
-            .await?;
 
         Ok(())
     }
@@ -723,7 +831,60 @@ fn row_to_quota_decision_record(row: sqlx::sqlite::SqliteRow) -> Result<QuotaDec
 mod tests {
     use super::*;
     use crate::audit::{AuditEvent, ObservationEvent, UsageEvent};
+    use crate::config::Config;
     use serde_json::json;
+
+    #[test]
+    fn legacy_db_path_config_plans_sqlite_storage() -> Result<()> {
+        let cfg: Config = toml::from_str(
+            r#"
+            [storage]
+            db_path = "/var/lib/llmctl/state.db"
+            model_dir = "/var/lib/llmctl/models"
+            "#,
+        )?;
+
+        let plan = cfg.storage.connection_plan()?;
+
+        assert_eq!(plan.backend, StorageBackend::Sqlite);
+        assert_eq!(plan.dialect(), SqlDialect::Sqlite);
+        assert_eq!(plan.display_target(), "/var/lib/llmctl/state.db");
+        assert_eq!(plan.to_string(), "sqlite database /var/lib/llmctl/state.db");
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_url_config_plans_postgres_storage_and_redacts_credentials() -> Result<()> {
+        let cfg: Config = toml::from_str(
+            r#"
+            [storage]
+            database-url = "postgres://llmctl:secret-token@db.internal:5432/llmctl?sslmode=require"
+            "#,
+        )?;
+
+        let plan = cfg.storage.connection_plan()?;
+
+        assert_eq!(plan.backend, StorageBackend::Postgres);
+        assert_eq!(plan.dialect(), SqlDialect::Postgres);
+        assert_eq!(
+            plan.display_target(),
+            "postgres://llmctl:[REDACTED]@db.internal:5432/llmctl?sslmode=require"
+        );
+        assert!(!plan.to_string().contains("secret-token"));
+        assert!(plan.to_string().contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[test]
+    fn migration_plan_renders_postgres_compatible_ddl() {
+        let plan = StorageMigrationPlan::new(SqlDialect::Postgres);
+        let ddl = plan.statements().join("\n");
+
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS audit_events"));
+        assert!(ddl.contains("allowed BOOLEAN NOT NULL"));
+        assert!(ddl.contains("CREATE INDEX IF NOT EXISTS idx_quota_decisions_request_id"));
+        assert!(!ddl.contains("PRAGMA"));
+    }
 
     #[tokio::test]
     async fn persists_audit_usage_observation_model_and_quota_records() -> Result<()> {

@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod config;
+pub mod integrations;
 pub mod model;
 pub mod observability;
 pub mod quota;

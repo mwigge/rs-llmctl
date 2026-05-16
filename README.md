@@ -318,6 +318,26 @@ quota state, and audit correlation fields. AQE/OpenAI-compatible clients can
 consume these summaries without exposing secrets because API keys, bearer
 tokens, collector headers, and raw prompts remain outside reporting metadata.
 
+Server deployments can plan external database storage with Postgres while the
+default local path remains SQLite. Postgres configuration must use a database
+URL that is redacted in reports and operational output; migration plans are
+reviewable before a live external database is attached.
+
+Router maturity controls include admission/backpressure limits, upstream timeout
+budgets, and non-secret failure responses for saturated or slow model workers.
+These controls are part of the serving contract so OpenAI-compatible clients see
+stable 429/504 errors without upstream URLs, prompts, file paths, API keys, or
+bearer tokens.
+
+External governance tools can consume the AQE/OpenAI-compatible contract with:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml integration aqe-contract
+```
+
+The contract lists OpenAI paths, required auth scopes, safe response headers,
+quota/team reporting fields, and model aliases without exposing runtime secrets.
+
 ## CLI
 
 `llmctl init` writes the default TOML config, creates the model directory, and

@@ -101,3 +101,27 @@ AQE/OpenAI-compatible clients when it is limited to request identifiers, model
 aliases, policy status, quota state, and audit correlation fields. These fields
 are safe for AQE/OpenAI-compatible clients because AQE/OpenAI-compatible clients
 can consume these summaries without exposing secrets.
+
+## Server Storage And Router Contract Review
+
+For server deployments that use an external database, attach the redacted
+Postgres storage plan and migration plan to the change record before connecting
+live infrastructure. The storage review must not include database passwords or
+raw connection secrets.
+
+Review router maturity controls with the same deployment record: admission and
+backpressure limits, upstream timeout budgets, and non-secret failure responses
+for saturated or slow model workers. Failure responses should preserve request
+correlation without exposing upstream URLs, prompts, file paths, API keys, or
+bearer tokens.
+
+Export the AQE/OpenAI-compatible governance contract for approved external
+clients:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml integration aqe-contract
+```
+
+Attach the contract output with the quota/team governance summary so external
+clients can validate paths, auth scopes, safe response headers, quota fields,
+team fields, and model aliases.

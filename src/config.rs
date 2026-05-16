@@ -114,9 +114,14 @@ impl Default for ResourceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     pub db_path: PathBuf,
     pub model_dir: PathBuf,
+    #[serde(default, alias = "database-url")]
+    pub database_url: Option<String>,
+    #[serde(default)]
+    pub backend: Option<crate::storage::StorageBackend>,
 }
 
 impl Default for StorageConfig {
@@ -125,7 +130,15 @@ impl Default for StorageConfig {
         Self {
             db_path: PathBuf::from(format!("{home}/.local/share/rs-llmctl/llmctl.db")),
             model_dir: PathBuf::from(format!("{home}/.local/share/rs-llmctl/models")),
+            database_url: None,
+            backend: None,
         }
+    }
+}
+
+impl StorageConfig {
+    pub fn connection_plan(&self) -> Result<crate::storage::StorageConnectionPlan> {
+        crate::storage::StorageConnectionPlan::from_config(self)
     }
 }
 

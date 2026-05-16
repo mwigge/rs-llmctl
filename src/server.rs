@@ -18,10 +18,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+
+const DEFAULT_MAX_IN_FLIGHT: usize = 128;
+const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -29,15 +34,29 @@ pub struct ServerState {
     storage: Storage,
     client: reqwest::Client,
     upstream: String,
+    admission: AdmissionController,
+    serving_limits: ServingLimits,
 }
 
 pub fn router(cfg: Config, storage: Storage) -> Router {
+    let limits = ServingLimits::from_config(&cfg);
+    router_with_serving_limits(cfg, storage, limits)
+}
+
+pub fn router_with_serving_limits(
+    cfg: Config,
+    storage: Storage,
+    serving_limits: ServingLimits,
+) -> Router {
     let upstream = normalize_upstream(&cfg.server.llama_server);
+    let admission = AdmissionController::new(serving_limits.max_in_flight);
     let state = ServerState {
         cfg: Arc::new(cfg),
         storage,
         client: reqwest::Client::new(),
         upstream,
+        admission,
+        serving_limits,
     };
 
     Router::new()
@@ -61,6 +80,77 @@ pub fn router(cfg: Config, storage: Storage) -> Router {
         )
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServingLimits {
+    max_in_flight: usize,
+    upstream_timeout: Duration,
+}
+
+impl ServingLimits {
+    pub fn new(max_in_flight: usize, upstream_timeout: Duration) -> Self {
+        Self {
+            max_in_flight: max_in_flight.max(1),
+            upstream_timeout: upstream_timeout.max(Duration::from_millis(1)),
+        }
+    }
+
+    fn from_config(cfg: &Config) -> Self {
+        let configured_max = cfg
+            .quotas
+            .iter()
+            .filter_map(|quota| usize::try_from(quota.max_concurrency).ok())
+            .filter(|limit| *limit > 0)
+            .fold(0usize, usize::saturating_add);
+        let max_in_flight = if configured_max > 0 {
+            configured_max
+        } else {
+            DEFAULT_MAX_IN_FLIGHT
+        };
+
+        Self::new(max_in_flight, DEFAULT_UPSTREAM_TIMEOUT)
+    }
+
+    fn upstream_timeout(&self) -> Duration {
+        self.upstream_timeout
+    }
+}
+
+#[derive(Clone)]
+struct AdmissionController {
+    permits: Arc<Semaphore>,
+}
+
+impl AdmissionController {
+    fn new(max_in_flight: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_in_flight.max(1))),
+        }
+    }
+
+    fn try_acquire(&self) -> std::result::Result<AdmissionPermit, AdmissionError> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map(|permit| AdmissionPermit { _permit: permit })
+            .map_err(|_| AdmissionError::Busy)
+    }
+}
+
+struct AdmissionPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for AdmissionPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionPermit").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionError {
+    Busy,
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -374,29 +464,52 @@ async fn chat_completions(
     )
     .await;
 
-    let upstream = format!("{}/v1/chat/completions", state.upstream);
-    let upstream_response = match state
-        .client
-        .post(upstream)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            let latency_ms = elapsed_ms(started);
-            record_usage(
+    let admission = match state.admission.try_acquire() {
+        Ok(permit) => permit,
+        Err(AdmissionError::Busy) => {
+            record_audit(
                 &state,
-                UsageRecordInput {
-                    request_id,
-                    principal: &principal,
-                    model: &model,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    latency_ms,
-                    status: "upstream_error",
-                },
+                Some(request_id),
+                principal,
+                "chat.completions",
+                model,
+                "denied",
+                json!({ "reason": "admission_limit_exceeded" }),
+            )
+            .await;
+            return with_request_id(
+                error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_exceeded",
+                    "server is busy; retry later".to_string(),
+                ),
+                request_id,
+            );
+        }
+    };
+
+    let upstream = format!("{}/v1/chat/completions", state.upstream);
+    let upstream_response = match timeout(
+        upstream_timeout_budget(&state),
+        state
+            .client
+            .post(upstream)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            let (status, code, message, usage_status) = upstream_request_error(&err);
+            record_upstream_failure(
+                &state,
+                request_id,
+                &principal,
+                &model,
+                started,
+                usage_status,
             )
             .await;
             record_audit(
@@ -406,71 +519,112 @@ async fn chat_completions(
                 "chat.completions",
                 model,
                 "error",
-                json!({ "reason": err.to_string() }),
+                json!({ "reason": usage_status }),
+            )
+            .await;
+            return with_request_id(error_response(status, code, message), request_id);
+        }
+        Err(_) => {
+            record_upstream_failure(&state, request_id, &principal, &model, started, "timeout")
+                .await;
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                model,
+                "error",
+                json!({ "reason": "timeout" }),
             )
             .await;
             return with_request_id(
-                error_response(StatusCode::BAD_GATEWAY, "upstream_error", err.to_string()),
+                error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "upstream request timed out".to_string(),
+                ),
                 request_id,
             );
         }
     };
 
     if request.stream {
-        stream_upstream(
-            state,
+        let upstream_context = UpstreamRequestContext {
             request_id,
             principal,
             model,
-            route.upstream_alias,
+            upstream_model: route.upstream_alias,
             started,
-            upstream_response,
-        )
-        .await
+            admission,
+        };
+        stream_upstream(state, upstream_response, upstream_context).await
     } else {
-        json_upstream(
-            state,
+        let upstream_context = UpstreamRequestContext {
             request_id,
             principal,
             model,
-            route.upstream_alias,
+            upstream_model: route.upstream_alias,
             started,
-            upstream_response,
-        )
-        .await
+            admission,
+        };
+        json_upstream(state, upstream_response, upstream_context).await
     }
 }
 
-async fn json_upstream(
-    state: Arc<ServerState>,
+struct UpstreamRequestContext {
     request_id: Uuid,
     principal: Principal,
     model: String,
     upstream_model: String,
     started: Instant,
+    admission: AdmissionPermit,
+}
+
+async fn json_upstream(
+    state: Arc<ServerState>,
     upstream_response: reqwest::Response,
+    context: UpstreamRequestContext,
 ) -> Response {
+    let UpstreamRequestContext {
+        request_id,
+        principal,
+        model,
+        upstream_model,
+        started,
+        admission: _admission,
+    } = context;
     let status = upstream_response.status();
     let headers = response_headers(upstream_response.headers());
-    let bytes = match upstream_response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            let latency_ms = elapsed_ms(started);
-            record_usage(
+    let bytes = match timeout(upstream_timeout_budget(&state), upstream_response.bytes()).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
+            record_upstream_failure(
                 &state,
-                UsageRecordInput {
-                    request_id,
-                    principal: &principal,
-                    model: &model,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    latency_ms,
-                    status: "upstream_error",
-                },
+                request_id,
+                &principal,
+                &model,
+                started,
+                upstream_error_status(&err),
             )
             .await;
             return with_request_id(
-                error_response(StatusCode::BAD_GATEWAY, "upstream_error", err.to_string()),
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "upstream request failed".to_string(),
+                ),
+                request_id,
+            );
+        }
+        Err(_) => {
+            record_upstream_failure(&state, request_id, &principal, &model, started, "timeout")
+                .await;
+            return with_request_id(
+                error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "upstream request timed out".to_string(),
+                ),
                 request_id,
             );
         }
@@ -517,13 +671,17 @@ async fn json_upstream(
 
 async fn stream_upstream(
     state: Arc<ServerState>,
-    request_id: Uuid,
-    principal: Principal,
-    model: String,
-    upstream_model: String,
-    started: Instant,
     upstream_response: reqwest::Response,
+    context: UpstreamRequestContext,
 ) -> Response {
+    let UpstreamRequestContext {
+        request_id,
+        principal,
+        model,
+        upstream_model,
+        started,
+        admission,
+    } = context;
     let status = upstream_response.status();
     let mut headers = response_headers(upstream_response.headers());
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -536,6 +694,7 @@ async fn stream_upstream(
     let response_upstream_model = upstream_model.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
     let stream = async_stream::stream! {
+        let _admission = admission;
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => yield Ok::<Bytes, std::io::Error>(bytes),
@@ -560,10 +719,10 @@ async fn stream_upstream(
                         "chat.completions",
                         model.clone(),
                         "stream_error",
-                        json!({ "status": status.as_u16(), "stream": true, "reason": err.to_string() }),
+                        json!({ "status": status.as_u16(), "stream": true, "reason": upstream_error_status(&err) }),
                     )
                     .await;
-                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(err));
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::other("upstream stream failed"));
                     return;
                 }
             }
@@ -603,6 +762,61 @@ async fn stream_upstream(
     } else {
         response
     }
+}
+
+fn upstream_timeout_budget(state: &ServerState) -> Duration {
+    state.serving_limits.upstream_timeout()
+}
+
+fn upstream_request_error(
+    err: &reqwest::Error,
+) -> (StatusCode, &'static str, String, &'static str) {
+    if err.is_timeout() {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            "upstream request timed out".to_string(),
+            "timeout",
+        )
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "upstream request failed".to_string(),
+            "upstream_error",
+        )
+    }
+}
+
+fn upstream_error_status(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else {
+        "upstream_error"
+    }
+}
+
+async fn record_upstream_failure(
+    state: &ServerState,
+    request_id: Uuid,
+    principal: &Principal,
+    model: &str,
+    started: Instant,
+    status: &'static str,
+) {
+    record_usage(
+        state,
+        UsageRecordInput {
+            request_id,
+            principal,
+            model,
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: elapsed_ms(started),
+            status,
+        },
+    )
+    .await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,6 +1319,56 @@ mod tests {
         let invalid = request_id_from_headers(&headers);
         assert_ne!(invalid, Uuid::nil());
         assert_ne!(invalid, missing);
+    }
+
+    #[test]
+    fn serving_limits_default_to_internal_admission_limit_without_quota_config() {
+        let cfg = Config::default();
+
+        let limits = ServingLimits::from_config(&cfg);
+
+        assert_eq!(limits.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(limits.upstream_timeout(), DEFAULT_UPSTREAM_TIMEOUT);
+    }
+
+    #[test]
+    fn serving_limits_use_configured_quota_concurrency_when_available() {
+        let cfg = Config {
+            quotas: vec![
+                crate::config::QuotaConfig {
+                    subject: "alice".to_string(),
+                    team: "".to_string(),
+                    requests_per_minute: 10,
+                    tokens_per_day: 100,
+                    max_concurrency: 2,
+                    allowed_models: vec!["llama".to_string()],
+                },
+                crate::config::QuotaConfig {
+                    subject: "bob".to_string(),
+                    team: "".to_string(),
+                    requests_per_minute: 10,
+                    tokens_per_day: 100,
+                    max_concurrency: 3,
+                    allowed_models: vec!["llama".to_string()],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let limits = ServingLimits::from_config(&cfg);
+
+        assert_eq!(limits.max_in_flight, 5);
+    }
+
+    #[test]
+    fn admission_controller_rejects_when_in_flight_limit_is_full() {
+        let controller = AdmissionController::new(1);
+        let first = controller.try_acquire().expect("first permit");
+
+        assert_eq!(controller.try_acquire().unwrap_err(), AdmissionError::Busy);
+
+        drop(first);
+        assert!(controller.try_acquire().is_ok());
     }
 
     #[test]

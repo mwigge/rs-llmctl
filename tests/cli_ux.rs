@@ -353,6 +353,143 @@ weight = 1
 }
 
 #[test]
+fn integration_aqe_contract_exports_openai_governance_contract_without_secrets() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let db_path = dir.path().join("llmctl.db");
+    let model_dir = dir.path().join("models");
+    let api_key_hash = sha256(b"aqe-contract-token");
+    let chat_path = model_dir.join("chat-private.gguf");
+    let review_path = model_dir.join("review-private.gguf");
+    let body = format!(
+        r#"
+mode = "weighted"
+
+[server]
+host = "0.0.0.0"
+port = 8765
+worker_base_port = 18765
+llama_server = "http://upstream.internal:8080"
+context_size = 8192
+
+[security]
+production = true
+require_auth = true
+bind_external = true
+
+[[security.api_keys]]
+id = "operator"
+sha256 = "{api_key_hash}"
+subject = "alice"
+team = "platform"
+scopes = ["admin", "chat", "models.read"]
+
+[resources]
+budget = 0.8
+cpu_only = true
+gpu_vendor = "auto"
+
+[storage]
+db_path = "{}"
+model_dir = "{}"
+
+[[models]]
+alias = "chat"
+path = "{}"
+role = "chat"
+weight = 10
+
+[[models]]
+alias = "review"
+path = "{}"
+role = "code"
+weight = 5
+
+[[quotas]]
+subject = "alice"
+team = "platform"
+requests_per_minute = 30
+tokens_per_day = 100000
+max_concurrency = 4
+allowed_models = ["chat", "review"]
+"#,
+        db_path.display(),
+        model_dir.display(),
+        chat_path.display(),
+        review_path.display()
+    );
+    fs::write(&config, body).expect("write config");
+
+    let mut contract = llmctl();
+    contract
+        .arg("--config")
+        .arg(&config)
+        .arg("integration")
+        .arg("aqe-contract");
+    let output = contract.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let contract: Value = serde_json::from_str(&raw).expect("stdout is json");
+    assert_eq!(contract["kind"], "aqe-openai-governance-contract");
+    assert_eq!(contract["endpoint"]["base_url"], "http://0.0.0.0:8765");
+    assert_eq!(contract["endpoint"]["openai_paths"]["models"], "/v1/models");
+    assert_eq!(
+        contract["endpoint"]["openai_paths"]["chat_completions"],
+        "/v1/chat/completions"
+    );
+    assert_eq!(
+        contract["auth"]["required_scopes"],
+        serde_json::json!(["chat", "models.read"])
+    );
+    assert_eq!(
+        contract["response_headers"],
+        serde_json::json!([
+            "x-request-id",
+            "x-llmctl-model-count",
+            "x-llmctl-model",
+            "x-llmctl-upstream-model",
+            "x-llmctl-quota-decision"
+        ])
+    );
+    assert_eq!(
+        contract["quota_reporting"]["fields"],
+        serde_json::json!([
+            "team",
+            "subject",
+            "requests_per_minute",
+            "tokens_per_day",
+            "max_concurrency",
+            "allowed_models"
+        ])
+    );
+    assert_eq!(
+        contract["team_reporting"]["teams"],
+        serde_json::json!(["platform"])
+    );
+    assert_eq!(
+        contract["model_aliases"],
+        serde_json::json!([
+            { "alias": "chat", "role": "chat", "weight": 10 },
+            { "alias": "review", "role": "code", "weight": 5 }
+        ])
+    );
+
+    assert!(!raw.contains("aqe-contract-token"));
+    assert!(!raw.contains(&api_key_hash));
+    assert!(!raw.contains(&chat_path.display().to_string()));
+    assert!(!raw.contains(&review_path.display().to_string()));
+    assert!(!raw.contains("upstream.internal"));
+    assert!(!raw.contains("http://upstream.internal:8080"));
+}
+
+#[test]
 fn server_plan_exports_cpu_startup_plan_with_command_specs_without_secrets() {
     let dir = TempDir::new().expect("tempdir");
     let config = dir.path().join("config.toml");
