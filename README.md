@@ -78,6 +78,27 @@ llmctl --config /etc/rs-llmctl/config.toml observe plan
 llmctl --config /etc/rs-llmctl/config.toml data export --hours 24
 ```
 
+For a production AIOps-style starting point, use the config wizard profile:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml init \
+  --profile production-aiops \
+  --bind 0.0.0.0 \
+  --otel-endpoint https://otel-collector.example/v1/traces \
+  --log-format json \
+  --event-format jsonl \
+  --data-format arrow-json \
+  --tls-provider envoy-edge \
+  --tls-evidence change-record-123 \
+  --mtls
+```
+
+That writes the typed config for SSE streaming, OTel trace/metric/log export,
+JSON logging, schema-versioned events, the data fabric, CRA-style monthly
+audit reporting, and external-bind security controls. The wizard does not add
+API keys for you; create hashed keys with `security hash-key` and review them
+like any other production secret material.
+
 Minimal manifest:
 
 ```toml
@@ -253,6 +274,22 @@ environment-backed headers. Use `env:` for collector credentials. Runtime
 events emit OTel-friendly signals for request routing, audit, quota, usage,
 resource snapshots, and drift observations.
 
+Data movement is explicit and schema-versioned:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml data contracts
+llmctl --config /etc/rs-llmctl/config.toml data contracts --dataset finops
+llmctl --config /etc/rs-llmctl/config.toml data export --dataset security --format json
+llmctl --config /etc/rs-llmctl/config.toml data export --dataset observability --format jsonl
+llmctl --config /etc/rs-llmctl/config.toml data export --dataset finops --format arrow-json
+llmctl aiops gaps
+```
+
+The current Arrow path is `arrow-json`: rows plus an Arrow-compatible schema
+description. That gives operators one contract surface for security,
+observability, user, finops, model, drift, and audit data today, while leaving
+native Arrow IPC and Parquet writers as a tracked platform gap.
+
 Compliance evidence is available through `llmctl compliance evidence`, with
 focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 
@@ -263,6 +300,9 @@ focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 - [Security model](docs/security.md)
 - [Compliance evidence](docs/compliance.md)
 - [Observability and reporting](docs/observability-reporting.md)
+- [Configuration](docs/configuration.md)
+- [Data contracts](docs/data-contracts.md)
+- [AIOps/MLOps platform gaps](docs/aiops-mlops-platform.md)
 - [Storage notes](docs/storage.md)
 - [Final role review](docs/reviews/final-role-review.md)
 - [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)

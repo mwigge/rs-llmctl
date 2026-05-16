@@ -30,6 +30,14 @@ pub struct Config {
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
+    pub sse: SseConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default)]
+    pub events: EventConfig,
+    #[serde(default, rename = "data-fabric", alias = "data_fabric")]
+    pub data_fabric: DataFabricConfig,
+    #[serde(default)]
     pub audit: AuditConfig,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -46,6 +54,10 @@ impl Default for Config {
             resources: ResourceConfig::default(),
             storage: StorageConfig::default(),
             observability: ObservabilityConfig::default(),
+            sse: SseConfig::default(),
+            log: LogConfig::default(),
+            events: EventConfig::default(),
+            data_fabric: DataFabricConfig::default(),
             audit: AuditConfig::default(),
             models: vec![],
             quotas: vec![],
@@ -214,6 +226,130 @@ pub enum OtlpProtocol {
     #[default]
     HttpProtobuf,
     Grpc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SseConfig {
+    pub enabled: bool,
+    pub heartbeat_seconds: u64,
+    pub max_stream_seconds: u64,
+}
+
+impl Default for SseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            heartbeat_seconds: 15,
+            max_stream_seconds: 3_600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct LogConfig {
+    pub format: LogFormat,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::Pretty,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogFormat {
+    #[default]
+    Pretty,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct EventConfig {
+    pub format: EventFormat,
+    pub schema_version: u32,
+}
+
+impl Default for EventConfig {
+    fn default() -> Self {
+        Self {
+            format: EventFormat::Json,
+            schema_version: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventFormat {
+    #[default]
+    Json,
+    Jsonl,
+    CloudEvents,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct DataFabricConfig {
+    pub enabled: bool,
+    pub format: DataFabricFormat,
+    pub schema_version: u32,
+    pub output_dir: Option<PathBuf>,
+    pub datasets: DataFabricDatasets,
+}
+
+impl Default for DataFabricConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: DataFabricFormat::Json,
+            schema_version: 1,
+            output_dir: None,
+            datasets: DataFabricDatasets::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DataFabricFormat {
+    #[default]
+    Json,
+    Jsonl,
+    ArrowJson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct DataFabricDatasets {
+    pub security: bool,
+    pub observability: bool,
+    pub usage: bool,
+    pub user: bool,
+    pub finops: bool,
+    pub models: bool,
+    pub drift: bool,
+    pub audit: bool,
+}
+
+impl Default for DataFabricDatasets {
+    fn default() -> Self {
+        Self {
+            security: true,
+            observability: true,
+            usage: true,
+            user: true,
+            finops: true,
+            models: true,
+            drift: true,
+            audit: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

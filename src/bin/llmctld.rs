@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use rs_llmctl::config::{self, StorageConfig};
+use rs_llmctl::config::{self, LogFormat, StorageConfig};
 use rs_llmctl::observability::TelemetryRuntime;
 use rs_llmctl::storage::{Storage, StorageBackend};
 use rs_llmctl::worker::{StartupPlan, TokioWorkerRunner, WorkerState, WorkerSupervisor};
@@ -28,7 +28,8 @@ async fn main() -> Result<()> {
     let cfg = config::load(&config_path)
         .await
         .with_context(|| format!("load config {}", config_path.display()))?;
-    let telemetry = TelemetryRuntime::install(&cfg, cli.json_logs)?;
+    let json_logs = cli.json_logs || cfg.log.format == LogFormat::Json;
+    let telemetry = TelemetryRuntime::install(&cfg, json_logs)?;
 
     config::validate_production_security(&cfg)?;
     let storage = init_storage(&cfg.storage).await?;

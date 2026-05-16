@@ -3,8 +3,10 @@ use chrono::{Datelike, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{
-    self, ApiKeyConfig, Config, Mode, ModelConfig, QuotaConfig, StorageConfig,
+    self, ApiKeyConfig, Config, DataFabricFormat, EventFormat, LogFormat, Mode, ModelConfig,
+    QuotaConfig, StorageConfig,
 };
+use rs_llmctl::contracts::{self, DatasetKind};
 use rs_llmctl::integrations;
 use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
 use rs_llmctl::observability::{Exporter, ObservabilityPlan};
@@ -71,6 +73,10 @@ enum Command {
         #[command(subcommand)]
         command: DataCommand,
     },
+    Aiops {
+        #[command(subcommand)]
+        command: AiopsCommand,
+    },
     Compliance {
         #[command(subcommand)]
         command: ComplianceCommand,
@@ -87,8 +93,57 @@ struct InitArgs {
     force: bool,
     #[arg(long)]
     production: bool,
+    #[arg(long, value_enum, default_value_t = InitProfile::LocalDev)]
+    profile: InitProfile,
     #[arg(long)]
     bind: Option<String>,
+    #[arg(long)]
+    otel_endpoint: Option<String>,
+    #[arg(long, value_enum)]
+    log_format: Option<CliLogFormat>,
+    #[arg(long, value_enum)]
+    event_format: Option<CliEventFormat>,
+    #[arg(long, value_enum)]
+    data_format: Option<CliDataFormat>,
+    #[arg(long)]
+    disable_sse: bool,
+    #[arg(long)]
+    tls_provider: Option<String>,
+    #[arg(long)]
+    tls_evidence: Option<String>,
+    #[arg(long)]
+    mtls: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum InitProfile {
+    LocalDev,
+    ProductionAiops,
+    CpuOnly,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum CliLogFormat {
+    Pretty,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum CliEventFormat {
+    Json,
+    Jsonl,
+    CloudEvents,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum CliDataFormat {
+    Json,
+    Jsonl,
+    ArrowJson,
 }
 
 #[derive(Debug, Subcommand)]
@@ -352,7 +407,13 @@ struct UsageChargebackArgs {
 #[derive(Debug, Subcommand)]
 enum DataCommand {
     Export(DataExportArgs),
+    Contracts(DataContractsArgs),
     VerifyEnvelope(DataVerifyEnvelopeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AiopsCommand {
+    Gaps,
 }
 
 #[derive(Debug, Subcommand)]
@@ -372,8 +433,53 @@ enum IntegrationCommand {
 struct DataExportArgs {
     #[arg(long, default_value_t = 24)]
     hours: i64,
+    #[arg(long, value_enum, default_value_t = DataDataset::All)]
+    dataset: DataDataset,
+    #[arg(long, value_enum, default_value_t = DataExportFormat::Json)]
+    format: DataExportFormat,
     #[arg(long)]
     envelope: bool,
+}
+
+#[derive(Debug, Args)]
+struct DataContractsArgs {
+    #[arg(long, value_enum)]
+    dataset: Option<DataContractDataset>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum DataDataset {
+    All,
+    Security,
+    Observability,
+    Usage,
+    User,
+    Finops,
+    Models,
+    Drift,
+    Audit,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum DataContractDataset {
+    Security,
+    Observability,
+    Usage,
+    User,
+    Finops,
+    Models,
+    Drift,
+    Audit,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum DataExportFormat {
+    Json,
+    Jsonl,
+    ArrowJson,
 }
 
 #[derive(Debug, Args)]
@@ -397,6 +503,7 @@ async fn main() -> Result<()> {
         Command::Audit { command } => audit_command(&config_path, command, cli.json).await,
         Command::Usage { command } => usage_command(&config_path, command, cli.json).await,
         Command::Data { command } => data_command(&config_path, command, cli.json).await,
+        Command::Aiops { command } => aiops_command(command, cli.json).await,
         Command::Compliance { command } => {
             compliance_command(&config_path, command, cli.json).await
         }
@@ -415,11 +522,36 @@ async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
     }
 
     let mut cfg = Config::default();
-    cfg.security.production = args.production;
+    apply_init_profile(&mut cfg, &args);
     if let Some(bind) = args.bind {
         cfg.server.host = bind;
         cfg.security.bind_external =
             cfg.server.host != "127.0.0.1" && cfg.server.host != "localhost";
+    }
+    if args.production {
+        cfg.security.production = true;
+    }
+    if let Some(endpoint) = args.otel_endpoint {
+        cfg.observability.exporter.endpoint = Some(endpoint);
+    }
+    if let Some(format) = args.log_format {
+        cfg.log.format = format.into();
+    }
+    if let Some(format) = args.event_format {
+        cfg.events.format = format.into();
+    }
+    if let Some(format) = args.data_format {
+        cfg.data_fabric.format = format.into();
+        cfg.data_fabric.enabled = true;
+    }
+    if args.disable_sse {
+        cfg.sse.enabled = false;
+    }
+    if args.tls_provider.is_some() || args.tls_evidence.is_some() || args.mtls {
+        cfg.security.tls_termination.enabled = true;
+        cfg.security.tls_termination.provider = args.tls_provider;
+        cfg.security.tls_termination.evidence = args.tls_evidence;
+        cfg.security.tls_termination.m_tls = args.mtls;
     }
 
     create_storage_dirs(&cfg.storage).await?;
@@ -429,6 +561,32 @@ async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
         as_json,
         &json!({ "config": path, "database": cfg.storage.db_path, "model_dir": cfg.storage.model_dir }),
     )
+}
+
+fn apply_init_profile(cfg: &mut Config, args: &InitArgs) {
+    match args.profile {
+        InitProfile::LocalDev => {
+            cfg.security.production = args.production;
+        }
+        InitProfile::CpuOnly => {
+            cfg.resources.cpu_only = true;
+            cfg.security.production = args.production;
+        }
+        InitProfile::ProductionAiops => {
+            cfg.security.production = true;
+            cfg.security.bind_external = true;
+            cfg.security.require_auth = true;
+            cfg.audit.monthly_reports = true;
+            cfg.audit.retention_days = 365;
+            cfg.observability.traces_enabled = true;
+            cfg.observability.metrics_enabled = true;
+            cfg.observability.logs_enabled = true;
+            cfg.log.format = LogFormat::Json;
+            cfg.events.format = EventFormat::Jsonl;
+            cfg.data_fabric.enabled = true;
+            cfg.data_fabric.format = DataFabricFormat::ArrowJson;
+        }
+    }
 }
 
 async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> Result<()> {
@@ -944,12 +1102,32 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
             let storage = init_storage(&cfg.storage).await?;
             let (from, to) = window(args.hours);
             if args.envelope {
+                anyhow::ensure!(
+                    matches!(args.dataset, DataDataset::All)
+                        && matches!(args.format, DataExportFormat::Json),
+                    "data export --envelope currently wraps the canonical all/json export"
+                );
                 let report = reporting::data_export_envelope(&storage, from, to).await?;
                 emit(as_json, &report)
             } else {
                 let report = reporting::data_export(&storage, from, to).await?;
-                emit(as_json, &report)
+                let output = format_data_export(report, args.dataset, args.format)?;
+                emit(as_json, &output)
             }
+        }
+        DataCommand::Contracts(args) => {
+            let contracts = if let Some(dataset) = args.dataset {
+                vec![contracts::contract_for(dataset.into())]
+            } else {
+                contracts::all_contracts()
+            };
+            emit(
+                as_json,
+                &json!({
+                    "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
+                    "contracts": contracts
+                }),
+            )
         }
         DataCommand::VerifyEnvelope(args) => {
             let envelope_bytes = fs::read(&args.path)
@@ -968,6 +1146,244 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
             emit(as_json, &output)
         }
     }
+}
+
+fn format_data_export(
+    report: reporting::DataExport,
+    dataset: DataDataset,
+    format: DataExportFormat,
+) -> Result<serde_json::Value> {
+    let rows = dataset_rows(&report, dataset)?;
+    let dataset_name = dataset.as_str();
+    let contract = dataset.contract_kind().map(contracts::contract_for);
+
+    match format {
+        DataExportFormat::Json if matches!(dataset, DataDataset::All) => {
+            Ok(serde_json::to_value(report)?)
+        }
+        DataExportFormat::Json => Ok(json!({
+            "format": "json",
+            "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
+            "dataset": dataset_name,
+            "from": report.from,
+            "to": report.to,
+            "report_summary": report.report_summary,
+            "rows": rows
+        })),
+        DataExportFormat::Jsonl => Ok(json!({
+            "format": "jsonl",
+            "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
+            "dataset": dataset_name,
+            "from": report.from,
+            "to": report.to,
+            "lines": rows.into_iter().map(|row| serde_json::to_string(&row)).collect::<Result<Vec<_>, _>>()?
+        })),
+        DataExportFormat::ArrowJson => Ok(json!({
+            "format": "arrow-json",
+            "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
+            "dataset": dataset_name,
+            "from": report.from,
+            "to": report.to,
+            "arrow_schema": contract.map(|contract| contract.arrow_schema).unwrap_or_else(|| json!({
+                "format": "arrow-json-schema",
+                "name": "rs_llmctl_all_v1",
+                "fields": []
+            })),
+            "rows": rows
+        })),
+    }
+}
+
+fn dataset_rows(
+    report: &reporting::DataExport,
+    dataset: DataDataset,
+) -> Result<Vec<serde_json::Value>> {
+    match dataset {
+        DataDataset::All => Ok(vec![serde_json::to_value(report)?]),
+        DataDataset::Security => Ok(report
+            .audit_events
+            .iter()
+            .map(|event| {
+                json!({
+                    "at": event.at,
+                    "kind": "audit",
+                    "actor": event.actor,
+                    "team": event.team,
+                    "resource": event.resource,
+                    "outcome": event.outcome,
+                    "request_id": event.request_id
+                })
+            })
+            .chain(report.quota_decisions.iter().map(|decision| {
+                json!({
+                    "at": decision.at,
+                    "kind": "quota-decision",
+                    "actor": decision.actor,
+                    "team": decision.team,
+                    "resource": decision.model,
+                    "outcome": if decision.allowed { "allowed" } else { "denied" },
+                    "request_id": decision.request_id
+                })
+            }))
+            .collect()),
+        DataDataset::Observability => Ok(report
+            .observation_events
+            .iter()
+            .map(|event| {
+                json!({
+                    "at": event.at,
+                    "kind": event.kind,
+                    "source": event.source,
+                    "model": event.model,
+                    "value": event.value,
+                    "unit": event.unit,
+                    "request_id": event.request_id
+                })
+            })
+            .collect()),
+        DataDataset::Usage => Ok(report
+            .usage_events
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?),
+        DataDataset::User => Ok(report
+            .usage_summary
+            .by_actor
+            .iter()
+            .map(|actor| {
+                let team = report
+                    .usage_events
+                    .iter()
+                    .find(|event| event.actor == actor.key)
+                    .map(|event| event.team.as_str())
+                    .unwrap_or("unknown");
+                json!({
+                    "actor": actor.key,
+                    "team": team,
+                    "request_count": actor.request_count,
+                    "input_tokens": actor.input_tokens,
+                    "output_tokens": actor.output_tokens,
+                    "total_tokens": actor.total_tokens
+                })
+            })
+            .collect()),
+        DataDataset::Finops => {
+            let mut rows = Vec::new();
+            rows.extend(report.usage_summary.by_team.iter().map(|team| {
+                json!({
+                    "team": team.key,
+                    "actor": null,
+                    "model": null,
+                    "request_count": team.request_count,
+                    "total_tokens": team.total_tokens,
+                    "total_latency_ms": team.total_latency_ms
+                })
+            }));
+            rows.extend(report.usage_summary.by_actor.iter().map(|actor| {
+                json!({
+                    "team": null,
+                    "actor": actor.key,
+                    "model": null,
+                    "request_count": actor.request_count,
+                    "total_tokens": actor.total_tokens,
+                    "total_latency_ms": actor.total_latency_ms
+                })
+            }));
+            rows.extend(report.usage_summary.by_model.iter().map(|model| {
+                json!({
+                    "team": null,
+                    "actor": null,
+                    "model": model.key,
+                    "request_count": model.request_count,
+                    "total_tokens": model.total_tokens,
+                    "total_latency_ms": model.total_latency_ms
+                })
+            }));
+            Ok(rows)
+        }
+        DataDataset::Models => Ok(report
+            .models
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?),
+        DataDataset::Drift => Ok(report
+            .observation_events
+            .iter()
+            .filter(|event| event.kind.contains("drift"))
+            .map(|event| {
+                json!({
+                    "at": event.at,
+                    "kind": event.kind,
+                    "model": event.model,
+                    "value": event.value,
+                    "unit": event.unit,
+                    "request_id": event.request_id
+                })
+            })
+            .collect()),
+        DataDataset::Audit => Ok(report
+            .audit_events
+            .iter()
+            .map(|event| {
+                json!({
+                    "at": event.at,
+                    "action": event.action,
+                    "actor": event.actor,
+                    "team": event.team,
+                    "resource": event.resource,
+                    "outcome": event.outcome,
+                    "request_id": event.request_id
+                })
+            })
+            .collect()),
+    }
+}
+
+async fn aiops_command(command: AiopsCommand, as_json: bool) -> Result<()> {
+    match command {
+        AiopsCommand::Gaps => emit(as_json, &aiops_gaps_report()),
+    }
+}
+
+fn aiops_gaps_report() -> serde_json::Value {
+    json!({
+        "status": "tracked",
+        "delivered": [
+            "typed production/local config profiles",
+            "SSE, log, event, OTel, and data-fabric config fields",
+            "schema-versioned contracts for security, observability, usage, user, finops, model, drift, and audit datasets",
+            "domain-filtered JSON, JSONL, and Arrow-schema JSON exports",
+            "CRA Article 14 active-control evidence and PCI DSS aligned reporting commands",
+            "OpenAI-compatible model and chat serving, local search, recommendations, quotas, and worker lifecycle controls"
+        ],
+        "gaps": [
+            {
+                "area": "data-fabric",
+                "gap": "native Arrow IPC and Parquet file writers are not bundled yet",
+                "next_control": "add an explicit arrow/parquet feature with golden-file compatibility tests"
+            },
+            {
+                "area": "model-quality",
+                "gap": "model eval suites, golden prompts, and baseline comparison history need first-class commands",
+                "next_control": "add llmctl eval run/list/report and persist results by model version"
+            },
+            {
+                "area": "lineage",
+                "gap": "prompt, dataset, embedding index, and model provenance are reported indirectly",
+                "next_control": "add lineage records tied to requests, RAG corpora, model manifests, and releases"
+            },
+            {
+                "area": "operations",
+                "gap": "SLOs, alert rules, and incident records are not yet generated from config",
+                "next_control": "add aiops slo plan and incident evidence envelopes"
+            },
+            {
+                "area": "governance",
+                "gap": "policy-as-code deployment gates and legal-hold retention overrides are not complete",
+                "next_control": "add signed policy bundles and retention/legal-hold scopes per dataset"
+            }
+        ]
+    })
 }
 
 async fn compliance_command(path: &Path, command: ComplianceCommand, as_json: bool) -> Result<()> {
@@ -1613,6 +2029,80 @@ impl From<SwapMode> for Mode {
         match mode {
             SwapMode::ColdSwap => Mode::ColdSwap,
             SwapMode::HotSwap => Mode::HotSwap,
+        }
+    }
+}
+
+impl From<CliLogFormat> for LogFormat {
+    fn from(format: CliLogFormat) -> Self {
+        match format {
+            CliLogFormat::Pretty => LogFormat::Pretty,
+            CliLogFormat::Json => LogFormat::Json,
+        }
+    }
+}
+
+impl From<CliEventFormat> for EventFormat {
+    fn from(format: CliEventFormat) -> Self {
+        match format {
+            CliEventFormat::Json => EventFormat::Json,
+            CliEventFormat::Jsonl => EventFormat::Jsonl,
+            CliEventFormat::CloudEvents => EventFormat::CloudEvents,
+        }
+    }
+}
+
+impl From<CliDataFormat> for DataFabricFormat {
+    fn from(format: CliDataFormat) -> Self {
+        match format {
+            CliDataFormat::Json => DataFabricFormat::Json,
+            CliDataFormat::Jsonl => DataFabricFormat::Jsonl,
+            CliDataFormat::ArrowJson => DataFabricFormat::ArrowJson,
+        }
+    }
+}
+
+impl DataDataset {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Security => "security",
+            Self::Observability => "observability",
+            Self::Usage => "usage",
+            Self::User => "user",
+            Self::Finops => "finops",
+            Self::Models => "models",
+            Self::Drift => "drift",
+            Self::Audit => "audit",
+        }
+    }
+
+    fn contract_kind(self) -> Option<DatasetKind> {
+        match self {
+            Self::All => None,
+            Self::Security => Some(DatasetKind::Security),
+            Self::Observability => Some(DatasetKind::Observability),
+            Self::Usage => Some(DatasetKind::Usage),
+            Self::User => Some(DatasetKind::User),
+            Self::Finops => Some(DatasetKind::Finops),
+            Self::Models => Some(DatasetKind::Models),
+            Self::Drift => Some(DatasetKind::Drift),
+            Self::Audit => Some(DatasetKind::Audit),
+        }
+    }
+}
+
+impl From<DataContractDataset> for DatasetKind {
+    fn from(dataset: DataContractDataset) -> Self {
+        match dataset {
+            DataContractDataset::Security => DatasetKind::Security,
+            DataContractDataset::Observability => DatasetKind::Observability,
+            DataContractDataset::Usage => DatasetKind::Usage,
+            DataContractDataset::User => DatasetKind::User,
+            DataContractDataset::Finops => DatasetKind::Finops,
+            DataContractDataset::Models => DatasetKind::Models,
+            DataContractDataset::Drift => DatasetKind::Drift,
+            DataContractDataset::Audit => DatasetKind::Audit,
         }
     }
 }

@@ -16,6 +16,14 @@ The config exposes an OTel-oriented exporter plan:
 Runtime events include audit rows, usage rows, quota decisions, model inventory,
 and resource observations.
 
+The production config also has explicit controls for the local event surface:
+
+- `sse.enabled`, `sse.heartbeat-seconds`, and `sse.max-stream-seconds`;
+- `log.format`, normally `json` in production;
+- `events.format`, one of `json`, `jsonl`, or `cloud-events`;
+- `events.schema-version`;
+- `data-fabric.enabled`, `data-fabric.format`, and dataset switches.
+
 Because CRA Article 14 is treated as active, production external-bind configs
 must keep traces, metrics, and logs enabled and configure an OTLP exporter
 endpoint. `security check` rejects production external bind without that
@@ -65,3 +73,17 @@ llmctl --config /etc/rs-llmctl/config.toml data verify-envelope retention-plan-e
 
 Retention planning is dry-run by default. Retention pruning requires the
 explicit `audit retention apply --yes` command.
+
+## Data Fabric Exports
+
+Data contracts and filtered exports are available through `llmctl data`:
+
+```bash
+llmctl data contracts
+llmctl data export --dataset security --format json
+llmctl data export --dataset observability --format jsonl
+llmctl data export --dataset finops --format arrow-json
+```
+
+Use `docs/data-contracts.md` as the operator reference for schemas and export
+formats.

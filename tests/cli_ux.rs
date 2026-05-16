@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use rs_llmctl::audit::{AuditEvent, UsageEvent};
+use rs_llmctl::audit::{AuditEvent, ObservationEvent, UsageEvent};
 use rs_llmctl::storage::Storage;
 use serde_json::json;
 use serde_json::Value;
@@ -120,6 +120,20 @@ fn usage_event(
         output_tokens,
         latency_ms,
         status: "ok".to_string(),
+    }
+}
+
+fn observation_event(kind: &str, model: &str, value: f64) -> ObservationEvent {
+    ObservationEvent {
+        id: Uuid::new_v4(),
+        request_id: Some(Uuid::new_v4()),
+        at: Utc::now(),
+        kind: kind.to_string(),
+        model: model.to_string(),
+        source: "test".to_string(),
+        value,
+        unit: "ratio".to_string(),
+        attributes_json: json!({ "source": "cli_ux" }),
     }
 }
 
@@ -1878,6 +1892,135 @@ fn compliance_evidence_reports_cra_pci_and_release_integrity() {
         evidence["release_integrity"]["signing"],
         "packaging/sign-release.sh"
     );
+}
+
+#[test]
+fn init_production_aiops_profile_writes_config_wizard_settings() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+
+    let mut init = llmctl();
+    init.arg("--config")
+        .arg(&config)
+        .arg("init")
+        .arg("--force")
+        .arg("--profile")
+        .arg("production-aiops")
+        .arg("--bind")
+        .arg("0.0.0.0")
+        .arg("--otel-endpoint")
+        .arg("https://otel.example.test/v1/traces")
+        .arg("--log-format")
+        .arg("json")
+        .arg("--event-format")
+        .arg("cloud-events")
+        .arg("--data-format")
+        .arg("arrow-json")
+        .arg("--tls-provider")
+        .arg("envoy-edge")
+        .arg("--tls-evidence")
+        .arg("change-123")
+        .arg("--mtls");
+    assert_success_json(init);
+
+    let body = read_config(&config);
+    assert!(body.contains("production = true"));
+    assert!(body.contains("require-auth = true"));
+    assert!(body.contains("bind-external = true"));
+    assert!(body.contains("endpoint = \"https://otel.example.test/v1/traces\""));
+    assert!(body.contains("[sse]"));
+    assert!(body.contains("[log]"));
+    assert!(body.contains("format = \"json\""));
+    assert!(body.contains("[events]"));
+    assert!(body.contains("format = \"cloud-events\""));
+    assert!(body.contains("[data-fabric]"));
+    assert!(body.contains("enabled = true"));
+    assert!(body.contains("provider = \"envoy-edge\""));
+    assert!(body.contains("m-tls = true"));
+}
+
+#[test]
+fn data_contracts_report_schema_versions_for_selected_dataset() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut contracts = llmctl();
+    contracts
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("contracts")
+        .arg("--dataset")
+        .arg("finops");
+    let output = assert_success_json(contracts);
+
+    assert_eq!(output["schema_version"], 1);
+    assert_eq!(output["contracts"].as_array().expect("contracts").len(), 1);
+    assert_eq!(output["contracts"][0]["dataset"], "finops");
+    assert_eq!(output["contracts"][0]["schema_version"], 1);
+    assert_eq!(
+        output["contracts"][0]["arrow_schema"]["format"],
+        "arrow-json-schema"
+    );
+}
+
+#[tokio::test]
+async fn data_export_filters_finops_as_arrow_json() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let db_path = dir.path().join("llmctl.db");
+    let storage = Storage::connect(&db_path).await.expect("connect storage");
+    storage
+        .insert_usage_event(&usage_event("qwen", "alice", "platform", 10, 15, 120))
+        .await
+        .expect("insert usage");
+    storage
+        .insert_observation_event(&observation_event("model.drift.embedding", "qwen", 0.14))
+        .await
+        .expect("insert observation");
+
+    let mut export = llmctl();
+    export
+        .arg("--config")
+        .arg(&config)
+        .arg("data")
+        .arg("export")
+        .arg("--hours")
+        .arg("1")
+        .arg("--dataset")
+        .arg("finops")
+        .arg("--format")
+        .arg("arrow-json");
+    let output = assert_success_json(export);
+
+    assert_eq!(output["format"], "arrow-json");
+    assert_eq!(output["dataset"], "finops");
+    assert_eq!(output["schema_version"], 1);
+    assert_eq!(output["arrow_schema"]["name"], "rs_llmctl_finops_v1");
+    assert!(output["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .any(|row| row["team"] == "platform" && row["total_tokens"] == 25));
+}
+
+#[test]
+fn aiops_gaps_reports_remaining_platform_capabilities() {
+    let mut gaps = llmctl();
+    gaps.arg("aiops").arg("gaps");
+    let output = assert_success_json(gaps);
+
+    assert_eq!(output["status"], "tracked");
+    assert!(output["delivered"]
+        .as_array()
+        .expect("delivered")
+        .iter()
+        .any(|item| item.as_str().unwrap_or("").contains("data-fabric")));
+    assert!(output["gaps"]
+        .as_array()
+        .expect("gaps")
+        .iter()
+        .any(|item| item["area"] == "model-quality"));
 }
 
 #[test]
