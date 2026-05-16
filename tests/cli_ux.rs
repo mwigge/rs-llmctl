@@ -212,3 +212,85 @@ sha256 = "{}"
     assert!(saved.contains("alias = \"chat\""));
     assert!(saved.contains("alias = \"review\""));
 }
+
+#[test]
+fn quota_status_and_report_are_scriptable_json() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut set = llmctl();
+    set.arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("set")
+        .arg("--subject")
+        .arg("alice")
+        .arg("--team")
+        .arg("platform")
+        .arg("--requests-per-minute")
+        .arg("2")
+        .arg("--tokens-per-day")
+        .arg("100")
+        .arg("--model")
+        .arg("llama");
+    assert_success_json(set);
+
+    let mut status = llmctl();
+    status
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("status")
+        .arg("--subject")
+        .arg("alice")
+        .arg("--model")
+        .arg("llama");
+    let status = assert_success_json(status);
+    assert_eq!(status["subject"], "alice");
+    assert_eq!(status["team"], "platform");
+    assert_eq!(status["model"], "llama");
+    assert_eq!(status["allowed"], true);
+    assert_eq!(status["usage"]["requests_last_minute"], 0);
+    assert_eq!(status["usage"]["tokens_today"], 0);
+    assert_eq!(status["policy"]["requests_per_minute"], 2);
+
+    let mut report = llmctl();
+    report
+        .arg("--config")
+        .arg(&config)
+        .arg("quota")
+        .arg("report")
+        .arg("--hours")
+        .arg("1");
+    let report = assert_success_json(report);
+    assert_eq!(report["hours"], 1);
+    assert_eq!(report["policies"].as_array().expect("policies").len(), 1);
+    assert!(report["decisions"].is_array());
+    assert!(report["usage_summary"].is_object());
+}
+
+#[test]
+fn security_check_and_observe_plan_are_top_level_json_commands() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut security = llmctl();
+    security
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("check");
+    let security = assert_success_json(security);
+    assert_eq!(security["status"], "ok");
+    assert_eq!(security["require_auth"], false);
+    assert_eq!(security["api_keys"], 0);
+
+    let mut plan = llmctl();
+    plan.arg("--config").arg(&config).arg("observe").arg("plan");
+    let plan = assert_success_json(plan);
+    assert_eq!(plan["service_name"], "rs-llmctl");
+    assert_eq!(plan["traces_enabled"], true);
+    assert_eq!(plan["metrics_enabled"], true);
+    assert_eq!(plan["logs_enabled"], true);
+    assert_eq!(plan["exporter"]["type"], "none");
+}

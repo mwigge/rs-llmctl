@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rs_llmctl::config::{self, StorageConfig};
 use rs_llmctl::storage::Storage;
+use rs_llmctl::worker::StartupPlan;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
@@ -27,11 +28,24 @@ async fn main() -> Result<()> {
 
     config::validate_production_security(&cfg)?;
     init_storage(&cfg.storage).await?;
+    let worker_startup_plan = StartupPlan::from_config(&cfg);
+    for planned in &worker_startup_plan.workers {
+        tracing::debug!(
+            worker = planned.worker.id.as_str(),
+            model = planned.worker.model.alias.as_str(),
+            upstream = %planned.worker.upstream(),
+            program = %planned.command.program.display(),
+            args = ?planned.command.args,
+            env = ?planned.command.env,
+            "planned worker command"
+        );
+    }
 
     tracing::info!(
         service = rs_llmctl::SERVICE_NAME,
         config = %config_path.display(),
         bind = %format!("{}:{}", cfg.server.host, cfg.server.port),
+        workers = worker_startup_plan.workers.len(),
         "starting daemon"
     );
 

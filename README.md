@@ -28,16 +28,53 @@ headers such as authorization, API key, token, or secret headers must use an
 Changes are expected to be test-driven: add or update the focused test first,
 watch it fail for the intended reason, implement the smallest change, then run
 the relevant gate locally before opening a review. CI enforces the baseline Rust
-gates:
+gates and verifies that production binaries compile in release mode:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
+cargo build --release --bins
 ```
 
 For narrow documentation or release changes, add focused tests that pin the
 release surface and still run the full CI gate before merging.
+
+## Release Package Readiness
+
+The package publishes two binary entry points from `Cargo.toml`:
+
+- `llmctl`, built from `src/bin/llmctl.rs`, is the operator CLI.
+- `llmctld`, built from `src/bin/llmctld.rs`, is the production daemon.
+
+Before cutting an archive or installer, run `cargo build --release --bins` and
+package the resulting `target/release/llmctl` and `target/release/llmctld`
+binaries together with this README, the release notes, license metadata, and an
+example production config. Package checks should fail if either binary name
+changes because downstream automation, systemd units, and air-gapped install
+runbooks address those names directly.
+
+Offline deployments should ship an offline install manifest next to the staged
+model files. Operators import it with:
+
+```bash
+llmctl model import-manifest ./manifest.toml
+```
+
+Minimal manifest shape:
+
+```toml
+[[models]]
+alias = "qwen"
+path = "models/qwen.gguf"
+role = "chat"
+weight = 1
+sha256 = "hex-encoded-sha256"
+```
+
+Relative paths resolve from the manifest directory. Include `sha256` whenever a
+bundle is copied across trust boundaries so the install rejects unexpected model
+bytes before registration.
 
 ## Enterprise Security Posture
 
@@ -64,6 +101,14 @@ downloads: operators can pre-stage approved model bundles and register local
 files with `llmctl model install`. Runtime planning defaults to an 80% resource
 budget, with CPU-only and GPU-aware detection available through the resource
 configuration and observation commands.
+
+Enterprise runtime controls belong in config, not release packaging scripts:
+`security.require-auth = true` for production, `security.bind-external = true`
+only when API keys are configured, quota policies for every served subject,
+`audit.retention-days` and report output for compliance review, and
+`observability.exporter.endpoint` pointed at the approved collector. Secrets and
+collector headers should use `env:` references so archives and manifests never
+carry plaintext runtime credentials.
 
 The serving API is OpenAI-compatible for enterprise clients, including Agentic
 QE (AQE), by pointing `OPENAI_BASE_URL` at `http://host:8765/v1`. AQE/OpenAI

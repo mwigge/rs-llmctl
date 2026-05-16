@@ -12,8 +12,27 @@ fn ci_workflow_enforces_core_rust_gates() {
         "cargo fmt --all -- --check",
         "cargo clippy --all-targets --all-features -- -D warnings",
         "cargo test --all-targets --all-features",
+        "cargo build --release --bins",
     ] {
         assert!(workflow.contains(gate), "CI workflow should run `{gate}`");
+    }
+}
+
+#[test]
+fn package_manifest_publishes_expected_binaries() {
+    let manifest = read("Cargo.toml");
+
+    for expected in [
+        r#"name = "rs-llmctl""#,
+        r#"name = "llmctl""#,
+        r#"path = "src/bin/llmctl.rs""#,
+        r#"name = "llmctld""#,
+        r#"path = "src/bin/llmctld.rs""#,
+    ] {
+        assert!(
+            manifest.contains(expected),
+            "Cargo.toml should declare `{expected}`"
+        );
     }
 }
 
@@ -26,10 +45,23 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
         "cargo fmt",
         "cargo clippy",
         "cargo test",
+        "cargo build --release",
+        "target/release/llmctl",
+        "target/release/llmctld",
         "pci dss",
         "external bind",
         "offline install",
+        "offline install manifest",
+        "model import-manifest",
+        "[[models]]",
+        "sha256",
         "resource budget",
+        "quota",
+        "audit.retention-days",
+        "observability.exporter.endpoint",
+        "security.require-auth",
+        "security.bind-external",
+        "env:",
         "audit",
         "usage report",
         "aqe",

@@ -1,4 +1,4 @@
-use crate::config::{ModelConfig, ResourceConfig, ServerConfig};
+use crate::config::{Config, ModelConfig, ResourceConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -66,7 +66,7 @@ impl WorkerBackend {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub id: WorkerId,
     pub model: ModelConfig,
@@ -99,11 +99,49 @@ impl WorkerSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedWorker {
+    pub worker: WorkerSpec,
+    pub command: CommandSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupPlan {
+    pub workers: Vec<PlannedWorker>,
+}
+
+impl StartupPlan {
+    pub fn from_config(cfg: &Config) -> Self {
+        let workers = cfg
+            .models
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, model)| {
+                let port_offset = u16::try_from(index).unwrap_or(u16::MAX);
+                let worker = WorkerSpec::from_config(
+                    model.alias.clone(),
+                    model,
+                    &cfg.server,
+                    &cfg.resources,
+                    port_offset,
+                );
+                let command =
+                    LlamaServerCommand::new(cfg.server.llama_server.clone(), worker.clone())
+                        .build();
+                PlannedWorker { worker, command }
+            })
+            .collect();
+
+        Self { workers }
+    }
 }
 
 impl CommandSpec {
@@ -354,6 +392,92 @@ mod tests {
                 LifecycleStep::transition(WorkerId::new("old"), WorkerState::Stopping),
                 LifecycleStep::transition(WorkerId::new("old"), WorkerState::Stopped),
             ]
+        );
+    }
+
+    #[test]
+    fn startup_plan_builds_cpu_only_commands_for_configured_models() {
+        let cfg = crate::config::Config {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                worker_base_port: 19000,
+                llama_server: "/usr/local/bin/llama-server".to_string(),
+                context_size: 4096,
+                ..ServerConfig::default()
+            },
+            resources: ResourceConfig {
+                cpu_only: true,
+                gpu_vendor: "nvidia".to_string(),
+                ..ResourceConfig::default()
+            },
+            models: vec![
+                model("chat", "/models/chat.gguf"),
+                model("coder", "/models/coder.gguf"),
+            ],
+            ..Default::default()
+        };
+
+        let plan = StartupPlan::from_config(&cfg);
+
+        assert_eq!(plan.workers.len(), 2);
+        assert_eq!(plan.workers[0].worker.id, WorkerId::new("chat"));
+        assert_eq!(plan.workers[0].worker.port, 19000);
+        assert_eq!(plan.workers[0].worker.backend, WorkerBackend::Cpu);
+        assert_eq!(
+            plan.workers[0].command.program,
+            PathBuf::from("/usr/local/bin/llama-server")
+        );
+        assert_eq!(
+            plan.workers[0].command.args,
+            vec![
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "19000",
+                "--model",
+                "/models/chat.gguf",
+                "--ctx-size",
+                "4096",
+                "--n-gpu-layers",
+                "0",
+            ]
+        );
+        assert!(plan.workers[0].command.env.is_empty());
+        assert_eq!(plan.workers[1].worker.id, WorkerId::new("coder"));
+        assert_eq!(plan.workers[1].worker.port, 19001);
+    }
+
+    #[test]
+    fn startup_plan_selects_gpu_backend_commands_from_resources() {
+        let cfg = crate::config::Config {
+            server: ServerConfig {
+                worker_base_port: 19100,
+                llama_server: "llama-server".to_string(),
+                ..ServerConfig::default()
+            },
+            resources: ResourceConfig {
+                cpu_only: false,
+                gpu_vendor: "nvidia".to_string(),
+                ..ResourceConfig::default()
+            },
+            models: vec![model("chat", "/models/chat.gguf")],
+            ..Default::default()
+        };
+
+        let plan = StartupPlan::from_config(&cfg);
+
+        assert_eq!(plan.workers.len(), 1);
+        assert_eq!(
+            plan.workers[0].worker.backend,
+            WorkerBackend::Nvidia { gpu_layers: 99 }
+        );
+        assert_eq!(
+            plan.workers[0].command.env,
+            vec![("GGML_CUDA_VISIBLE_DEVICES".into(), "0".into())]
+        );
+        assert_eq!(
+            plan.workers[0].command.args.last().map(String::as_str),
+            Some("99")
         );
     }
 }

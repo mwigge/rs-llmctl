@@ -3,8 +3,35 @@ use crate::storage::{ModelInventoryRecord, QuotaDecisionRecord, Storage};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+const REPORT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportKind {
+    MonthlyAudit,
+    PerRequestAudit,
+    PerRequestData,
+    DataExport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportMetadata {
+    pub report_kind: ReportKind,
+    pub generated_at: DateTime<Utc>,
+    pub schema_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportEnvelope<T> {
+    pub metadata: ReportMetadata,
+    pub sha256: String,
+    pub payload: T,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonthlyAuditReport {
@@ -12,7 +39,6 @@ pub struct MonthlyAuditReport {
     pub month: u32,
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
-    pub generated_at: DateTime<Utc>,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub usage_summary: UsageSummary,
@@ -24,7 +50,6 @@ pub struct MonthlyAuditReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerRequestAuditReport {
     pub request_id: Uuid,
-    pub generated_at: DateTime<Utc>,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
@@ -35,7 +60,6 @@ pub struct PerRequestAuditReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerRequestDataReport {
     pub request_id: Uuid,
-    pub generated_at: DateTime<Utc>,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
@@ -71,7 +95,6 @@ pub struct UsageBreakdown {
 pub struct DataExport {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
-    pub generated_at: DateTime<Utc>,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub usage_summary: UsageSummary,
@@ -98,7 +121,6 @@ pub async fn monthly_audit_report(
         month,
         from,
         to,
-        generated_at: Utc::now(),
         audit_events,
         usage_events,
         usage_summary,
@@ -115,7 +137,6 @@ pub async fn per_request_audit_report(
     let usage_events = storage.usage_events_for_request(request_id).await?;
     Ok(PerRequestAuditReport {
         request_id,
-        generated_at: Utc::now(),
         audit_events: storage.audit_events_for_request(request_id).await?,
         usage_summary: summarize_usage(&usage_events),
         usage_events,
@@ -131,7 +152,6 @@ pub async fn per_request_data_report(
     let usage_events = storage.usage_events_for_request(request_id).await?;
     Ok(PerRequestDataReport {
         request_id,
-        generated_at: Utc::now(),
         audit_events: storage.audit_events_for_request(request_id).await?,
         usage_summary: summarize_usage(&usage_events),
         usage_events,
@@ -158,7 +178,6 @@ pub async fn data_export(
     Ok(DataExport {
         from,
         to,
-        generated_at: Utc::now(),
         audit_events: storage.audit_events_between(from, to).await?,
         usage_summary: summarize_usage(&usage_events),
         usage_events,
@@ -166,6 +185,63 @@ pub async fn data_export(
         quota_decisions: storage.quota_decisions_between(from, to).await?,
         models: storage.list_models().await?,
     })
+}
+
+pub async fn monthly_audit_report_envelope(
+    storage: &Storage,
+    year: i32,
+    month: u32,
+) -> Result<ReportEnvelope<MonthlyAuditReport>> {
+    let report = monthly_audit_report(storage, year, month).await?;
+    report_envelope(ReportKind::MonthlyAudit, report)
+}
+
+pub async fn per_request_audit_report_envelope(
+    storage: &Storage,
+    request_id: Uuid,
+) -> Result<ReportEnvelope<PerRequestAuditReport>> {
+    let report = per_request_audit_report(storage, request_id).await?;
+    report_envelope(ReportKind::PerRequestAudit, report)
+}
+
+pub async fn per_request_data_report_envelope(
+    storage: &Storage,
+    request_id: Uuid,
+) -> Result<ReportEnvelope<PerRequestDataReport>> {
+    let report = per_request_data_report(storage, request_id).await?;
+    report_envelope(ReportKind::PerRequestData, report)
+}
+
+pub async fn data_export_envelope(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<ReportEnvelope<DataExport>> {
+    let export = data_export(storage, from, to).await?;
+    report_envelope(ReportKind::DataExport, export)
+}
+
+pub fn report_envelope<T>(report_kind: ReportKind, payload: T) -> Result<ReportEnvelope<T>>
+where
+    T: Serialize,
+{
+    report_envelope_at(report_kind, payload, Utc::now())
+}
+
+pub fn canonical_sha256<T>(payload: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    let canonical = canonical_json(payload)?;
+    Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
+}
+
+pub fn canonical_json<T>(payload: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    let value = serde_json::to_value(payload)?;
+    Ok(serde_json::to_string(&canonicalize_value(value))?)
 }
 
 pub fn summarize_usage(events: &[UsageEvent]) -> UsageSummary {
@@ -263,13 +339,48 @@ fn average(total: u64, count: u64) -> Option<f64> {
     }
 }
 
+fn report_envelope_at<T>(
+    report_kind: ReportKind,
+    payload: T,
+    generated_at: DateTime<Utc>,
+) -> Result<ReportEnvelope<T>>
+where
+    T: Serialize,
+{
+    Ok(ReportEnvelope {
+        metadata: ReportMetadata {
+            report_kind,
+            generated_at,
+            schema_version: REPORT_SCHEMA_VERSION,
+        },
+        sha256: canonical_sha256(&payload)?,
+        payload,
+    })
+}
+
+fn canonicalize_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),
+        Value::Object(values) => {
+            let mut sorted = Map::new();
+            let mut entries: Vec<_> = values.into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                sorted.insert(key, canonicalize_value(value));
+            }
+            Value::Object(sorted)
+        }
+        scalar => scalar,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audit::{AuditEvent, ObservationEvent, UsageEvent};
     use crate::storage::{ModelInventoryRecord, QuotaDecisionRecord};
     use chrono::TimeZone;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn summarizes_usage_by_total_model_team_and_actor() {
@@ -299,6 +410,58 @@ mod tests {
         assert_eq!(from, Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap());
         assert_eq!(to, Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap());
         assert!(month_bounds(2026, 13).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_json_hash_is_stable_for_object_key_order() -> Result<()> {
+        let left: Value = serde_json::from_str(r#"{"b":2,"a":{"d":4,"c":3}}"#)?;
+        let right: Value = serde_json::from_str(r#"{"a":{"c":3,"d":4},"b":2}"#)?;
+
+        assert_eq!(canonical_json(&left)?, canonical_json(&right)?);
+        assert_eq!(canonical_sha256(&left)?, canonical_sha256(&right)?);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_json_hash_changes_when_payload_changes() -> Result<()> {
+        let original = json!({"request_count": 1, "status": "ok"});
+        let changed = json!({"request_count": 2, "status": "ok"});
+
+        assert_ne!(canonical_sha256(&original)?, canonical_sha256(&changed)?);
+        Ok(())
+    }
+
+    #[test]
+    fn report_envelope_hashes_payload_and_keeps_generated_metadata() -> Result<()> {
+        let generated_at = Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap();
+        let payload = json!({"month": 5, "year": 2026});
+
+        let envelope = report_envelope_at(ReportKind::MonthlyAudit, payload.clone(), generated_at)?;
+
+        assert_eq!(envelope.metadata.report_kind, ReportKind::MonthlyAudit);
+        assert_eq!(envelope.metadata.generated_at, generated_at);
+        assert_eq!(envelope.metadata.schema_version, 1);
+        assert_eq!(envelope.sha256, canonical_sha256(&payload)?);
+        Ok(())
+    }
+
+    #[test]
+    fn report_envelope_hash_is_stable_across_generation_times() -> Result<()> {
+        let payload = json!({"request_id": "018f9c40-1a2b-7320-bc4f-111111111111"});
+        let first = report_envelope_at(
+            ReportKind::PerRequestData,
+            payload.clone(),
+            Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap(),
+        )?;
+        let second = report_envelope_at(
+            ReportKind::PerRequestData,
+            payload,
+            Utc.with_ymd_and_hms(2026, 5, 16, 13, 0, 0).unwrap(),
+        )?;
+
+        assert_ne!(first.metadata.generated_at, second.metadata.generated_at);
+        assert_eq!(first.sha256, second.sha256);
         Ok(())
     }
 
@@ -367,6 +530,17 @@ mod tests {
         assert_eq!(report.observations.len(), 1);
         assert_eq!(report.models.len(), 1);
 
+        let report_envelope =
+            monthly_audit_report_envelope(&storage, now.year(), now.month()).await?;
+        assert_eq!(
+            report_envelope.metadata.report_kind,
+            ReportKind::MonthlyAudit
+        );
+        assert_eq!(
+            report_envelope.sha256,
+            canonical_sha256(&report_envelope.payload)?
+        );
+
         let request_report = per_request_audit_report(&storage, request_id).await?;
         assert_eq!(request_report.audit_events.len(), 1);
         assert_eq!(request_report.usage_events.len(), 1);
@@ -374,10 +548,30 @@ mod tests {
         assert_eq!(request_report.quota_decisions.len(), 1);
         assert_eq!(request_report.observations.len(), 1);
 
+        let request_envelope = per_request_audit_report_envelope(&storage, request_id).await?;
+        assert_eq!(
+            request_envelope.metadata.report_kind,
+            ReportKind::PerRequestAudit
+        );
+        assert_eq!(
+            request_envelope.sha256,
+            canonical_sha256(&request_envelope.payload)?
+        );
+
         let data_report = per_request_data_report(&storage, request_id).await?;
         assert_eq!(data_report.request_id, request_id);
         assert_eq!(data_report.usage_summary.average_latency_ms, Some(100.0));
         assert_eq!(data_report.observations[0].request_id, Some(request_id));
+
+        let data_report_envelope = per_request_data_report_envelope(&storage, request_id).await?;
+        assert_eq!(
+            data_report_envelope.metadata.report_kind,
+            ReportKind::PerRequestData
+        );
+        assert_eq!(
+            data_report_envelope.sha256,
+            canonical_sha256(&data_report_envelope.payload)?
+        );
 
         let (from, to) = current_month_bounds()?;
         let export = data_export(&storage, from, to).await?;
@@ -386,6 +580,13 @@ mod tests {
         assert_eq!(export.usage_summary.request_count, 1);
         assert_eq!(export.observation_events.len(), 1);
         assert_eq!(export.quota_decisions.len(), 1);
+
+        let export_envelope = data_export_envelope(&storage, from, to).await?;
+        assert_eq!(export_envelope.metadata.report_kind, ReportKind::DataExport);
+        assert_eq!(
+            export_envelope.sha256,
+            canonical_sha256(&export_envelope.payload)?
+        );
         Ok(())
     }
 

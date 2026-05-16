@@ -32,7 +32,13 @@ Development follows TDD for release-owned surfaces: write focused tests first,
 implement the smallest passing change, then run `cargo fmt`, `cargo clippy`,
 and `cargo test`. The minimal CI gate mirrors those local checks with
 `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
-and `cargo test --all-targets --all-features`.
+`cargo test --all-targets --all-features`, and `cargo build --release --bins`.
+
+Release packaging keeps the binary names stable. `Cargo.toml` declares
+`llmctl` for the operator CLI and `llmctld` for daemon startup, and release
+artifacts are expected to include `target/release/llmctl` and
+`target/release/llmctld`. CI should block changes that break a release build or
+rename those entry points without an explicit migration plan.
 
 The enterprise security baseline is PCI DSS v4.0.1-aligned. Production service
 exposure requires authenticated external bind, scoped API keys, quota policy,
@@ -41,6 +47,29 @@ Offline install remains a first-class deployment path through local model
 registration and bundle-oriented operations, while AQE/OpenAI endpoint usage is
 supported through `OPENAI_BASE_URL=http://host:8765/v1` and recorded in audit
 and usage reporting.
+
+Offline package runbooks should prefer an offline install manifest for
+air-gapped sites:
+
+```toml
+[[models]]
+alias = "qwen"
+path = "models/qwen.gguf"
+role = "chat"
+weight = 1
+sha256 = "hex-encoded-sha256"
+```
+
+Operators register the bundle with `llmctl model import-manifest
+./manifest.toml`. Relative model paths resolve from the manifest directory, and
+`sha256` pins the bytes shipped in the approved bundle.
+
+Enterprise runtime controls are release-blocking documentation requirements:
+`security.require-auth`, `security.bind-external`, quota policy, resource budget
+limits, `audit.retention-days`, usage report retention, and
+`observability.exporter.endpoint` must be documented for production operators.
+Runtime secrets should be represented as `env:` references so offline manifests,
+archives, and config examples do not embed credentials.
 
 ## CLI Contract
 

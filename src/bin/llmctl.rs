@@ -4,6 +4,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{self, Config, Mode, ModelConfig, QuotaConfig, StorageConfig};
 use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
+use rs_llmctl::observability::{Exporter, ObservabilityPlan};
+use rs_llmctl::quota::{self, Principal};
 use rs_llmctl::reporting;
 use rs_llmctl::storage::Storage;
 use serde::Serialize;
@@ -41,6 +43,10 @@ enum Command {
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
+    },
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommand,
     },
     Observe {
         #[command(subcommand)]
@@ -126,6 +132,8 @@ struct ModelImportManifestArgs {
 #[derive(Debug, Subcommand)]
 enum QuotaCommand {
     Set(QuotaSetArgs),
+    Status(QuotaStatusArgs),
+    Report(ObserveWindowArgs),
     List,
 }
 
@@ -145,9 +153,25 @@ struct QuotaSetArgs {
     allowed_models: Vec<String>,
 }
 
+#[derive(Debug, Args)]
+struct QuotaStatusArgs {
+    #[arg(long)]
+    subject: String,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityCommand {
+    Check,
+}
+
 #[derive(Debug, Subcommand)]
 enum ObserveCommand {
     Snapshot,
+    Plan,
     Drift(ObserveWindowArgs),
     Usage(ObserveWindowArgs),
     Show(ObserveShowArgs),
@@ -230,6 +254,7 @@ async fn main() -> Result<()> {
         Command::Model { command } => model_command(&config_path, command, cli.json).await,
         Command::Swap { command } => swap_command(&config_path, command, cli.json).await,
         Command::Quota { command } => quota_command(&config_path, command, cli.json).await,
+        Command::Security { command } => security_command(&config_path, command, cli.json).await,
         Command::Observe { command } => observe_command(&config_path, command, cli.json).await,
         Command::Audit { command } => audit_command(&config_path, command, cli.json).await,
         Command::Usage { command } => usage_command(&config_path, command, cli.json).await,
@@ -380,15 +405,90 @@ async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Res
             config::save(path, &cfg).await?;
             emit(as_json, &json!({ "status": "set", "quotas": cfg.quotas }))
         }
+        QuotaCommand::Status(args) => {
+            let storage = init_storage(&cfg.storage).await?;
+            let principal = quota_status_principal(&cfg.quotas, &args);
+            let policy = matching_quota(&cfg.quotas, &principal);
+            let subject_scoped = policy.is_some_and(|policy| policy.subject == principal.subject);
+            let decision =
+                quota::check_quota(&storage, &cfg.quotas, &principal, &args.model).await?;
+            let now = Utc::now();
+            let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let requests_last_minute = storage
+                .allowed_quota_decision_count(
+                    &principal,
+                    subject_scoped,
+                    now - Duration::minutes(1),
+                    now,
+                )
+                .await?;
+            let tokens_today = storage
+                .usage_tokens_total(&principal, subject_scoped, day_start, now)
+                .await?;
+
+            emit(
+                as_json,
+                &json!({
+                    "subject": principal.subject,
+                    "team": principal.team,
+                    "model": args.model,
+                    "allowed": decision.allowed,
+                    "reason": decision.reason,
+                    "policy": policy,
+                    "usage": {
+                        "requests_last_minute": requests_last_minute,
+                        "tokens_today": tokens_today
+                    }
+                }),
+            )
+        }
+        QuotaCommand::Report(args) => {
+            let storage = init_storage(&cfg.storage).await?;
+            let (from, to) = window(args.hours);
+            let usage_summary = reporting::usage_summary(&storage, from, to).await?;
+            let decisions = storage.quota_decisions_between(from, to).await?;
+            emit(
+                as_json,
+                &json!({
+                    "hours": args.hours,
+                    "from": from,
+                    "to": to,
+                    "generated_at": Utc::now(),
+                    "policies": cfg.quotas,
+                    "decisions": decisions,
+                    "usage_summary": usage_summary
+                }),
+            )
+        }
         QuotaCommand::List => emit(as_json, &cfg.quotas),
+    }
+}
+
+async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    match command {
+        SecurityCommand::Check => {
+            config::validate_production_security(&cfg)?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "ok",
+                    "production": cfg.security.production,
+                    "require_auth": cfg.security.require_auth,
+                    "bind_external": cfg.security.bind_external,
+                    "host": cfg.server.host,
+                    "api_keys": cfg.security.api_keys.len()
+                }),
+            )
+        }
     }
 }
 
 async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) -> Result<()> {
     let cfg = load_config(path).await?;
-    let storage = init_storage(&cfg.storage).await?;
     match command {
         ObserveCommand::Snapshot => {
+            let storage = init_storage(&cfg.storage).await?;
             let (snapshot, plan) = rs_llmctl::resources::snapshot_and_plan(&cfg.resources);
             let value = if snapshot.total_memory_bytes == 0 {
                 0.0
@@ -410,11 +510,22 @@ async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) ->
             storage.insert_observation_event(&event).await?;
             emit(as_json, &event)
         }
+        ObserveCommand::Plan => {
+            let plan = ObservabilityPlan::from_config(&cfg)?;
+            emit(as_json, &observability_plan_json(plan))
+        }
         ObserveCommand::Drift(args) => {
+            let storage = init_storage(&cfg.storage).await?;
             report_observations(&storage, "drift", args.hours, as_json).await
         }
-        ObserveCommand::Usage(args) => report_usage(&storage, args.hours, as_json).await,
-        ObserveCommand::Show(args) => show_observations(&storage, args, as_json).await,
+        ObserveCommand::Usage(args) => {
+            let storage = init_storage(&cfg.storage).await?;
+            report_usage(&storage, args.hours, as_json).await
+        }
+        ObserveCommand::Show(args) => {
+            let storage = init_storage(&cfg.storage).await?;
+            show_observations(&storage, args, as_json).await
+        }
     }
 }
 
@@ -507,6 +618,62 @@ fn upsert_quota(quotas: &mut Vec<QuotaConfig>, quota: QuotaConfig) {
     } else {
         quotas.push(quota);
     }
+}
+
+fn quota_status_principal(quotas: &[QuotaConfig], args: &QuotaStatusArgs) -> Principal {
+    let team = args.team.clone().unwrap_or_else(|| {
+        quotas
+            .iter()
+            .find(|quota| quota.subject == args.subject)
+            .map(|quota| quota.team.clone())
+            .filter(|team| !team.is_empty())
+            .unwrap_or_else(|| "public".to_string())
+    });
+    Principal {
+        subject: args.subject.clone(),
+        team,
+        scopes: vec![],
+    }
+}
+
+fn matching_quota<'a>(quotas: &'a [QuotaConfig], principal: &Principal) -> Option<&'a QuotaConfig> {
+    quotas
+        .iter()
+        .find(|quota| quota.subject == principal.subject)
+        .or_else(|| {
+            quotas
+                .iter()
+                .find(|quota| !quota.team.is_empty() && quota.team == principal.team)
+        })
+}
+
+fn observability_plan_json(plan: ObservabilityPlan) -> serde_json::Value {
+    let exporter = match plan.exporter {
+        Exporter::None => json!({ "type": "none" }),
+        Exporter::Otlp {
+            endpoint,
+            protocol,
+            headers,
+            timeout_ms,
+        } => json!({
+            "type": "otlp",
+            "endpoint": endpoint,
+            "protocol": protocol,
+            "headers": headers,
+            "timeout_ms": timeout_ms
+        }),
+    };
+
+    json!({
+        "service_name": plan.service_name,
+        "service_version": plan.service_version,
+        "environment": plan.environment,
+        "traces_enabled": plan.traces_enabled,
+        "metrics_enabled": plan.metrics_enabled,
+        "logs_enabled": plan.logs_enabled,
+        "resource_attributes": plan.resource_attributes,
+        "exporter": exporter
+    })
 }
 
 fn model_source(source: &str) -> ModelSource {
