@@ -32,6 +32,51 @@ clients, swap it safely, and keep useful evidence about what happened.
 - Keeps production CORS explicit so browser-based clients only work from
   approved origins.
 
+## Install In 5 Steps
+
+One-line install from GitHub Releases:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mwigge/rs-llmctl/main/install.sh | sh
+```
+
+For a pinned version or another fork:
+
+```bash
+RS_LLMCTL_VERSION=v0.1.0 RS_LLMCTL_REPO=your-org/rs-llmctl curl -fsSL https://raw.githubusercontent.com/mwigge/rs-llmctl/main/install.sh | sh
+```
+
+1. Install the binaries with the one-liner or copy `llmctl` and `llmctld` from
+   a reviewed release bundle.
+2. Create a production config:
+   `llmctl --config /etc/rs-llmctl/config.toml init --profile production-aiops`.
+3. Add at least one hashed API key with `security hash-key` and configure TLS
+   termination evidence.
+4. Import or install a verified model, then run `server check`, `security
+   check`, `observe plan`, and `compliance evidence`.
+5. Start `llmctld` under systemd or your supervisor and point clients at
+   `https://<host>:8765/v1`.
+
+## Operate In 10 Steps
+
+1. Stage `/etc/rs-llmctl/config.toml` with the `production-aiops` profile.
+2. Set `observability.exporter.endpoint` to your OTel collector and keep
+   traces, metrics, and logs enabled.
+3. Put API keys, OTel tokens, and policy signing secrets in your secret store,
+   not in process arguments or plaintext config.
+4. Import a SHA-256 verified model manifest with `model import-manifest`.
+5. Run `server plan`, `server check`, `security check`, and `security
+   audit-config`.
+6. Start `llmctld` and test `/v1/models` and `/v1/chat/completions`.
+7. Export `aiops slo-plan --format prometheus` into Prometheus/Alertmanager
+   and `aiops slo-plan --format grafana` into Grafana.
+8. Use lineage headers such as `x-llmctl-lineage-id: corpus:ops-v1` so requests
+   can be tied back to prompts, corpora, models, and releases.
+9. Run eval suites with `eval run-suite`, export data with Arrow/Parquet, and
+   create monthly audit envelopes.
+10. Sign policy changes with Ed25519 and append them to the transparency log
+    before promotion.
+
 ## Quick Start
 
 ```bash
@@ -287,6 +332,8 @@ llmctl --config /etc/rs-llmctl/config.toml data export --dataset finops --format
 llmctl --config /etc/rs-llmctl/config.toml eval run --model qwen --suite golden-code --score 0.91 --baseline 0.85
 llmctl --config /etc/rs-llmctl/config.toml lineage record --kind model --id qwen --parent corpus:internal-docs
 llmctl aiops slo-plan
+llmctl aiops slo-plan --format prometheus --output llmctl-slo-rules.yaml
+llmctl aiops slo-plan --format grafana --output llmctl-slo-dashboard.json
 llmctl aiops incident-template --severity high --team platform
 llmctl aiops gaps
 ```
@@ -296,14 +343,43 @@ observability, user, finops, model, drift, and audit data. JSON and JSONL are
 available for simple scripts, `arrow-json` exposes the schema and rows, and
 native Arrow IPC/Parquet writers produce files for analytics systems.
 
-Policy bundles can be signed and verified with HMAC-SHA256 key material from
-the environment:
+Lineage is how you explain where a model answer came from. A client can send
+`x-llmctl-lineage-id` or `metadata.lineage_ids` on chat, search, and
+recommendation requests. `rs-llmctl` records those joins with the request ID,
+model, corpus, and source endpoint so audits can connect a response back to a
+prompt template, document corpus, embedding index, model, or release.
+
+The dashboard path is intentionally simple. `llmctl aiops slo-plan --format
+prometheus` emits Alertmanager-compatible rules, and `--format grafana` emits a
+Grafana dashboard JSON file. Import those files with your normal monitoring
+provisioning workflow.
+
+Policy bundles can still be signed and verified with HMAC-SHA256 key material
+from the environment:
 
 ```bash
 llmctl policy bundle --name platform --input policy.json --output policy-bundle.json --signing-key-env LLMCTL_POLICY_KEY
 llmctl policy verify-bundle policy-bundle.json --signing-key-env LLMCTL_POLICY_KEY
+```
+
+For reviewed promotion workflows, use Ed25519 keys and publish the policy
+artifact to the local append-only transparency log:
+
+```bash
+llmctl policy keygen --private-key policy-ed25519.private.json --public-key policy-ed25519.public.json
+llmctl policy sign --input policy.json --signature policy-signature.json --private-key policy-ed25519.private.json
+llmctl policy verify --input policy.json --signature policy-signature.json --public-key policy-ed25519.public.json
+llmctl policy log append --log policy-transparency.jsonl --artifact policy.json --signature policy-signature.json
+llmctl policy log verify --log policy-transparency.jsonl
 llmctl policy legal-hold-plan --dataset audit --case-id case-123 --reason "regulatory review"
 ```
+
+Sigstore and Rekor are public supply-chain transparency tools. Sigstore is a
+keyless signing ecosystem, and Rekor is an append-only transparency log for
+signed artifact metadata. `rs-llmctl` includes local Ed25519 signing and a local
+hash-chained transparency log today; Sigstore/Rekor integration is the external
+publication path to add when your organization wants public or shared
+transparency-log evidence.
 
 Compliance evidence is available through `llmctl compliance evidence`, with
 focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
@@ -317,9 +393,9 @@ focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 - [Observability and reporting](docs/observability-reporting.md)
 - [Configuration](docs/configuration.md)
 - [Data contracts](docs/data-contracts.md)
-- [AIOps/MLOps platform gaps](docs/aiops-mlops-platform.md)
+- [AIOps/MLOps platform](docs/aiops-mlops-platform.md)
 - [Storage notes](docs/storage.md)
-- [Final role review](docs/reviews/final-role-review.md)
+- [Final acceptance review](docs/reviews/final-acceptance-review.md)
 - [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)
 
 ## License

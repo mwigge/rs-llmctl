@@ -458,6 +458,98 @@ async fn local_recommendations_rank_local_material_for_ai_developer_workflows() 
 }
 
 #[tokio::test]
+async fn local_recommendations_records_runtime_lineage_headers() {
+    let request_id = Uuid::new_v4();
+    let (app, storage) = test_app_with_storage(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/recommendations")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .header("x-llmctl-lineage-id", "corpus:code-review")
+                .header("x-llmctl-corpus", "engineering-docs")
+                .body(Body::from(
+                    json!({
+                        "task": "code review",
+                        "documents": [
+                            {
+                                "id": "code-review",
+                                "title": "Code Review Guide",
+                                "content": "code review recommendations"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let joins = storage
+        .request_lineage_joins_for_request(request_id)
+        .await
+        .expect("lineage joins");
+    assert_eq!(joins.len(), 1);
+    assert_eq!(joins[0].lineage_id, "corpus:code-review");
+    assert_eq!(joins[0].model, None);
+    assert_eq!(joins[0].corpus.as_deref(), Some("engineering-docs"));
+    assert_eq!(joins[0].source, "local.recommendations");
+}
+
+#[tokio::test]
+async fn local_search_records_runtime_lineage_metadata() {
+    let request_id = Uuid::new_v4();
+    let (app, storage) = test_app_with_storage(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/search")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(
+                    json!({
+                        "query": "readiness",
+                        "metadata": {
+                            "lineage_ids": ["corpus:ops-v1", "prompt:search-template"],
+                            "corpus": "ops-docs"
+                        },
+                        "documents": [
+                            {
+                                "id": "ops",
+                                "title": "Operations Notes",
+                                "content": "readiness and lifecycle"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let joins = storage
+        .request_lineage_joins_for_request(request_id)
+        .await
+        .expect("lineage joins");
+    assert_eq!(joins.len(), 2);
+    assert_eq!(joins[0].lineage_id, "corpus:ops-v1");
+    assert_eq!(joins[0].model, None);
+    assert_eq!(joins[0].corpus.as_deref(), Some("ops-docs"));
+    assert_eq!(joins[0].source, "local.search");
+}
+
+#[tokio::test]
 async fn embeddings_endpoint_proxies_openai_compatible_payloads() {
     let (upstream, mut upstream_requests) = spawn_embeddings_upstream().await;
     let mut cfg = config_with_models(vec![model("embed")]);
@@ -486,6 +578,46 @@ async fn embeddings_endpoint_proxies_openai_compatible_payloads() {
         upstream_requests.recv().await.expect("embedding request")["model"],
         "embed"
     );
+}
+
+#[tokio::test]
+async fn chat_completions_records_runtime_lineage_headers() {
+    let request_id = Uuid::new_v4();
+    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
+    let mut cfg = config_with_models(vec![model("llama")]);
+    cfg.server.llama_server = upstream;
+    let (app, storage) = test_app_with_storage(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .header("x-llmctl-lineage-id", "prompt:review-v2,corpus:ops-v1")
+                .header("x-llmctl-corpus", "ops-docs")
+                .body(Body::from(
+                    json!({"model": "llama", "messages": [], "stream": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    upstream_requests.recv().await.expect("upstream request");
+    let joins = storage
+        .request_lineage_joins_for_request(request_id)
+        .await
+        .expect("lineage joins");
+    assert_eq!(joins.len(), 2);
+    assert_eq!(joins[0].request_id, request_id);
+    assert_eq!(joins[0].lineage_id, "prompt:review-v2");
+    assert_eq!(joins[0].model.as_deref(), Some("llama"));
+    assert_eq!(joins[0].corpus.as_deref(), Some("ops-docs"));
+    assert_eq!(joins[0].source, "chat.completions");
 }
 
 #[tokio::test]

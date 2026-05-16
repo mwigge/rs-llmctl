@@ -5,7 +5,7 @@ use crate::observability::{
 };
 use crate::quota::{check_quota, matching_quota_policy, Principal};
 use crate::rag::{lexical_search, SearchDocument};
-use crate::storage::{QuotaDecisionRecord, Storage};
+use crate::storage::{QuotaDecisionRecord, RequestLineageJoinRecord, Storage};
 use crate::worker::{
     PlannedWorker, StartupPlan, SwapExecution, SwapMode, TokioWorkerRunner, WorkerId,
     WorkerSupervisor,
@@ -25,7 +25,7 @@ use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,7 +99,14 @@ pub fn router_with_worker_control(
 fn cors_layer(cfg: &Config) -> CorsLayer {
     let mut layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE, request_id_header_name()])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            request_id_header_name(),
+            lineage_id_header_name(),
+            lineage_ids_header_name(),
+            corpus_header_name(),
+        ])
         .expose_headers([
             request_id_header_name(),
             model_count_header_name(),
@@ -364,6 +371,8 @@ struct LocalSearchRequest {
     query: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default)]
+    metadata: Option<Value>,
     documents: Vec<SearchDocument>,
 }
 
@@ -399,6 +408,8 @@ async fn local_search(
     }
 
     let hits = lexical_search(&request.query, &request.documents, request.limit.min(50));
+    let lineage = runtime_lineage_from_headers_and_metadata(&headers, request.metadata.as_ref());
+    record_request_lineage_joins(&state, request_id, &lineage, None, "local.search").await;
     record_audit(
         &state,
         Some(request_id),
@@ -425,6 +436,8 @@ struct LocalRecommendationRequest {
     task: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default)]
+    metadata: Option<Value>,
     documents: Vec<SearchDocument>,
 }
 
@@ -457,6 +470,8 @@ async fn local_recommendations(
 
     let hits = lexical_search(&request.task, &request.documents, request.limit.min(50));
     let recommendations = local_recommendation_items(&request.task, &hits);
+    let lineage = runtime_lineage_from_headers_and_metadata(&headers, request.metadata.as_ref());
+    record_request_lineage_joins(&state, request_id, &lineage, None, "local.recommendations").await;
     record_audit(
         &state,
         Some(request_id),
@@ -816,6 +831,7 @@ async fn chat_completions(
             );
         }
     };
+    let lineage = runtime_lineage_from_headers_and_metadata(&headers, request.metadata.as_ref());
 
     let route = match resolve_model_route(&state.cfg, &request.model, request_id) {
         Ok(route) => route,
@@ -838,6 +854,14 @@ async fn chat_completions(
     };
     let original_body = body.clone();
     let model = route.requested_alias.clone();
+    record_request_lineage_joins(
+        &state,
+        request_id,
+        &lineage,
+        Some(model.as_str()),
+        "chat.completions",
+    )
+    .await;
     let quota = match check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await {
         Ok(decision) => decision,
         Err(err) => {
@@ -1746,6 +1770,109 @@ async fn record_quota_decision(
     ));
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RuntimeLineageMetadata {
+    lineage_ids: Vec<String>,
+    corpus: Option<String>,
+}
+
+async fn record_request_lineage_joins(
+    state: &ServerState,
+    request_id: Uuid,
+    lineage: &RuntimeLineageMetadata,
+    model: Option<&str>,
+    source: &str,
+) {
+    for lineage_id in &lineage.lineage_ids {
+        let record = RequestLineageJoinRecord::new(
+            request_id,
+            lineage_id.clone(),
+            model.map(str::to_string),
+            lineage.corpus.clone(),
+            source,
+        );
+        if let Err(err) = state.storage.insert_request_lineage_join(&record).await {
+            tracing::warn!(error = %err, "failed to record request lineage join");
+        }
+    }
+}
+
+fn runtime_lineage_from_headers_and_metadata(
+    headers: &HeaderMap,
+    metadata: Option<&Value>,
+) -> RuntimeLineageMetadata {
+    let mut lineage = RuntimeLineageMetadata::default();
+    extend_lineage_ids_from_header(headers, lineage_id_header_name(), &mut lineage.lineage_ids);
+    extend_lineage_ids_from_header(headers, lineage_ids_header_name(), &mut lineage.lineage_ids);
+    if let Some(corpus) = header_string(headers, corpus_header_name()) {
+        lineage.corpus = Some(corpus);
+    }
+
+    if let Some(metadata) = metadata.and_then(|value| value.as_object()) {
+        extend_lineage_ids_from_value(metadata.get("lineage_id"), &mut lineage.lineage_ids);
+        extend_lineage_ids_from_value(metadata.get("lineage_ids"), &mut lineage.lineage_ids);
+        if lineage.corpus.is_none() {
+            lineage.corpus = metadata
+                .get("corpus")
+                .or_else(|| metadata.get("corpus_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    lineage
+        .lineage_ids
+        .retain(|lineage_id| seen.insert(lineage_id.clone()));
+    lineage
+}
+
+fn extend_lineage_ids_from_header(
+    headers: &HeaderMap,
+    name: HeaderName,
+    lineage_ids: &mut Vec<String>,
+) {
+    for value in headers.get_all(name) {
+        if let Ok(value) = value.to_str() {
+            extend_lineage_ids_from_str(value, lineage_ids);
+        }
+    }
+}
+
+fn extend_lineage_ids_from_value(value: Option<&Value>, lineage_ids: &mut Vec<String>) {
+    match value {
+        Some(Value::String(value)) => extend_lineage_ids_from_str(value, lineage_ids),
+        Some(Value::Array(values)) => {
+            for value in values {
+                if let Some(value) = value.as_str() {
+                    extend_lineage_ids_from_str(value, lineage_ids);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extend_lineage_ids_from_str(raw: &str, lineage_ids: &mut Vec<String>) {
+    lineage_ids.extend(
+        raw.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    );
+}
+
+fn header_string(headers: &HeaderMap, name: HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn json_string(value: Option<Uuid>) -> Value {
     value
         .map(|value| Value::String(value.to_string()))
@@ -2024,6 +2151,18 @@ fn request_id_header_name() -> HeaderName {
     HeaderName::from_static("x-request-id")
 }
 
+fn lineage_id_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-lineage-id")
+}
+
+fn lineage_ids_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-lineage-ids")
+}
+
+fn corpus_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-corpus")
+}
+
 fn model_count_header_name() -> HeaderName {
     HeaderName::from_static("x-llmctl-model-count")
 }
@@ -2081,6 +2220,8 @@ struct ChatCompletionRequest {
     model: String,
     #[serde(default)]
     stream: bool,
+    #[serde(default)]
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]

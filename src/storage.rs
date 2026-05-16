@@ -271,6 +271,27 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
             .to_string(),
         "CREATE INDEX IF NOT EXISTS idx_quota_decisions_team_allowed_at ON quota_decisions(team, allowed, at)"
             .to_string(),
+        format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS request_lineage_joins (
+                id {id_type} PRIMARY KEY NOT NULL,
+                request_id {id_type} NOT NULL,
+                at {time_type} NOT NULL,
+                lineage_id TEXT NOT NULL,
+                model TEXT,
+                corpus TEXT,
+                source TEXT NOT NULL
+            )
+            "#
+        ),
+        "CREATE INDEX IF NOT EXISTS idx_request_lineage_joins_request_id ON request_lineage_joins(request_id)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_request_lineage_joins_lineage_id ON request_lineage_joins(lineage_id)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_request_lineage_joins_model ON request_lineage_joins(model)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_request_lineage_joins_corpus ON request_lineage_joins(corpus)"
+            .to_string(),
     ]
 }
 
@@ -300,6 +321,37 @@ pub struct QuotaDecisionRecord {
     pub allowed: bool,
     pub reason: String,
     pub policy_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestLineageJoinRecord {
+    pub id: Uuid,
+    pub request_id: Uuid,
+    pub at: DateTime<Utc>,
+    pub lineage_id: String,
+    pub model: Option<String>,
+    pub corpus: Option<String>,
+    pub source: String,
+}
+
+impl RequestLineageJoinRecord {
+    pub fn new(
+        request_id: Uuid,
+        lineage_id: impl Into<String>,
+        model: Option<String>,
+        corpus: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            request_id,
+            at: Utc::now(),
+            lineage_id: lineage_id.into(),
+            model,
+            corpus,
+            source: source.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -741,6 +793,64 @@ impl Storage {
         rows.into_iter().map(row_to_quota_decision_record).collect()
     }
 
+    pub async fn insert_request_lineage_join(
+        &self,
+        record: &RequestLineageJoinRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO request_lineage_joins
+                (id, request_id, at, lineage_id, model, corpus, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(record.id.to_string())
+        .bind(record.request_id.to_string())
+        .bind(encode_time(record.at))
+        .bind(&record.lineage_id)
+        .bind(&record.model)
+        .bind(&record.corpus)
+        .bind(&record.source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn request_lineage_joins(&self) -> Result<Vec<RequestLineageJoinRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, request_id, at, lineage_id, model, corpus, source
+            FROM request_lineage_joins
+            ORDER BY at ASC, id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(row_to_request_lineage_join_record)
+            .collect()
+    }
+
+    pub async fn request_lineage_joins_for_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<RequestLineageJoinRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, request_id, at, lineage_id, model, corpus, source
+            FROM request_lineage_joins
+            WHERE request_id = ?
+            ORDER BY at ASC, id ASC
+            "#,
+        )
+        .bind(request_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(row_to_request_lineage_join_record)
+            .collect()
+    }
+
     pub async fn allowed_quota_decision_count(
         &self,
         principal: &Principal,
@@ -925,6 +1035,18 @@ fn row_to_quota_decision_record(row: sqlx::any::AnyRow) -> Result<QuotaDecisionR
     })
 }
 
+fn row_to_request_lineage_join_record(row: sqlx::any::AnyRow) -> Result<RequestLineageJoinRecord> {
+    Ok(RequestLineageJoinRecord {
+        id: parse_uuid(&row.try_get::<String, _>("id")?)?,
+        request_id: parse_uuid(&row.try_get::<String, _>("request_id")?)?,
+        at: parse_time(&row.try_get::<String, _>("at")?)?,
+        lineage_id: row.try_get("lineage_id")?,
+        model: row.try_get("model")?,
+        corpus: row.try_get("corpus")?,
+        source: row.try_get("source")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1187,15 @@ mod tests {
         };
         storage.insert_quota_decision(&quota).await?;
 
+        let lineage = RequestLineageJoinRecord::new(
+            request_id,
+            "corpus:internal-docs",
+            Some("llama".to_string()),
+            Some("internal-docs".to_string()),
+            "chat.completions",
+        );
+        storage.insert_request_lineage_join(&lineage).await?;
+
         let from = Utc::now() - chrono::Duration::minutes(1);
         let to = Utc::now() + chrono::Duration::minutes(1);
         assert_eq!(storage.audit_events_between(from, to).await?.len(), 1);
@@ -1084,6 +1215,16 @@ mod tests {
         assert_eq!(
             storage.quota_decisions_for_request(request_id).await?.len(),
             1
+        );
+        assert_eq!(
+            storage.request_lineage_joins().await?,
+            vec![lineage.clone()]
+        );
+        assert_eq!(
+            storage
+                .request_lineage_joins_for_request(request_id)
+                .await?,
+            vec![lineage]
         );
         Ok(())
     }

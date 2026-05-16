@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use rs_llmctl::audit::{AuditEvent, ObservationEvent, UsageEvent};
-use rs_llmctl::storage::Storage;
+use rs_llmctl::storage::{RequestLineageJoinRecord, Storage};
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -2072,6 +2072,86 @@ fn aiops_gaps_reports_remaining_platform_capabilities() {
 }
 
 #[test]
+fn aiops_slo_plan_renders_prometheus_alert_rules() {
+    let mut rules = llmctl();
+    rules
+        .arg("aiops")
+        .arg("slo-plan")
+        .arg("--format")
+        .arg("prometheus")
+        .arg("--availability-percent")
+        .arg("99.5")
+        .arg("--latency-p95-ms")
+        .arg("1500")
+        .arg("--error-rate-percent")
+        .arg("0.5");
+    let output = rules.output().expect("run llmctl");
+
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains("groups:"));
+    assert!(stdout.contains("name: llmctl_slo_alerts"));
+    assert!(stdout.contains("alert: LlmctlAvailabilityBelowSlo"));
+    assert!(stdout.contains("alert: LlmctlHighErrorRate"));
+    assert!(stdout.contains("alert: LlmctlHighLatencyP95"));
+    assert!(stdout.contains("severity: page"));
+    assert!(stdout.contains("histogram_quantile(0.95"));
+}
+
+#[test]
+fn aiops_slo_plan_writes_grafana_dashboard_json() {
+    let dir = TempDir::new().expect("tempdir");
+    let output_path = dir.path().join("llmctl-slo-dashboard.json");
+    let mut dashboard = llmctl();
+    dashboard
+        .arg("aiops")
+        .arg("slo-plan")
+        .arg("--format")
+        .arg("grafana")
+        .arg("--availability-percent")
+        .arg("99.9")
+        .arg("--output")
+        .arg(&output_path);
+    let output = dashboard.output().expect("run llmctl");
+
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "expected --output to suppress stdout, got {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let dashboard: Value = serde_json::from_slice(&fs::read(&output_path).expect("read dashboard"))
+        .expect("dashboard json");
+    assert_eq!(dashboard["title"], "rs-llmctl SLOs");
+    assert_eq!(dashboard["tags"][0], "llmctl");
+    assert!(dashboard["panels"]
+        .as_array()
+        .expect("panels")
+        .iter()
+        .any(|panel| panel["title"] == "Availability"));
+    assert!(dashboard["panels"]
+        .as_array()
+        .expect("panels")
+        .iter()
+        .any(|panel| panel["targets"][0]["expr"]
+            .as_str()
+            .unwrap_or("")
+            .contains("llmctl_request_latency_ms_bucket")));
+}
+
+#[test]
 fn eval_lineage_slo_and_signed_policy_bundle_are_scriptable() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
@@ -2174,6 +2254,187 @@ fn eval_lineage_slo_and_signed_policy_bundle_are_scriptable() {
     let legal_hold = assert_success_json(legal_hold);
     assert_eq!(legal_hold["dataset"], "audit");
     assert_eq!(legal_hold["retention"]["override"], "hold_until_released");
+}
+
+#[test]
+fn lineage_list_reports_runtime_request_joins() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let db_path = dir.path().join("llmctl.db");
+    let request_id = Uuid::new_v4();
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let storage = Storage::connect(&db_path).await.expect("storage");
+        storage
+            .insert_request_lineage_join(&RequestLineageJoinRecord::new(
+                request_id,
+                "corpus:ops-v1",
+                Some("llama".to_string()),
+                Some("ops-docs".to_string()),
+                "chat.completions",
+            ))
+            .await
+            .expect("insert lineage join");
+    });
+
+    let mut list = llmctl();
+    list.arg("--config").arg(&config).arg("lineage").arg("list");
+    let output = assert_success_json(list);
+
+    assert_eq!(output["joins"][0]["request_id"], request_id.to_string());
+    assert_eq!(output["joins"][0]["lineage_id"], "corpus:ops-v1");
+    assert_eq!(output["joins"][0]["model"], "llama");
+    assert_eq!(output["joins"][0]["corpus"], "ops-docs");
+}
+
+#[test]
+fn policy_ed25519_sign_verify_and_transparency_log_are_scriptable() {
+    let dir = TempDir::new().expect("tempdir");
+    let policy = dir.path().join("policy.json");
+    fs::write(&policy, r#"{"quotas":{"team":"platform"}}"#).expect("write policy");
+    let private_key = dir.path().join("policy-ed25519.private.json");
+    let public_key = dir.path().join("policy-ed25519.public.json");
+    let signature = dir.path().join("policy-signature.json");
+    let log = dir.path().join("policy-transparency.jsonl");
+
+    let mut keygen = llmctl();
+    keygen
+        .arg("policy")
+        .arg("keygen")
+        .arg("--private-key")
+        .arg(&private_key)
+        .arg("--public-key")
+        .arg(&public_key);
+    let keygen = assert_success_json(keygen);
+    assert_eq!(keygen["algorithm"], "ed25519");
+    assert!(private_key.exists());
+    assert!(public_key.exists());
+
+    let mut sign = llmctl();
+    sign.arg("policy")
+        .arg("sign")
+        .arg("--input")
+        .arg(&policy)
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--private-key")
+        .arg(&private_key);
+    let signed = assert_success_json(sign);
+    assert_eq!(signed["algorithm"], "ed25519");
+    assert_eq!(signed["status"], "signed");
+
+    let mut verify = llmctl();
+    verify
+        .arg("policy")
+        .arg("verify")
+        .arg("--input")
+        .arg(&policy)
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--public-key")
+        .arg(&public_key);
+    let verified = assert_success_json(verify);
+    assert_eq!(verified["valid"], true);
+
+    let mut append_first = llmctl();
+    append_first
+        .arg("policy")
+        .arg("log")
+        .arg("append")
+        .arg("--log")
+        .arg(&log)
+        .arg("--artifact")
+        .arg(&policy)
+        .arg("--signature")
+        .arg(&signature);
+    let first = assert_success_json(append_first);
+    assert_eq!(first["index"], 0);
+    assert_eq!(first["previous_hash"], Value::Null);
+
+    let mut append_second = llmctl();
+    append_second
+        .arg("policy")
+        .arg("log")
+        .arg("append")
+        .arg("--log")
+        .arg(&log)
+        .arg("--artifact")
+        .arg(&signature);
+    let second = assert_success_json(append_second);
+    assert_eq!(second["index"], 1);
+    assert_eq!(second["previous_hash"], first["entry_hash"]);
+
+    let mut verify_log = llmctl();
+    verify_log
+        .arg("policy")
+        .arg("log")
+        .arg("verify")
+        .arg("--log")
+        .arg(&log);
+    let verified_log = assert_success_json(verify_log);
+    assert_eq!(verified_log["valid"], true);
+    assert_eq!(verified_log["entries"], 2);
+}
+
+#[tokio::test]
+async fn eval_run_suite_executes_manifest_against_openai_compatible_endpoint() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let manifest = dir.path().join("golden-suite.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&json!({
+            "suite": "golden-readiness",
+            "model": "qwen",
+            "cases": [
+                {
+                    "id": "codename",
+                    "prompt": "Return the release codename.",
+                    "expect": {"exact": "aurora"}
+                },
+                {
+                    "id": "readiness",
+                    "prompt": "Summarize readiness.",
+                    "expect": {
+                        "contains": ["ready"],
+                        "regex": "score=\\d+"
+                    }
+                }
+            ]
+        }))
+        .expect("manifest json"),
+    )
+    .expect("write manifest");
+    let mut run_suite = llmctl();
+    run_suite
+        .arg("--config")
+        .arg(&config)
+        .arg("eval")
+        .arg("run-suite")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--base-url")
+        .arg("mock://golden-suite");
+    let output = assert_success_json(run_suite);
+
+    assert_eq!(output["kind"], "eval-suite-run");
+    assert_eq!(output["suite"], "golden-readiness");
+    assert_eq!(output["model"], "qwen");
+    assert_eq!(output["passed"], 2);
+    assert_eq!(output["failed"], 0);
+    assert_eq!(output["score"], 1.0);
+    assert_eq!(output["cases"][0]["passed"], true);
+    assert_eq!(output["cases"][1]["checks"]["regex"], true);
+    let eval_runs = fs::read_to_string(dir.path().join("eval-runs.jsonl")).expect("eval jsonl");
+    let persisted = eval_runs
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("jsonl record"))
+        .collect::<Vec<_>>();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0]["suite"], "golden-readiness");
+    assert_eq!(persisted[0]["kind"], "eval-suite-run");
+    assert_eq!(persisted[0]["score"], 1.0);
 }
 
 #[test]

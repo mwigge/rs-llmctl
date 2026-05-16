@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use chrono::{Datelike, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
+use regex::Regex;
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{
     self, ApiKeyConfig, Config, DataFabricFormat, EventFormat, LogFormat, Mode, ModelConfig,
@@ -19,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs as stdfs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
@@ -436,6 +442,7 @@ enum AiopsCommand {
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
     Run(EvalRunArgs),
+    RunSuite(EvalRunSuiteArgs),
     List,
     Report,
 }
@@ -450,7 +457,20 @@ enum LineageCommand {
 enum PolicyCommand {
     Bundle(PolicyBundleArgs),
     VerifyBundle(PolicyVerifyBundleArgs),
+    Keygen(PolicyKeygenArgs),
+    Sign(PolicySignArgs),
+    Verify(PolicyVerifyArgs),
+    Log {
+        #[command(subcommand)]
+        command: PolicyLogCommand,
+    },
     LegalHoldPlan(PolicyLegalHoldPlanArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyLogCommand {
+    Append(PolicyLogAppendArgs),
+    Verify(PolicyLogVerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -461,6 +481,18 @@ struct AiopsSloPlanArgs {
     latency_p95_ms: u64,
     #[arg(long, default_value_t = 1.0)]
     error_rate_percent: f64,
+    #[arg(long, value_enum, default_value_t = AiopsSloPlanFormat::Plan)]
+    format: AiopsSloPlanFormat,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum AiopsSloPlanFormat {
+    Plan,
+    Prometheus,
+    Grafana,
 }
 
 #[derive(Debug, Args)]
@@ -483,6 +515,46 @@ struct EvalRunArgs {
     baseline: Option<f64>,
     #[arg(long)]
     notes: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EvalRunSuiteArgs {
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long)]
+    api_key_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalSuiteManifest {
+    suite: String,
+    model: String,
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    cases: Vec<EvalCaseManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalCaseManifest {
+    id: String,
+    prompt: String,
+    expect: EvalExpectation,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalExpectation {
+    #[serde(default)]
+    exact: Option<String>,
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    regex: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -527,6 +599,50 @@ struct PolicyVerifyBundleArgs {
     path: PathBuf,
     #[arg(long)]
     signing_key_env: String,
+}
+
+#[derive(Debug, Args)]
+struct PolicyKeygenArgs {
+    #[arg(long)]
+    private_key: PathBuf,
+    #[arg(long)]
+    public_key: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PolicySignArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    signature: PathBuf,
+    #[arg(long)]
+    private_key: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PolicyVerifyArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    signature: PathBuf,
+    #[arg(long)]
+    public_key: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PolicyLogAppendArgs {
+    #[arg(long = "log")]
+    log_path: PathBuf,
+    #[arg(long)]
+    artifact: PathBuf,
+    #[arg(long)]
+    signature: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PolicyLogVerifyArgs {
+    #[arg(long = "log")]
+    log_path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -1507,7 +1623,7 @@ fn dataset_rows(
 async fn aiops_command(command: AiopsCommand, as_json: bool) -> Result<()> {
     match command {
         AiopsCommand::Gaps => emit(as_json, &aiops_gaps_report()),
-        AiopsCommand::SloPlan(args) => emit(as_json, &slo_plan(args)),
+        AiopsCommand::SloPlan(args) => emit_slo_plan(args),
         AiopsCommand::IncidentTemplate(args) => emit(as_json, &incident_template(args)),
     }
 }
@@ -1521,34 +1637,53 @@ fn aiops_gaps_report() -> serde_json::Value {
             "schema-versioned contracts for security, observability, usage, user, finops, model, drift, and audit datasets",
             "domain-filtered JSON, JSONL, Arrow-schema JSON, Arrow IPC, and Parquet exports",
             "CRA Article 14 active-control evidence and PCI DSS aligned reporting commands",
-            "OpenAI-compatible model and chat serving, local search, recommendations, quotas, and worker lifecycle controls"
+            "OpenAI-compatible model and chat serving, local search, recommendations, quotas, and worker lifecycle controls",
+            "manifest-driven eval suites that execute golden prompts against OpenAI-compatible endpoints",
+            "runtime request-to-lineage joins for chat, local search, and recommendations",
+            "Prometheus/Alertmanager rules and Grafana dashboard renderers for SLOs",
+            "HMAC policy bundles plus Ed25519 policy signatures and hash-chained transparency logs"
         ],
         "gaps": [
             {
                 "area": "model-quality",
-                "gap": "eval execution is operator-supplied today; built-in prompt runners are not bundled",
-                "next_control": "add optional suite runners that execute golden prompts against configured endpoints"
+                "gap": "eval suites execute configured prompts, but advanced judges and rubric scoring are not bundled",
+                "next_control": "add optional LLM-as-judge and rubric evaluators with deterministic evidence output"
             },
             {
                 "area": "lineage",
-                "gap": "lineage records are file-backed; runtime request-to-lineage joins are not automatic yet",
-                "next_control": "attach lineage ids to serving requests, RAG corpora, model manifests, and releases"
+                "gap": "runtime joins are recorded when clients provide lineage IDs; automatic corpus/model lineage inference is not complete",
+                "next_control": "derive lineage IDs from configured model manifests and managed RAG indexes"
             },
             {
                 "area": "operations",
-                "gap": "SLO and incident templates are generated, but alert-manager specific renderers are not bundled",
-                "next_control": "add Prometheus/Alertmanager and Grafana dashboard renderers"
+                "gap": "SLO plans include Prometheus/Alertmanager rules and Grafana dashboards; live deployment sync is operator-managed",
+                "next_control": "add optional push/apply helpers for Prometheus rule files and Grafana dashboard provisioning"
             },
             {
                 "area": "governance",
-                "gap": "policy bundles use HMAC-SHA256; asymmetric signing and transparency log publication are not bundled",
-                "next_control": "add Sigstore/minisign support and append-only policy publication"
+                "gap": "Ed25519 signing and a local transparency log exist; Sigstore/Rekor publication is not bundled",
+                "next_control": "add optional Sigstore/Rekor publication for organizations that want public transparency"
             }
         ]
     })
 }
 
-fn slo_plan(args: AiopsSloPlanArgs) -> serde_json::Value {
+fn emit_slo_plan(args: AiopsSloPlanArgs) -> Result<()> {
+    let rendered = match args.format {
+        AiopsSloPlanFormat::Plan => serde_json::to_string_pretty(&slo_plan(&args))?,
+        AiopsSloPlanFormat::Prometheus => prometheus_slo_rules(&args),
+        AiopsSloPlanFormat::Grafana => serde_json::to_string_pretty(&grafana_slo_dashboard(&args))?,
+    };
+
+    if let Some(output) = args.output {
+        stdfs::write(&output, rendered).with_context(|| format!("write {}", output.display()))?;
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+fn slo_plan(args: &AiopsSloPlanArgs) -> serde_json::Value {
     json!({
         "schema_version": 1,
         "kind": "slo-plan",
@@ -1559,6 +1694,12 @@ fn slo_plan(args: AiopsSloPlanArgs) -> serde_json::Value {
             "error_rate_percent": args.error_rate_percent
         },
         "alert_rules": [
+            {
+                "name": "llmctl_availability_below_slo",
+                "expr": format!("100 * sum(rate(llmctl_requests_total{{status!=\"error\"}}[5m])) / sum(rate(llmctl_requests_total[5m])) < {}", args.availability_percent),
+                "for": "10m",
+                "severity": "page"
+            },
             {
                 "name": "llmctl_high_error_rate",
                 "expr": format!("rate(llmctl_requests_total{{status=\"error\"}}[5m]) / rate(llmctl_requests_total[5m]) > {}", args.error_rate_percent / 100.0),
@@ -1577,6 +1718,165 @@ fn slo_plan(args: AiopsSloPlanArgs) -> serde_json::Value {
             "llmctl usage report --hours 24",
             "llmctl compliance evidence"
         ]
+    })
+}
+
+fn prometheus_slo_rules(args: &AiopsSloPlanArgs) -> String {
+    format!(
+        r#"groups:
+  - name: llmctl_slo_alerts
+    rules:
+      - alert: LlmctlAvailabilityBelowSlo
+        expr: 100 * sum(rate(llmctl_requests_total{{status!="error"}}[5m])) / sum(rate(llmctl_requests_total[5m])) < {availability_percent}
+        for: 10m
+        labels:
+          severity: page
+          service: llmctl
+        annotations:
+          summary: rs-llmctl availability is below SLO
+          description: Availability over 5m is below {availability_percent}%.
+      - alert: LlmctlHighErrorRate
+        expr: sum(rate(llmctl_requests_total{{status="error"}}[5m])) / sum(rate(llmctl_requests_total[5m])) > {error_rate}
+        for: 10m
+        labels:
+          severity: page
+          service: llmctl
+        annotations:
+          summary: rs-llmctl error rate exceeds SLO
+          description: Error rate over 5m is above {error_rate_percent}%.
+      - alert: LlmctlHighLatencyP95
+        expr: histogram_quantile(0.95, sum(rate(llmctl_request_latency_ms_bucket[5m])) by (le)) > {latency_p95_ms}
+        for: 15m
+        labels:
+          severity: ticket
+          service: llmctl
+        annotations:
+          summary: rs-llmctl p95 latency exceeds SLO
+          description: Request latency p95 is above {latency_p95_ms}ms.
+"#,
+        availability_percent = args.availability_percent,
+        error_rate = args.error_rate_percent / 100.0,
+        error_rate_percent = args.error_rate_percent,
+        latency_p95_ms = args.latency_p95_ms,
+    )
+}
+
+fn grafana_slo_dashboard(args: &AiopsSloPlanArgs) -> serde_json::Value {
+    json!({
+        "uid": "llmctl-slos",
+        "title": "rs-llmctl SLOs",
+        "schemaVersion": 39,
+        "version": 1,
+        "refresh": "30s",
+        "tags": ["llmctl", "slo", "aiops"],
+        "time": {
+            "from": "now-6h",
+            "to": "now"
+        },
+        "templating": {
+            "list": [
+                {
+                    "name": "datasource",
+                    "type": "datasource",
+                    "query": "prometheus",
+                    "current": {
+                        "text": "Prometheus",
+                        "value": "Prometheus"
+                    }
+                }
+            ]
+        },
+        "panels": [
+            grafana_timeseries_panel(
+                1,
+                "Availability",
+                0,
+                0,
+                "percent",
+                "100 * sum(rate(llmctl_requests_total{status!=\"error\"}[5m])) / sum(rate(llmctl_requests_total[5m]))".to_string(),
+                Some(args.availability_percent),
+            ),
+            grafana_timeseries_panel(
+                2,
+                "Error Rate",
+                12,
+                0,
+                "percentunit",
+                "sum(rate(llmctl_requests_total{status=\"error\"}[5m])) / sum(rate(llmctl_requests_total[5m]))".to_string(),
+                Some(args.error_rate_percent / 100.0),
+            ),
+            grafana_timeseries_panel(
+                3,
+                "Latency p95",
+                0,
+                8,
+                "ms",
+                "histogram_quantile(0.95, sum(rate(llmctl_request_latency_ms_bucket[5m])) by (le))".to_string(),
+                Some(args.latency_p95_ms as f64),
+            ),
+        ]
+    })
+}
+
+fn grafana_timeseries_panel(
+    id: u64,
+    title: &str,
+    x: u64,
+    y: u64,
+    unit: &str,
+    expr: String,
+    threshold: Option<f64>,
+) -> serde_json::Value {
+    json!({
+        "id": id,
+        "type": "timeseries",
+        "title": title,
+        "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+        },
+        "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": x,
+            "y": y
+        },
+        "targets": [
+            {
+                "refId": "A",
+                "expr": expr,
+                "legendFormat": title
+            }
+        ],
+        "fieldConfig": {
+            "defaults": {
+                "unit": unit,
+                "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                        {
+                            "color": "green",
+                            "value": null
+                        },
+                        {
+                            "color": "red",
+                            "value": threshold
+                        }
+                    ]
+                }
+            },
+            "overrides": []
+        },
+        "options": {
+            "legend": {
+                "displayMode": "list",
+                "placement": "bottom"
+            },
+            "tooltip": {
+                "mode": "single",
+                "sort": "none"
+            }
+        }
     })
 }
 
@@ -1599,6 +1899,11 @@ async fn eval_command(path: &Path, command: EvalCommand, as_json: bool) -> Resul
             append_jsonl(&path, &record).await?;
             emit(as_json, &record)
         }
+        EvalCommand::RunSuite(args) => {
+            let record = run_eval_suite(&cfg, args).await?;
+            append_jsonl(&path, &record).await?;
+            emit(as_json, &record)
+        }
         EvalCommand::List => emit(
             as_json,
             &json!({
@@ -1612,6 +1917,179 @@ async fn eval_command(path: &Path, command: EvalCommand, as_json: bool) -> Resul
             emit(as_json, &eval_report(&runs))
         }
     }
+}
+
+async fn run_eval_suite(cfg: &Config, args: EvalRunSuiteArgs) -> Result<serde_json::Value> {
+    let manifest = read_eval_manifest(&args.manifest).await?;
+    if manifest.cases.is_empty() {
+        bail!("eval manifest {} has no cases", args.manifest.display());
+    }
+
+    let base_url = args
+        .base_url
+        .unwrap_or_else(|| format!("http://{}:{}", cfg.server.host, cfg.server.port));
+    let endpoint = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let api_key = match args.api_key_env.as_deref() {
+        Some(env) => Some(std::env::var(env).with_context(|| format!("read API key env {env}"))?),
+        None => None,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build eval HTTP client")?;
+    let mut cases = Vec::with_capacity(manifest.cases.len());
+
+    for case in &manifest.cases {
+        validate_expectation(&case.expect)
+            .with_context(|| format!("validate eval case {}", case.id))?;
+        let output = if base_url.starts_with("mock://") {
+            mock_eval_output(&case.expect, &case.prompt)
+        } else {
+            execute_eval_case(&client, &endpoint, api_key.as_deref(), &manifest, case)
+                .await
+                .with_context(|| format!("execute eval case {}", case.id))?
+        };
+        let checks = score_eval_case(&case.expect, &output)
+            .with_context(|| format!("score eval case {}", case.id))?;
+        let passed = checks.values().all(|passed| *passed);
+        cases.push(json!({
+            "id": case.id,
+            "passed": passed,
+            "checks": checks,
+            "output": output
+        }));
+    }
+
+    let passed = cases
+        .iter()
+        .filter(|case| case.get("passed").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+    let total = cases.len();
+    let score = passed as f64 / total as f64;
+    Ok(json!({
+        "schema_version": 1,
+        "kind": "eval-suite-run",
+        "id": Uuid::new_v4(),
+        "at": Utc::now(),
+        "manifest": args.manifest,
+        "base_url": base_url,
+        "model": manifest.model,
+        "suite": manifest.suite,
+        "score": score,
+        "passed": passed,
+        "failed": total - passed,
+        "total": total,
+        "cases": cases
+    }))
+}
+
+fn mock_eval_output(expect: &EvalExpectation, prompt: &str) -> String {
+    let mut output = expect
+        .exact
+        .clone()
+        .or_else(|| {
+            if expect.contains.is_empty() {
+                None
+            } else {
+                Some(expect.contains.join(" "))
+            }
+        })
+        .unwrap_or_else(|| prompt.to_string());
+    if expect.regex.is_some() && !output.contains("score=") {
+        output.push_str(" score=1");
+    }
+    output
+}
+
+async fn read_eval_manifest(path: &Path) -> Result<EvalSuiteManifest> {
+    let body = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("read eval manifest {}", path.display()))?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("toml") => toml::from_str(&body)
+            .with_context(|| format!("parse TOML eval manifest {}", path.display())),
+        _ => serde_json::from_str(&body)
+            .with_context(|| format!("parse JSON eval manifest {}", path.display())),
+    }
+}
+
+fn validate_expectation(expect: &EvalExpectation) -> Result<()> {
+    if expect.exact.is_none() && expect.contains.is_empty() && expect.regex.is_none() {
+        bail!("expectation must set exact, contains, or regex");
+    }
+    if let Some(pattern) = &expect.regex {
+        Regex::new(pattern).with_context(|| format!("compile regex {pattern:?}"))?;
+    }
+    Ok(())
+}
+
+async fn execute_eval_case(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    manifest: &EvalSuiteManifest,
+    case: &EvalCaseManifest,
+) -> Result<String> {
+    let mut messages = Vec::new();
+    if let Some(system) = &manifest.system {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    messages.push(json!({"role": "user", "content": &case.prompt}));
+
+    let mut request = json!({
+        "model": &manifest.model,
+        "messages": messages,
+        "stream": false
+    });
+    if let Some(temperature) = manifest.temperature {
+        request["temperature"] = json!(temperature);
+    }
+    if let Some(max_tokens) = manifest.max_tokens {
+        request["max_tokens"] = json!(max_tokens);
+    }
+
+    let mut builder = client.post(endpoint).json(&request);
+    if let Some(api_key) = api_key {
+        builder = builder.bearer_auth(api_key);
+    }
+    let response = builder
+        .send()
+        .await
+        .with_context(|| format!("POST {endpoint}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("read response from {endpoint}"))?;
+    if !status.is_success() {
+        bail!("endpoint returned {status}: {body}");
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("parse chat completion response")?;
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!("chat completion response missing choices[0].message.content")
+        })
+}
+
+fn score_eval_case(expect: &EvalExpectation, output: &str) -> Result<BTreeMap<String, bool>> {
+    let mut checks = BTreeMap::new();
+    if let Some(exact) = &expect.exact {
+        checks.insert("exact".to_string(), output == exact);
+    }
+    if !expect.contains.is_empty() {
+        checks.insert(
+            "contains".to_string(),
+            expect.contains.iter().all(|needle| output.contains(needle)),
+        );
+    }
+    if let Some(pattern) = &expect.regex {
+        checks.insert("regex".to_string(), Regex::new(pattern)?.is_match(output));
+    }
+    Ok(checks)
 }
 
 async fn lineage_command(path: &Path, command: LineageCommand, as_json: bool) -> Result<()> {
@@ -1636,7 +2114,11 @@ async fn lineage_command(path: &Path, command: LineageCommand, as_json: bool) ->
             &json!({
                 "schema_version": 1,
                 "path": path,
-                "records": read_jsonl(&path).await?
+                "records": read_jsonl(&path).await?,
+                "joins": Storage::connect_config(&cfg.storage)
+                    .await?
+                    .request_lineage_joins()
+                    .await?
             }),
         ),
     }
@@ -1710,6 +2192,101 @@ async fn policy_command(command: PolicyCommand, as_json: bool) -> Result<()> {
                 }),
             )
         }
+        PolicyCommand::Keygen(args) => {
+            let mut rng = rand_core::OsRng;
+            let signing_key = SigningKey::generate(&mut rng);
+            let verifying_key = signing_key.verifying_key();
+            let public_key = encode_b64(&verifying_key.to_bytes());
+            let private_key = encode_b64(&signing_key.to_bytes());
+            let private_doc = json!({
+                "schema_version": 1,
+                "kind": "policy-signing-private-key",
+                "algorithm": "ed25519",
+                "private_key": private_key,
+                "public_key": public_key
+            });
+            let public_doc = json!({
+                "schema_version": 1,
+                "kind": "policy-signing-public-key",
+                "algorithm": "ed25519",
+                "public_key": public_key
+            });
+            write_json_file(&args.private_key, &private_doc).await?;
+            restrict_private_key_file(&args.private_key).await?;
+            write_json_file(&args.public_key, &public_doc).await?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "created",
+                    "algorithm": "ed25519",
+                    "private_key": args.private_key,
+                    "public_key": args.public_key
+                }),
+            )
+        }
+        PolicyCommand::Sign(args) => {
+            let input = fs::read(&args.input)
+                .await
+                .with_context(|| format!("read {}", args.input.display()))?;
+            let signing_key = read_policy_signing_key(&args.private_key).await?;
+            let signature = signing_key.sign(&input);
+            let payload_sha256 = sha256_hex(&input);
+            let signature_doc = json!({
+                "schema_version": 1,
+                "kind": "policy-signature",
+                "algorithm": "ed25519",
+                "signed_at": Utc::now(),
+                "payload_sha256": payload_sha256,
+                "public_key": encode_b64(&signing_key.verifying_key().to_bytes()),
+                "signature": encode_b64(&signature.to_bytes())
+            });
+            write_json_file(&args.signature, &signature_doc).await?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "signed",
+                    "algorithm": "ed25519",
+                    "input": args.input,
+                    "signature": args.signature,
+                    "payload_sha256": payload_sha256
+                }),
+            )
+        }
+        PolicyCommand::Verify(args) => {
+            let input = fs::read(&args.input)
+                .await
+                .with_context(|| format!("read {}", args.input.display()))?;
+            let verifying_key = read_policy_verifying_key(&args.public_key).await?;
+            let signature_doc = read_json_file(&args.signature).await?;
+            require_algorithm(&signature_doc)?;
+            let expected_hash = required_str(&signature_doc, "payload_sha256")?;
+            let actual_hash = sha256_hex(&input);
+            let signature_bytes = decode_b64(required_str(&signature_doc, "signature")?)?;
+            let signature = Signature::from_slice(&signature_bytes).context("parse signature")?;
+            let signature_valid = verifying_key.verify(&input, &signature).is_ok();
+            let hash_valid = expected_hash.eq_ignore_ascii_case(&actual_hash);
+            emit(
+                as_json,
+                &json!({
+                    "status": if signature_valid && hash_valid { "valid" } else { "invalid" },
+                    "valid": signature_valid && hash_valid,
+                    "algorithm": "ed25519",
+                    "input": args.input,
+                    "signature": args.signature,
+                    "payload_sha256": actual_hash
+                }),
+            )
+        }
+        PolicyCommand::Log { command } => match command {
+            PolicyLogCommand::Append(args) => {
+                let entry = append_policy_log_entry(&args).await?;
+                emit(as_json, &entry)
+            }
+            PolicyLogCommand::Verify(args) => {
+                let result = verify_policy_log(&args.log_path).await?;
+                emit(as_json, &result)
+            }
+        },
         PolicyCommand::LegalHoldPlan(args) => emit(
             as_json,
             &json!({
@@ -1814,6 +2391,202 @@ fn hmac_signature(key_env: &str, payload: &serde_json::Value) -> Result<String> 
     let mut mac = HmacSha256::new_from_slice(key.as_bytes())?;
     mac.update(canonical.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+async fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value)?)
+        .await
+        .with_context(|| format!("write {}", path.display()))
+}
+
+async fn read_json_file(path: &Path) -> Result<serde_json::Value> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+async fn restrict_private_key_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("set private key permissions {}", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn read_policy_signing_key(path: &Path) -> Result<SigningKey> {
+    let doc = read_json_file(path).await?;
+    require_algorithm(&doc)?;
+    let bytes = decode_b64(required_str(&doc, "private_key")?)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("ed25519 private key must be 32 bytes"))?;
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+async fn read_policy_verifying_key(path: &Path) -> Result<VerifyingKey> {
+    let doc = read_json_file(path).await?;
+    require_algorithm(&doc)?;
+    let bytes = decode_b64(required_str(&doc, "public_key")?)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("ed25519 public key must be 32 bytes"))?;
+    VerifyingKey::from_bytes(&bytes).context("parse ed25519 public key")
+}
+
+fn require_algorithm(doc: &serde_json::Value) -> Result<()> {
+    let algorithm = required_str(doc, "algorithm")?;
+    if algorithm != "ed25519" {
+        bail!("unsupported policy signing algorithm {algorithm}");
+    }
+    Ok(())
+}
+
+fn required_str<'a>(doc: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+    doc.get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing string field {field}"))
+}
+
+fn encode_b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn decode_b64(value: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .context("decode base64")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+async fn append_policy_log_entry(args: &PolicyLogAppendArgs) -> Result<serde_json::Value> {
+    let current = read_jsonl(&args.log_path).await?;
+    let verification = verify_policy_log_values(&current)?;
+    if !verification
+        .get("valid")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("policy transparency log hash chain is invalid");
+    }
+
+    let artifact = fs::read(&args.artifact)
+        .await
+        .with_context(|| format!("read {}", args.artifact.display()))?;
+    let signature_sha256 = if let Some(path) = &args.signature {
+        let bytes = fs::read(path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        Some(sha256_hex(&bytes))
+    } else {
+        None
+    };
+    let previous_hash = current
+        .last()
+        .and_then(|entry| entry.get("entry_hash"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let body = json!({
+        "schema_version": 1,
+        "kind": "policy-transparency-log-entry",
+        "index": current.len(),
+        "logged_at": Utc::now(),
+        "artifact_sha256": sha256_hex(&artifact),
+        "signature_sha256": signature_sha256,
+        "previous_hash": previous_hash
+    });
+    let entry_hash = policy_log_entry_hash(&body)?;
+    let mut entry = body;
+    entry["entry_hash"] = json!(entry_hash);
+    append_jsonl(&args.log_path, &entry).await?;
+    Ok(entry)
+}
+
+async fn verify_policy_log(path: &Path) -> Result<serde_json::Value> {
+    let entries = read_jsonl(path).await?;
+    verify_policy_log_values(&entries)
+}
+
+fn verify_policy_log_values(entries: &[serde_json::Value]) -> Result<serde_json::Value> {
+    let mut previous_hash: Option<String> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(actual_hash) = entry.get("entry_hash").and_then(serde_json::Value::as_str) else {
+            return Ok(policy_log_verification(
+                false,
+                entries.len(),
+                index,
+                "missing entry_hash",
+            ));
+        };
+        if entry.get("index").and_then(serde_json::Value::as_u64) != Some(index as u64) {
+            return Ok(policy_log_verification(
+                false,
+                entries.len(),
+                index,
+                "index mismatch",
+            ));
+        }
+        if entry
+            .get("previous_hash")
+            .and_then(serde_json::Value::as_str)
+            != previous_hash.as_deref()
+        {
+            return Ok(policy_log_verification(
+                false,
+                entries.len(),
+                index,
+                "previous_hash mismatch",
+            ));
+        }
+        let expected_hash = policy_log_entry_hash(entry)?;
+        if actual_hash != expected_hash {
+            return Ok(policy_log_verification(
+                false,
+                entries.len(),
+                index,
+                "entry_hash mismatch",
+            ));
+        }
+        previous_hash = Some(actual_hash.to_string());
+    }
+    Ok(json!({
+        "status": "valid",
+        "valid": true,
+        "entries": entries.len(),
+        "head": previous_hash
+    }))
+}
+
+fn policy_log_verification(
+    valid: bool,
+    entries: usize,
+    failed_index: usize,
+    reason: &str,
+) -> serde_json::Value {
+    json!({
+        "status": if valid { "valid" } else { "invalid" },
+        "valid": valid,
+        "entries": entries,
+        "failed_index": failed_index,
+        "reason": reason
+    })
+}
+
+fn policy_log_entry_hash(entry: &serde_json::Value) -> Result<String> {
+    let mut body = entry.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("entry_hash");
+    }
+    let canonical = reporting::canonical_json(&body)?;
+    Ok(sha256_hex(canonical.as_bytes()))
 }
 
 fn incident_template(args: AiopsIncidentTemplateArgs) -> serde_json::Value {

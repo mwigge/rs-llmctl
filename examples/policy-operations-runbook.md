@@ -33,6 +33,33 @@ limits forward.
 Run `llmctl --config /etc/rs-llmctl/config.toml quota list` after import and
 attach the output to the change record.
 
+## Policy Signing And Transparency Log
+
+Preserve HMAC bundle verification for environments that already use secret
+manager-backed HMAC keys:
+
+```bash
+llmctl policy bundle --name platform --input policy.json --output policy-bundle.json --signing-key-env LLMCTL_POLICY_KEY
+llmctl policy verify-bundle policy-bundle.json --signing-key-env LLMCTL_POLICY_KEY
+```
+
+For asymmetric review, generate an Ed25519 keypair once for the approved
+promotion lane, sign the reviewed policy artifact, verify it before rollout,
+and append the artifact hash to the local transparency log:
+
+```bash
+llmctl policy keygen --private-key policy-ed25519.private.json --public-key policy-ed25519.public.json
+llmctl policy sign --input policy.json --signature policy-signature.json --private-key policy-ed25519.private.json
+llmctl policy verify --input policy.json --signature policy-signature.json --public-key policy-ed25519.public.json
+llmctl policy log append --log policy-transparency.jsonl --artifact policy.json --signature policy-signature.json
+llmctl policy log verify --log policy-transparency.jsonl
+```
+
+Attach the signature JSON and transparency-log verification output to the
+change record. A log entry records the artifact hash, optional signature hash,
+previous entry hash, and entry hash; verification must stay valid before any
+new entry is appended.
+
 ## Add-Key Workflow
 
 Hash the new API key outside the config file:
