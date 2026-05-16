@@ -587,6 +587,7 @@ async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Res
             let (from, to) = window(args.hours);
             let usage_summary = reporting::usage_summary(&storage, from, to).await?;
             let decisions = storage.quota_decisions_between(from, to).await?;
+            let policy_summary = quota::summarize_quota_policies(&cfg.quotas);
             emit(
                 as_json,
                 &json!({
@@ -595,6 +596,7 @@ async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Res
                     "to": to,
                     "generated_at": Utc::now(),
                     "policies": cfg.quotas,
+                    "policy_summary": policy_summary,
                     "decisions": decisions,
                     "usage_summary": usage_summary
                 }),

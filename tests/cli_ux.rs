@@ -1202,6 +1202,18 @@ fn quota_status_and_report_are_scriptable_json() {
     let report = assert_success_json(report);
     assert_eq!(report["hours"], 1);
     assert_eq!(report["policies"].as_array().expect("policies").len(), 1);
+    assert_eq!(report["policy_summary"]["policy_count"], 1);
+    assert_eq!(report["policy_summary"]["total_requests_per_minute"], 2);
+    assert_eq!(report["policy_summary"]["total_tokens_per_day"], 100);
+    assert_eq!(report["policy_summary"]["by_team"][0]["team"], "platform");
+    assert_eq!(
+        report["policy_summary"]["by_team"][0]["subjects"],
+        json!(["alice"])
+    );
+    assert_eq!(
+        report["policy_summary"]["by_team"][0]["allowed_models"],
+        json!(["llama"])
+    );
     assert!(report["decisions"].is_array());
     assert!(report["usage_summary"].is_object());
 }

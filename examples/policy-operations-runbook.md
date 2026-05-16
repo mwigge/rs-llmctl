@@ -88,3 +88,16 @@ Attach `retention-plan-envelope.json` and the verification output to the change
 record. Review the envelope `metadata sha256`, confirm the verification hashes
 match, and confirm the payload keeps `dry_run` set to true and `deletes` set to
 false.
+
+## Enterprise Reporting Metadata Review
+
+Attach data/audit summaries and quota/team governance summaries to the same
+change record. Data/audit summaries should show usage totals, audit event
+counts, retention windows, and envelope hashes. Quota/team governance summaries
+should show quota limits, team attribution, model aliases, and policy status.
+
+External client non-secret response metadata may be shared with approved
+AQE/OpenAI-compatible clients when it is limited to request identifiers, model
+aliases, policy status, quota state, and audit correlation fields. These fields
+are safe for AQE/OpenAI-compatible clients because AQE/OpenAI-compatible clients
+can consume these summaries without exposing secrets.

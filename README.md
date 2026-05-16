@@ -305,6 +305,19 @@ endpoint usage is captured through audit trails, usage reports, quota checks,
 and per-request reporting so regulated deployments can review who used which
 model, when, and under which policy.
 
+Enterprise reporting should publish data/audit summaries and quota/team
+governance summaries as reviewed artifacts. The data/audit summaries should
+include usage totals, audit event counts, retention windows, and export envelope
+hashes. The quota/team governance summaries should include quota limits, team
+attribution, model aliases, and policy status so reviewers can compare intended
+policy with observed use.
+
+External client non-secret response metadata is safe for AQE/OpenAI-compatible
+clients when it contains only request identifiers, model aliases, policy status,
+quota state, and audit correlation fields. AQE/OpenAI-compatible clients can
+consume these summaries without exposing secrets because API keys, bearer
+tokens, collector headers, and raw prompts remain outside reporting metadata.
+
 ## CLI
 
 `llmctl init` writes the default TOML config, creates the model directory, and

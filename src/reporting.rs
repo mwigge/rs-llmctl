@@ -52,6 +52,8 @@ pub struct MonthlyAuditReport {
     pub month: u32,
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
+    #[serde(default)]
+    pub report_summary: ReportSummary,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub usage_summary: UsageSummary,
@@ -113,10 +115,42 @@ pub struct UsageBreakdown {
     pub average_latency_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReportSummary {
+    pub audit_event_count: u64,
+    pub usage_event_count: u64,
+    pub observation_event_count: u64,
+    pub model_record_count: u64,
+    pub quota_decision_count: u64,
+    pub usage: UsageSummary,
+}
+
+impl ReportSummary {
+    pub fn new(
+        audit_event_count: u64,
+        usage_event_count: u64,
+        observation_event_count: u64,
+        model_record_count: u64,
+        quota_decision_count: u64,
+        usage: UsageSummary,
+    ) -> Self {
+        Self {
+            audit_event_count,
+            usage_event_count,
+            observation_event_count,
+            model_record_count,
+            quota_decision_count,
+            usage,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataExport {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
+    #[serde(default)]
+    pub report_summary: ReportSummary,
     pub audit_events: Vec<AuditEvent>,
     pub usage_events: Vec<UsageEvent>,
     pub usage_summary: UsageSummary,
@@ -137,12 +171,21 @@ pub async fn monthly_audit_report(
     let observations = storage.observation_events_between(from, to).await?;
     let models = storage.list_models().await?;
     let usage_summary = summarize_usage(&usage_events);
+    let report_summary = summarize_report(
+        audit_events.len(),
+        usage_events.len(),
+        observations.len(),
+        models.len(),
+        quota_decisions.len(),
+        usage_summary.clone(),
+    );
 
     Ok(MonthlyAuditReport {
         year,
         month,
         from,
         to,
+        report_summary,
         audit_events,
         usage_events,
         usage_summary,
@@ -228,16 +271,31 @@ pub async fn data_export(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<DataExport> {
+    let audit_events = storage.audit_events_between(from, to).await?;
     let usage_events = storage.usage_events_between(from, to).await?;
+    let observation_events = storage.observation_events_between(from, to).await?;
+    let quota_decisions = storage.quota_decisions_between(from, to).await?;
+    let models = storage.list_models().await?;
+    let usage_summary = summarize_usage(&usage_events);
+    let report_summary = summarize_report(
+        audit_events.len(),
+        usage_events.len(),
+        observation_events.len(),
+        models.len(),
+        quota_decisions.len(),
+        usage_summary.clone(),
+    );
+
     Ok(DataExport {
         from,
         to,
-        audit_events: storage.audit_events_between(from, to).await?,
-        usage_summary: summarize_usage(&usage_events),
+        report_summary,
+        audit_events,
+        usage_summary,
         usage_events,
-        observation_events: storage.observation_events_between(from, to).await?,
-        quota_decisions: storage.quota_decisions_between(from, to).await?,
-        models: storage.list_models().await?,
+        observation_events,
+        quota_decisions,
+        models,
     })
 }
 
@@ -377,6 +435,24 @@ pub fn summarize_usage(events: &[UsageEvent]) -> UsageSummary {
     summary.by_team = finish_breakdowns(by_team);
     summary.by_actor = finish_breakdowns(by_actor);
     summary
+}
+
+pub fn summarize_report(
+    audit_event_count: usize,
+    usage_event_count: usize,
+    observation_event_count: usize,
+    model_record_count: usize,
+    quota_decision_count: usize,
+    usage: UsageSummary,
+) -> ReportSummary {
+    ReportSummary::new(
+        audit_event_count as u64,
+        usage_event_count as u64,
+        observation_event_count as u64,
+        model_record_count as u64,
+        quota_decision_count as u64,
+        usage,
+    )
 }
 
 pub fn month_bounds(year: i32, month: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -724,6 +800,13 @@ mod tests {
         assert_eq!(report.quota_decisions.len(), 1);
         assert_eq!(report.observations.len(), 1);
         assert_eq!(report.models.len(), 1);
+        assert_eq!(report.report_summary.audit_event_count, 1);
+        assert_eq!(report.report_summary.usage_event_count, 1);
+        assert_eq!(report.report_summary.observation_event_count, 1);
+        assert_eq!(report.report_summary.model_record_count, 1);
+        assert_eq!(report.report_summary.quota_decision_count, 1);
+        assert_eq!(report.report_summary.usage.request_count, 1);
+        assert_eq!(report.report_summary.usage.total_tokens, 30);
 
         let report_envelope =
             monthly_audit_report_envelope(&storage, now.year(), now.month()).await?;
@@ -775,6 +858,13 @@ mod tests {
         assert_eq!(export.usage_summary.request_count, 1);
         assert_eq!(export.observation_events.len(), 1);
         assert_eq!(export.quota_decisions.len(), 1);
+        assert_eq!(export.report_summary.audit_event_count, 1);
+        assert_eq!(export.report_summary.usage_event_count, 1);
+        assert_eq!(export.report_summary.observation_event_count, 1);
+        assert_eq!(export.report_summary.model_record_count, 1);
+        assert_eq!(export.report_summary.quota_decision_count, 1);
+        assert_eq!(export.report_summary.usage.by_model[0].key, "llama");
+        assert_eq!(export.report_summary.usage.by_model[0].total_tokens, 30);
 
         let export_envelope = data_export_envelope(&storage, from, to).await?;
         assert_eq!(export_envelope.metadata.report_kind, ReportKind::DataExport);
@@ -782,6 +872,34 @@ mod tests {
             export_envelope.metadata.sha256,
             canonical_sha256(&export_envelope.payload)?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn report_summary_serializes_only_aggregate_reporting_fields() -> Result<()> {
+        let usage = summarize_usage(&[usage_event(
+            Uuid::new_v4(),
+            "llama",
+            "alice",
+            "platform",
+            10,
+            20,
+            100,
+        )]);
+        let summary = ReportSummary::new(2, 1, 3, 4, 5, usage);
+
+        let value = serde_json::to_value(&summary)?;
+
+        assert_eq!(value["audit_event_count"], 2);
+        assert_eq!(value["usage_event_count"], 1);
+        assert_eq!(value["observation_event_count"], 3);
+        assert_eq!(value["model_record_count"], 4);
+        assert_eq!(value["quota_decision_count"], 5);
+        assert_eq!(value["usage"]["total_tokens"], 30);
+        assert!(value.get("audit_events").is_none());
+        assert!(value.get("quota_decisions").is_none());
+        assert!(value.get("detail_json").is_none());
+        assert!(value.get("policy_json").is_none());
         Ok(())
     }
 

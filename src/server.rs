@@ -51,7 +51,13 @@ pub fn router(cfg: Config, storage: Storage) -> Router {
                 .allow_origin(Any)
                 .allow_methods([Method::GET, Method::POST])
                 .allow_headers([AUTHORIZATION, CONTENT_TYPE, request_id_header_name()])
-                .expose_headers([request_id_header_name()]),
+                .expose_headers([
+                    request_id_header_name(),
+                    model_count_header_name(),
+                    model_header_name(),
+                    upstream_model_header_name(),
+                    quota_decision_header_name(),
+                ]),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
@@ -178,7 +184,7 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
     )
     .await;
 
-    with_request_id(
+    let response = with_request_id(
         Json(ModelList {
             object: "list",
             data: routed_models(&state.cfg)
@@ -188,7 +194,8 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
         })
         .into_response(),
         request_id,
-    )
+    );
+    with_model_count(response, state.cfg.models.len())
 }
 
 async fn chat_completions(
@@ -415,6 +422,7 @@ async fn chat_completions(
             request_id,
             principal,
             model,
+            route.upstream_alias,
             started,
             upstream_response,
         )
@@ -425,6 +433,7 @@ async fn chat_completions(
             request_id,
             principal,
             model,
+            route.upstream_alias,
             started,
             upstream_response,
         )
@@ -437,6 +446,7 @@ async fn json_upstream(
     request_id: Uuid,
     principal: Principal,
     model: String,
+    upstream_model: String,
     started: Instant,
     upstream_response: reqwest::Response,
 ) -> Response {
@@ -491,13 +501,18 @@ async fn json_upstream(
         Some(request_id),
         principal,
         "chat.completions",
-        model,
+        model.clone(),
         status_text,
         json!({ "status": status.as_u16() }),
     )
     .await;
 
-    build_response(status, headers, Body::from(bytes), request_id)
+    let response = build_response(status, headers, Body::from(bytes), request_id);
+    if status.is_success() {
+        with_chat_metadata(response, &model, &upstream_model, "allowed")
+    } else {
+        response
+    }
 }
 
 async fn stream_upstream(
@@ -505,6 +520,7 @@ async fn stream_upstream(
     request_id: Uuid,
     principal: Principal,
     model: String,
+    upstream_model: String,
     started: Instant,
     upstream_response: reqwest::Response,
 ) -> Response {
@@ -516,6 +532,8 @@ async fn stream_upstream(
     } else {
         "upstream_error"
     };
+    let response_model = model.clone();
+    let response_upstream_model = upstream_model.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
     let stream = async_stream::stream! {
         while let Some(chunk) = upstream_stream.next().await {
@@ -574,7 +592,17 @@ async fn stream_upstream(
         )
         .await;
     };
-    build_response(status, headers, Body::from_stream(stream), request_id)
+    let response = build_response(status, headers, Body::from_stream(stream), request_id);
+    if status.is_success() {
+        with_chat_metadata(
+            response,
+            &response_model,
+            &response_upstream_model,
+            "allowed",
+        )
+    } else {
+        response
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -861,8 +889,64 @@ fn with_request_id(mut response: Response, request_id: Uuid) -> Response {
     response
 }
 
+fn with_model_count(mut response: Response, count: usize) -> Response {
+    insert_header_value(
+        response.headers_mut(),
+        model_count_header_name(),
+        &count.to_string(),
+    );
+    response
+}
+
+fn with_chat_metadata(
+    mut response: Response,
+    model: &str,
+    upstream_model: &str,
+    quota_decision: &str,
+) -> Response {
+    insert_header_value(response.headers_mut(), model_header_name(), model);
+    insert_header_value(
+        response.headers_mut(),
+        upstream_model_header_name(),
+        upstream_model,
+    );
+    insert_header_value(
+        response.headers_mut(),
+        quota_decision_header_name(),
+        quota_decision,
+    );
+    response
+}
+
+fn insert_header_value(headers: &mut HeaderMap, name: HeaderName, value: &str) {
+    match HeaderValue::from_str(value) {
+        Ok(value) => {
+            headers.insert(name, value);
+        }
+        Err(err) => {
+            tracing::warn!(header = %name, error = %err, "skipping invalid response metadata header");
+        }
+    }
+}
+
 fn request_id_header_name() -> HeaderName {
     HeaderName::from_static("x-request-id")
+}
+
+fn model_count_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-model-count")
+}
+
+fn model_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-model")
+}
+
+fn upstream_model_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-upstream-model")
+}
+
+fn quota_decision_header_name() -> HeaderName {
+    HeaderName::from_static("x-llmctl-quota-decision")
 }
 
 fn normalize_upstream(raw: &str) -> String {

@@ -38,6 +38,17 @@ async fn lists_openai_compatible_models() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-model-count")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_response_headers_do_not_leak(
+        response.headers(),
+        &["/models/alpha.gguf", TOKEN, &cfg_api_key_hash()],
+    );
     let body = response_json(response).await;
     assert_eq!(body["object"], "list");
     assert_eq!(body["data"][0]["id"], "alpha");
@@ -220,6 +231,37 @@ async fn chat_completions_non_streaming_passthrough_returns_upstream_response() 
         .unwrap()
         .parse::<Uuid>()
         .expect("generated request id");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("llama")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-upstream-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("llama")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-quota-decision")
+            .and_then(|value| value.to_str().ok()),
+        Some("allowed")
+    );
+    assert_response_headers_do_not_leak(
+        response.headers(),
+        &[
+            "hello",
+            "127.0.0.1",
+            "/models/llama.gguf",
+            TOKEN,
+            &cfg_api_key_hash(),
+        ],
+    );
     let body = response_json(response).await;
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["model"], "llama");
@@ -231,6 +273,53 @@ async fn chat_completions_non_streaming_passthrough_returns_upstream_response() 
     assert_eq!(upstream_request["model"], "llama");
     assert_eq!(upstream_request["messages"], request_body["messages"]);
     assert_eq!(upstream_request["stream"], false);
+}
+
+#[tokio::test]
+async fn chat_completions_reports_requested_and_upstream_model_metadata() {
+    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
+    let mut cfg = config_with_models(vec![model("light"), model("heavy")]);
+    cfg.mode = Mode::Weighted;
+    cfg.models[0].weight = 1;
+    cfg.models[1].weight = 50;
+    cfg.server.llama_server = upstream;
+    let app = test_app(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "light", "messages": [], "stream": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("light")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-upstream-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("heavy")
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["model"], "heavy");
+
+    let upstream_request = upstream_requests.recv().await.expect("upstream request");
+    assert_eq!(upstream_request["model"], "heavy");
 }
 
 #[tokio::test]
@@ -335,6 +424,37 @@ async fn chat_completions_streaming_passthrough_returns_sse_and_records_zero_tok
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("llama")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-upstream-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("llama")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-quota-decision")
+            .and_then(|value| value.to_str().ok()),
+        Some("allowed")
+    );
+    assert_response_headers_do_not_leak(
+        response.headers(),
+        &[
+            "hello",
+            "127.0.0.1",
+            "/models/llama.gguf",
+            TOKEN,
+            &cfg_api_key_hash(),
+        ],
     );
 
     let bytes = to_bytes(response.into_body(), usize::MAX)
@@ -496,6 +616,24 @@ fn model(alias: &str) -> ModelConfig {
 
 fn bearer() -> String {
     format!("Bearer {TOKEN}")
+}
+
+fn cfg_api_key_hash() -> String {
+    hex::encode(Sha256::digest(TOKEN.as_bytes()))
+}
+
+fn assert_response_headers_do_not_leak(headers: &axum::http::HeaderMap, forbidden: &[&str]) {
+    let values = headers
+        .iter()
+        .filter_map(|(_, value)| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in forbidden {
+        assert!(
+            !values.contains(secret),
+            "response headers leaked forbidden value: {secret}"
+        );
+    }
 }
 
 async fn response_json(response: axum::response::Response) -> Value {

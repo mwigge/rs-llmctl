@@ -10,6 +10,10 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn normalize_doc_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[test]
 fn ci_workflow_enforces_core_rust_gates() {
     let workflow = read(".github/workflows/ci.yml");
@@ -220,6 +224,47 @@ fn policy_runbook_documents_strict_passive_review_expectations() {
         assert!(
             !docs_lower.contains(forbidden),
             "policy runbook docs should stay passive and not include `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn docs_pin_enterprise_reporting_and_client_safe_metadata() {
+    let docs = format!(
+        "{}\n{}",
+        read("README.md"),
+        read("examples/policy-operations-runbook.md")
+    );
+    let docs_lower = docs.to_lowercase();
+    let docs_flat = normalize_doc_text(&docs_lower);
+
+    for required in [
+        "data/audit summaries",
+        "quota/team governance summaries",
+        "external client non-secret response metadata",
+        "safe for aqe/openai-compatible clients",
+        "aqe/openai-compatible clients can consume these summaries",
+        "without exposing secrets",
+    ] {
+        assert!(
+            docs_flat.contains(required),
+            "enterprise docs should cover `{required}`"
+        );
+    }
+
+    for required in [
+        "usage totals",
+        "audit event counts",
+        "retention windows",
+        "quota limits",
+        "team attribution",
+        "request identifiers",
+        "model aliases",
+        "policy status",
+    ] {
+        assert!(
+            docs_lower.contains(required),
+            "enterprise reporting docs should mention `{required}`"
         );
     }
 }
