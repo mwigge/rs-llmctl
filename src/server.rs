@@ -1,5 +1,8 @@
 use crate::audit::{AuditEvent, UsageEvent};
 use crate::config::{Config, Mode, ModelConfig};
+use crate::observability::{
+    emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
+};
 use crate::quota::{check_quota, matching_quota_policy, Principal};
 use crate::rag::{lexical_search, SearchDocument};
 use crate::storage::{QuotaDecisionRecord, Storage};
@@ -86,6 +89,7 @@ pub fn router_with_worker_control(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(proxy_embeddings))
         .route("/v1/local/search", post(local_search))
+        .route("/v1/local/recommendations", post(local_recommendations))
         .route("/v1/admin/swap", post(admin_swap))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -414,6 +418,96 @@ async fn local_search(
         .into_response(),
         request_id,
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalRecommendationRequest {
+    task: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    documents: Vec<SearchDocument>,
+}
+
+async fn local_recommendations(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<LocalRecommendationRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let principal = match authenticate(&state.cfg, &headers) {
+        Ok(principal) => principal,
+        Err(err) => {
+            return with_request_id(
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
+                request_id,
+            );
+        }
+    };
+
+    if !principal.has_scope("chat") {
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "missing chat scope".to_string(),
+            ),
+            request_id,
+        );
+    }
+
+    let hits = lexical_search(&request.task, &request.documents, request.limit.min(50));
+    let recommendations = local_recommendation_items(&request.task, &hits);
+    record_audit(
+        &state,
+        Some(request_id),
+        principal,
+        "local.recommendations",
+        "documents",
+        "allowed",
+        json!({
+            "documents": request.documents.len(),
+            "hits": hits.len(),
+            "recommendations": recommendations.len()
+        }),
+    )
+    .await;
+    with_request_id(
+        Json(json!({
+            "object": "recommendation.results",
+            "task": request.task,
+            "data": hits,
+            "recommendations": recommendations
+        }))
+        .into_response(),
+        request_id,
+    )
+}
+
+fn local_recommendation_items(
+    task: &str,
+    hits: &[crate::rag::SearchHit],
+) -> Vec<BTreeMap<&'static str, String>> {
+    hits.iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, hit)| {
+            let title = hit.title.clone().unwrap_or_else(|| hit.id.clone());
+            BTreeMap::from([
+                ("rank", (index + 1).to_string()),
+                ("document_id", hit.id.clone()),
+                ("title", title.clone()),
+                ("reason", recommendation_reason(task, &title)),
+            ])
+        })
+        .collect()
+}
+
+fn recommendation_reason(task: &str, title: &str) -> String {
+    let task = task.trim();
+    if task.is_empty() {
+        return format!("Use `{title}` as supporting local context.");
+    }
+    format!("Use `{title}` because it matches local context for `{task}`.")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1561,6 +1655,28 @@ async fn record_audit(
     if let Err(err) = state.storage.insert_audit_event(&event).await {
         tracing::warn!(error = %err, "failed to record audit event");
     }
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Span,
+        TelemetryEventName::RequestRouting,
+        Utc::now(),
+        BTreeMap::from([
+            ("llmctl.request_id".to_string(), json_string(request_id)),
+            (
+                "llmctl.audit.action".to_string(),
+                json!(event.action.as_str()),
+            ),
+            (
+                "llmctl.audit.resource".to_string(),
+                json!(event.resource.as_str()),
+            ),
+            (
+                "llmctl.audit.outcome".to_string(),
+                json!(event.outcome.as_str()),
+            ),
+            ("llmctl.actor".to_string(), json!(event.actor.as_str())),
+            ("llmctl.team".to_string(), json!(event.team.as_str())),
+        ]),
+    ));
 }
 
 async fn record_swap_execution(
@@ -1609,6 +1725,31 @@ async fn record_quota_decision(
     if let Err(err) = state.storage.insert_quota_decision(&record).await {
         tracing::warn!(error = %err, "failed to record quota decision");
     }
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Span,
+        TelemetryEventName::QuotaDecision,
+        Utc::now(),
+        BTreeMap::from([
+            ("llmctl.request_id".to_string(), json_string(request_id)),
+            ("llmctl.model".to_string(), json!(model)),
+            (
+                "llmctl.actor".to_string(),
+                json!(principal.subject.as_str()),
+            ),
+            ("llmctl.team".to_string(), json!(principal.team.as_str())),
+            ("llmctl.quota.allowed".to_string(), json!(decision.allowed)),
+            (
+                "llmctl.quota.reason".to_string(),
+                json!(decision.reason.as_str()),
+            ),
+        ]),
+    ));
+}
+
+fn json_string(value: Option<Uuid>) -> Value {
+    value
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
 }
 
 struct UsageRecordInput<'a> {
@@ -1641,6 +1782,30 @@ async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
 }
 
 fn record_usage_telemetry(event: &UsageEvent) {
+    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
+        TelemetrySignal::Span,
+        TelemetryEventName::RequestRouting,
+        Utc::now(),
+        BTreeMap::from([
+            (
+                "llmctl.request_id".to_string(),
+                json!(event.request_id.to_string()),
+            ),
+            ("llmctl.model".to_string(), json!(event.model.as_str())),
+            ("llmctl.actor".to_string(), json!(event.actor.as_str())),
+            ("llmctl.team".to_string(), json!(event.team.as_str())),
+            (
+                "gen_ai.usage.input_tokens".to_string(),
+                json!(event.input_tokens),
+            ),
+            (
+                "gen_ai.usage.output_tokens".to_string(),
+                json!(event.output_tokens),
+            ),
+            ("llmctl.latency_ms".to_string(), json!(event.latency_ms)),
+            ("llmctl.status".to_string(), json!(event.status.as_str())),
+        ]),
+    ));
     let attributes = [
         KeyValue::new("llmctl.model", event.model.clone()),
         KeyValue::new("llmctl.actor", event.actor.clone()),

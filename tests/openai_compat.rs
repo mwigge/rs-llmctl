@@ -417,6 +417,47 @@ async fn local_search_returns_ranked_hits_for_code_assistance_substrate() {
 }
 
 #[tokio::test]
+async fn local_recommendations_rank_local_material_for_ai_developer_workflows() {
+    let app = test_app(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/recommendations")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "task": "build code review recommendations from local docs",
+                        "documents": [
+                            {
+                                "id": "ops",
+                                "title": "Operations Notes",
+                                "content": "model lifecycle and server status"
+                            },
+                            {
+                                "id": "code-review",
+                                "title": "Code Review Guide",
+                                "content": "code review recommendations and local search"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "recommendation.results");
+    assert_eq!(body["data"][0]["id"], "code-review");
+    assert_eq!(body["recommendations"][0]["document_id"], "code-review");
+}
+
+#[tokio::test]
 async fn embeddings_endpoint_proxies_openai_compatible_payloads() {
     let (upstream, mut upstream_requests) = spawn_embeddings_upstream().await;
     let mut cfg = config_with_models(vec![model("embed")]);

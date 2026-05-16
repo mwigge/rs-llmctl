@@ -27,6 +27,8 @@ clients, swap it safely, and keep useful evidence about what happened.
   limits, and upstream timeout budgets.
 - Records audit events, usage events, quota decisions, resource observations,
   data exports, and monthly/per-request reporting.
+- Gives AI-developer workflows local search and local recommendation endpoints
+  for code, docs, and private operational material.
 - Keeps production CORS explicit so browser-based clients only work from
   approved origins.
 
@@ -227,6 +229,11 @@ llmctl --config /etc/rs-llmctl/config.toml integration aqe-contract
 It lists OpenAI paths, required auth scopes, safe response headers,
 quota/team reporting fields, and model aliases.
 
+Local AI-developer workflows can also use `/v1/local/search` and
+`/v1/local/recommendations` with caller-provided documents. That keeps private
+code and local material under the caller's control while still returning ranked
+context and recommendation metadata for an assistant or AQE workflow.
+
 ## Storage And Observability
 
 SQLite is the default runtime store. External database storage with Postgres is
@@ -240,7 +247,9 @@ API keys, or bearer tokens.
 
 OTel-oriented observability is configured through
 `observability.exporter.endpoint`, traces/metrics/logs switches, and
-environment-backed headers. Use `env:` for collector credentials.
+environment-backed headers. Use `env:` for collector credentials. Runtime
+events emit OTel-friendly signals for request routing, audit, quota, usage,
+resource snapshots, and drift observations.
 
 Compliance evidence is available through `llmctl compliance evidence`, with
 focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
@@ -248,10 +257,12 @@ focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 ## Deeper Docs
 
 - [Operations guide](docs/operations.md)
+- [AI developer workflows](docs/ai-developer-workflows.md)
 - [Security model](docs/security.md)
 - [Compliance evidence](docs/compliance.md)
 - [Observability and reporting](docs/observability-reporting.md)
 - [Storage notes](docs/storage.md)
+- [Final role review](docs/reviews/final-role-review.md)
 - [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)
 
 ## License

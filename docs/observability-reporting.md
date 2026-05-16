@@ -21,6 +21,20 @@ providers and bridges `tracing` events into OpenTelemetry logs. Request IDs,
 model aliases, quota decisions, usage totals, and lifecycle events are the
 correlation keys operators should expect to search by.
 
+Server-side request routing, audit events, quota decisions, usage records, drift
+observations, and resource snapshots emit OTel-friendly runtime event names:
+
+- `llmctl.request.routing`
+- `llmctl.quota.decision`
+- `llmctl.worker.lifecycle`
+- `llmctl.resource.snapshot`
+- `llmctl.drift.observation`
+- `llmctl.model.install.verification`
+
+Sensitive attributes are redacted before emission. Prompts, messages, bearer
+tokens, API keys, passwords, collector authorization headers, and local file
+paths are not exported as span/log attributes.
+
 ## Reports
 
 Reports focus on:

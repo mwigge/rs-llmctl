@@ -2,6 +2,7 @@ use crate::config::{Config, OtlpProtocol};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
+use opentelemetry::trace::{Span, Tracer};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -406,6 +407,73 @@ impl NoopTelemetryExporter {
     }
 }
 
+pub fn emit_runtime_telemetry(event: &RuntimeTelemetryEvent) {
+    let attributes = telemetry_key_values(event);
+    global::meter(crate::SERVICE_NAME)
+        .u64_counter("llmctl.runtime.events")
+        .with_description("Runtime telemetry events emitted by rs-llmctl")
+        .build()
+        .add(1, &attributes);
+
+    if matches!(event.signal, TelemetrySignal::Span) {
+        let tracer = global::tracer(crate::SERVICE_NAME);
+        let mut span = tracer.start(event.name.as_str().to_string());
+        for attribute in attributes {
+            span.set_attribute(attribute);
+        }
+        span.end();
+    }
+
+    tracing::info!(
+        telemetry_event = event.name.as_str(),
+        telemetry_signal = ?event.signal,
+        "runtime telemetry event emitted"
+    );
+}
+
+fn telemetry_key_values(event: &RuntimeTelemetryEvent) -> Vec<KeyValue> {
+    let mut attributes = vec![
+        KeyValue::new("llmctl.telemetry.name", event.name.as_str()),
+        KeyValue::new(
+            "llmctl.telemetry.signal",
+            match event.signal {
+                TelemetrySignal::Metric => "metric",
+                TelemetrySignal::Span => "span",
+                TelemetrySignal::Log => "log",
+            },
+        ),
+    ];
+    attributes.extend(
+        event
+            .attributes
+            .iter()
+            .filter_map(|(key, value)| json_to_key_value(key, value)),
+    );
+    attributes
+}
+
+fn json_to_key_value(key: &str, value: &Value) -> Option<KeyValue> {
+    match value {
+        Value::Bool(value) => Some(KeyValue::new(key.to_string(), *value)),
+        Value::Number(value) => value
+            .as_i64()
+            .map(|value| KeyValue::new(key.to_string(), value))
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .map(|value| KeyValue::new(key.to_string(), value))
+            })
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .map(|value| KeyValue::new(key.to_string(), value))
+            }),
+        Value::String(value) => Some(KeyValue::new(key.to_string(), value.clone())),
+        _ => None,
+    }
+}
+
 pub fn sanitize_otel_attributes(attributes: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
     attributes
         .into_iter()
@@ -513,6 +581,22 @@ mod tests {
             "/v1/chat/completions"
         );
         assert_eq!(serialized["events"][0]["attributes"]["quota.allowed"], true);
+    }
+
+    #[test]
+    fn runtime_telemetry_emitter_accepts_sanitized_span_attributes() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("llmctl.model".to_string(), json!("qwen"));
+        attrs.insert("llmctl.allowed".to_string(), json!(true));
+        attrs.insert("llmctl.tokens".to_string(), json!(42));
+        let event = RuntimeTelemetryEvent::new(
+            TelemetrySignal::Span,
+            TelemetryEventName::RequestRouting,
+            Utc::now(),
+            attrs,
+        );
+
+        emit_runtime_telemetry(&event);
     }
 
     #[test]
