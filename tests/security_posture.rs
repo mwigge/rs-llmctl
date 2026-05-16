@@ -15,6 +15,13 @@ fn hashed_key() -> ApiKeyConfig {
     }
 }
 
+fn enable_tls_termination(cfg: &mut Config) {
+    cfg.security.tls_termination.enabled = true;
+    cfg.security.tls_termination.provider = Some("envoy-edge".to_string());
+    cfg.security.tls_termination.evidence = Some("change-record-123".to_string());
+    cfg.security.tls_termination.m_tls = true;
+}
+
 #[test]
 fn external_bind_requires_auth_and_hashed_api_keys() {
     let mut cfg = Config::default();
@@ -39,7 +46,25 @@ fn external_bind_requires_auth_and_hashed_api_keys() {
     );
 
     cfg.security.api_keys = vec![hashed_key()];
+    enable_tls_termination(&mut cfg);
     config::validate_production_security(&cfg).expect("valid production posture");
+}
+
+#[test]
+fn external_bind_requires_documented_tls_termination() {
+    let mut cfg = Config::default();
+    cfg.server.host = "0.0.0.0".to_string();
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![hashed_key()];
+
+    let err = config::validate_production_security(&cfg).expect_err("TLS termination is required");
+    assert!(
+        err.to_string().contains("TLS termination"),
+        "unexpected error: {err}"
+    );
+
+    enable_tls_termination(&mut cfg);
+    config::validate_production_security(&cfg).expect("documented TLS termination is accepted");
 }
 
 #[test]
@@ -56,6 +81,7 @@ fn production_security_accepts_known_api_key_scopes() {
         ],
         ..hashed_key()
     }];
+    enable_tls_termination(&mut cfg);
 
     config::validate_production_security(&cfg).expect("known scopes are allowed");
 }
@@ -65,6 +91,7 @@ fn production_security_rejects_unknown_api_key_scopes() {
     let mut cfg = Config::default();
     cfg.security.production = true;
     cfg.security.require_auth = true;
+    enable_tls_termination(&mut cfg);
     cfg.security.api_keys = vec![ApiKeyConfig {
         scopes: vec!["chat".to_string(), "models:read".to_string()],
         ..hashed_key()
@@ -82,6 +109,7 @@ fn production_security_rejects_empty_api_key_scopes() {
     let mut cfg = Config::default();
     cfg.security.production = true;
     cfg.security.require_auth = true;
+    enable_tls_termination(&mut cfg);
     cfg.security.api_keys = vec![ApiKeyConfig {
         scopes: vec!["chat".to_string(), "".to_string()],
         ..hashed_key()
@@ -110,6 +138,7 @@ fn production_security_rejects_ambiguous_api_key_identity() {
     let mut cfg = Config::default();
     cfg.security.production = true;
     cfg.security.require_auth = true;
+    enable_tls_termination(&mut cfg);
     cfg.security.api_keys = vec![ApiKeyConfig {
         id: " ".to_string(),
         ..hashed_key()
@@ -176,6 +205,7 @@ fn production_security_rejects_plaintext_observability_secrets() {
     cfg.security.production = true;
     cfg.security.require_auth = true;
     cfg.security.api_keys = vec![hashed_key()];
+    enable_tls_termination(&mut cfg);
     cfg.observability.exporter.headers.insert(
         "authorization".to_string(),
         "Bearer plain-collector-token".to_string(),

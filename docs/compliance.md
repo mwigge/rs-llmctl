@@ -51,6 +51,7 @@ Monthly evidence should include:
 - `security audit-config`;
 - `compliance evidence`;
 - SBOM, checksums, and release signature for deployed binaries.
+- TLS termination or mTLS evidence from `security audit-config`.
 
 ## SBOM, Provenance, And Signing
 
@@ -73,4 +74,5 @@ evidence. `packaging/sign-release.sh` supports `cosign` or `minisign`.
 Production external bind must sit behind TLS termination or an mTLS-capable
 service mesh/load balancer. Keep `security.require-auth = true`, pin allowed
 CORS origins, and document the termination point in the deployment change
-record.
+record. `security check` rejects production external bind when
+`security.tls-termination.enabled`, `provider`, or `evidence` is missing.

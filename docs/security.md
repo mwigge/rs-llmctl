@@ -8,6 +8,7 @@ not a casual development endpoint.
 The production posture is PCI DSS v4.0.1-aligned:
 
 - authentication is required for external bind;
+- external bind requires documented TLS termination or mTLS evidence;
 - API keys are stored as SHA-256 digests only;
 - scopes control access to chat, model listing, and admin operations;
 - quotas and admission limits protect shared capacity;
@@ -37,3 +38,19 @@ AQE/OpenAI-compatible clients can use the API through
 `OPENAI_BASE_URL=http://host:8765/v1`. Safe response headers include request
 identifiers, model aliases, quota state, and policy status. They do not include
 upstream URLs, prompts, file paths, API keys, or bearer tokens.
+
+Production external bind should normally be published as HTTPS through a load
+balancer, ingress, reverse proxy, or service mesh. The runtime validates that
+the deployment config documents that control:
+
+```toml
+[security.tls-termination]
+enabled = true
+provider = "envoy-edge"
+evidence = "change-record-or-runbook-url"
+m-tls = true
+```
+
+`llmctl security check`, `llmctl security audit-config`, and
+`llmctl compliance evidence` include the same TLS evidence fields so monthly
+reviews can prove the control was present at deployment time.

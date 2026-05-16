@@ -36,6 +36,22 @@ expected SHA-256, no redirects, and a bounded network timeout.
 - `fallback`: prefer the requested model when it has weight, otherwise use the
   preferred weighted model.
 
+The daemon exposes live swap orchestration through the authenticated admin
+endpoint:
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $LLMCTL_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"active":"qwen-prod","replacement":"qwen-canary","mode":"hot"}' \
+  http://127.0.0.1:8765/v1/admin/swap
+```
+
+The caller needs the `admin` scope. Hot swap starts and probes the replacement
+before draining the active worker. Cold swap drains and stops the active worker
+before starting the replacement. Each execution is written to the audit trail
+with request ID, planned steps, worker statuses, and success state.
+
 ## Resource Budget
 
 The default resource budget is 80%. That applies to CPU/RAM/VRAM planning so

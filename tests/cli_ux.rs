@@ -378,6 +378,12 @@ production = true
 require_auth = true
 bind_external = true
 
+[security.tls-termination]
+enabled = true
+provider = "envoy-edge"
+evidence = "change-record-123"
+m-tls = true
+
 [[security.api_keys]]
 id = "operator"
 sha256 = "{api_key_hash}"
@@ -2104,6 +2110,12 @@ context_size = 8192
 production = true
 require_auth = true
 bind_external = true
+
+[security.tls-termination]
+enabled = true
+provider = "envoy-edge"
+evidence = "change-record-123"
+m-tls = true
 
 [[security.api_keys]]
 id = "operator"

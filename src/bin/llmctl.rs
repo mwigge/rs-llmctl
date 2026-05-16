@@ -685,6 +685,7 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                     "require_auth": cfg.security.require_auth,
                     "bind_external": cfg.security.bind_external,
                     "host": cfg.server.host,
+                    "tls_termination": cfg.security.tls_termination,
                     "api_keys": cfg.security.api_keys.len()
                 }),
             )
@@ -990,8 +991,28 @@ fn compliance_evidence(cfg: &Config) -> serde_json::Value {
             "bind_external": cfg.security.bind_external || is_external_host(&cfg.server.host),
             "hashed_api_keys": cfg.security.api_keys.iter().all(|key| key.sha256.len() == 64),
             "api_key_count": cfg.security.api_keys.len(),
+            "tls_termination": {
+                "enabled": cfg.security.tls_termination.enabled,
+                "provider": cfg.security.tls_termination.provider.as_deref(),
+                "evidence": cfg.security.tls_termination.evidence.as_deref(),
+                "m_tls": cfg.security.tls_termination.m_tls
+            },
             "audit_retention_days": cfg.audit.retention_days,
             "monthly_reports": cfg.audit.monthly_reports
+        },
+        "evidence_completeness": {
+            "production_security_validation": cfg.security.production || cfg.security.bind_external || is_external_host(&cfg.server.host),
+            "hashed_api_keys": cfg.security.api_keys.iter().all(|key| key.sha256.len() == 64),
+            "tls_termination_documented": cfg.security.tls_termination.enabled
+                && cfg.security.tls_termination.provider.as_deref().is_some_and(|value| !value.trim().is_empty())
+                && cfg.security.tls_termination.evidence.as_deref().is_some_and(|value| !value.trim().is_empty()),
+            "audit_reports_enabled": cfg.audit.monthly_reports && cfg.audit.retention_days > 0,
+            "otel_enabled": cfg.observability.traces_enabled || cfg.observability.metrics_enabled || cfg.observability.logs_enabled,
+            "release_integrity_scripts": [
+                "packaging/generate-sbom.sh",
+                "packaging/generate-checksums.sh",
+                "packaging/sign-release.sh"
+            ]
         },
         "cra_article_14": {
             "regulatory_start_date": "2026-09-11",
@@ -1019,7 +1040,7 @@ fn compliance_evidence(cfg: &Config) -> serde_json::Value {
                 { "area": "access_control", "evidence": "hashed API keys, scopes, auth-required production validation" },
                 { "area": "audit_logging", "evidence": "audit events, request IDs, report envelopes, retention plan/apply" },
                 { "area": "vulnerability_management", "evidence": "cargo audit, SBOM generation, signed release checksums" },
-                { "area": "secure_configuration", "evidence": "security check, audit-config, least privilege systemd unit" },
+                { "area": "secure_configuration", "evidence": "security check, audit-config, documented TLS termination or mTLS, least privilege systemd unit" },
                 { "area": "monitoring", "evidence": "OTel traces, metrics, logs, resource snapshots, drift observations" }
             ],
             "regular_reports": [
@@ -1387,6 +1408,32 @@ async fn audit_config_report(
     {
         findings.push("external/production serving requires authentication".to_string());
     }
+    if cfg.security.production || external_bind {
+        if !cfg.security.tls_termination.enabled {
+            findings.push(
+                "external/production serving requires documented TLS termination or mTLS"
+                    .to_string(),
+            );
+        }
+        if cfg
+            .security
+            .tls_termination
+            .provider
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            findings.push("TLS termination must declare a provider".to_string());
+        }
+        if cfg
+            .security
+            .tls_termination
+            .evidence
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            findings.push("TLS termination must declare evidence".to_string());
+        }
+    }
     if cfg
         .observability
         .exporter
@@ -1421,6 +1468,12 @@ async fn audit_config_report(
             "api_key_count": cfg.security.api_keys.len(),
             "hashed_api_keys": hashed_api_keys,
             "keys": key_reports
+        },
+        "tls_termination": {
+            "enabled": cfg.security.tls_termination.enabled,
+            "provider": cfg.security.tls_termination.provider.as_deref(),
+            "evidence": cfg.security.tls_termination.evidence.as_deref(),
+            "m_tls": cfg.security.tls_termination.m_tls
         },
         "observability": {
             "endpoint_configured": cfg.observability.exporter.endpoint.is_some() || cfg.observability.otlp_endpoint.is_some(),

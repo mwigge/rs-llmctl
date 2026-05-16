@@ -3,7 +3,10 @@ use crate::config::{Config, Mode, ModelConfig};
 use crate::quota::{check_quota, matching_quota_policy, Principal};
 use crate::rag::{lexical_search, SearchDocument};
 use crate::storage::{QuotaDecisionRecord, Storage};
-use crate::worker::StartupPlan;
+use crate::worker::{
+    PlannedWorker, StartupPlan, SwapExecution, SwapMode, TokioWorkerRunner, WorkerId,
+    WorkerSupervisor,
+};
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -23,7 +26,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -40,6 +43,7 @@ pub struct ServerState {
     upstreams: BTreeMap<String, String>,
     admission: AdmissionController,
     serving_limits: ServingLimits,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
 }
 
 pub fn router(cfg: Config, storage: Storage) -> Router {
@@ -52,6 +56,15 @@ pub fn router_with_serving_limits(
     storage: Storage,
     serving_limits: ServingLimits,
 ) -> Router {
+    router_with_worker_control(cfg, storage, serving_limits, None)
+}
+
+pub fn router_with_worker_control(
+    cfg: Config,
+    storage: Storage,
+    serving_limits: ServingLimits,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+) -> Router {
     let upstreams = serving_upstreams(&cfg);
     let admission = AdmissionController::new(serving_limits.max_in_flight);
     let cors = cors_layer(&cfg);
@@ -62,6 +75,7 @@ pub fn router_with_serving_limits(
         upstreams,
         admission,
         serving_limits,
+        worker_control,
     };
 
     Router::new()
@@ -72,6 +86,7 @@ pub fn router_with_serving_limits(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(proxy_embeddings))
         .route("/v1/local/search", post(local_search))
+        .route("/v1/admin/swap", post(admin_swap))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
@@ -399,6 +414,117 @@ async fn local_search(
         .into_response(),
         request_id,
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminSwapRequest {
+    active: String,
+    replacement: String,
+    mode: SwapMode,
+}
+
+async fn admin_swap(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<AdminSwapRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let principal = match authenticate(&state.cfg, &headers) {
+        Ok(principal) => principal,
+        Err(err) => {
+            return with_request_id(
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
+                request_id,
+            );
+        }
+    };
+
+    if !principal.has_scope("admin") {
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "admin.swap",
+            &request.replacement,
+            "denied",
+            json!({ "reason": "missing admin scope" }),
+        )
+        .await;
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "missing admin scope".to_string(),
+            ),
+            request_id,
+        );
+    }
+
+    let Some(worker_control) = state.worker_control.clone() else {
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "admin.swap",
+            &request.replacement,
+            "failed",
+            json!({ "reason": "worker supervisor is not attached" }),
+        )
+        .await;
+        return with_request_id(
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "worker_control_unavailable",
+                "daemon worker supervisor is not attached".to_string(),
+            ),
+            request_id,
+        );
+    };
+
+    let active = WorkerId::new(request.active);
+    let Some(replacement) = replacement_worker(&state.cfg, &request.replacement) else {
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "admin.swap",
+            &request.replacement,
+            "rejected",
+            json!({ "reason": "replacement worker is not in startup plan" }),
+        )
+        .await;
+        return with_request_id(
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "unknown_worker",
+                "replacement worker is not in startup plan".to_string(),
+            ),
+            request_id,
+        );
+    };
+
+    let execution = {
+        let mut supervisor = worker_control.lock().await;
+        supervisor
+            .execute_swap(request.mode, &active, &replacement)
+            .await
+    };
+
+    record_swap_execution(&state, Some(request_id), principal, &execution).await;
+    let status = if execution.success {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    with_request_id((status, Json(execution)).into_response(), request_id)
+}
+
+fn replacement_worker(cfg: &Config, replacement: &str) -> Option<PlannedWorker> {
+    let replacement_id = WorkerId::new(replacement);
+    StartupPlan::from_config(cfg)
+        .workers
+        .into_iter()
+        .find(|planned| planned.worker.id == replacement_id)
 }
 
 async fn proxy_embeddings(
@@ -1437,6 +1563,34 @@ async fn record_audit(
     }
 }
 
+async fn record_swap_execution(
+    state: &ServerState,
+    request_id: Option<Uuid>,
+    principal: Principal,
+    execution: &SwapExecution,
+) {
+    record_audit(
+        state,
+        request_id,
+        principal,
+        "admin.swap",
+        execution.plan.replacement.as_str(),
+        if execution.success {
+            "allowed"
+        } else {
+            "failed"
+        },
+        json!({
+            "mode": execution.mode,
+            "active": execution.plan.active,
+            "replacement": execution.plan.replacement,
+            "steps": execution.plan.steps,
+            "statuses": execution.statuses,
+        }),
+    )
+    .await;
+}
+
 async fn record_quota_decision(
     state: &ServerState,
     request_id: Option<Uuid>,
@@ -1811,14 +1965,30 @@ pub async fn serve_with_storage_and_shutdown<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    serve_with_storage_worker_control_and_shutdown(cfg, storage, None, shutdown).await
+}
+
+pub async fn serve_with_storage_worker_control_and_shutdown<S>(
+    cfg: Config,
+    storage: Storage,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    axum::serve(listener, router(cfg, storage))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("serve HTTP API")
+    let limits = ServingLimits::from_config(&cfg);
+    axum::serve(
+        listener,
+        router_with_worker_control(cfg, storage, limits, worker_control),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("serve HTTP API")
 }
 
 pub async fn shutdown_signal() {
@@ -2047,6 +2217,7 @@ data: [DONE]
                     team: "platform".to_string(),
                     scopes: vec!["chat".to_string()],
                 }],
+                ..SecurityConfig::default()
             },
             ..Default::default()
         };

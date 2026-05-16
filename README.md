@@ -49,7 +49,8 @@ export OPENAI_API_KEY=<your-rs-llmctl-api-key>
 
 External bind is intentionally strict. Production configs must enable
 `security.require-auth` and `security.bind-external`, define hashed API keys,
-set quota policy, and use reviewed CORS origins for browser clients.
+document TLS termination or mTLS evidence, set quota policy, and use reviewed
+CORS origins for browser clients.
 
 ## Model Operations
 
@@ -148,6 +149,7 @@ The validation script runs daemon dry-run planning, `security check`,
 
 - external bind requires authentication and scoped API keys;
 - raw API keys are never stored in config;
+- external production bind requires documented TLS termination or mTLS evidence;
 - sensitive exporter headers must use `env:` references;
 - response headers expose only safe metadata such as request IDs, model aliases,
   quota state, and policy status;
@@ -169,6 +171,17 @@ sha256 = "<sha256-from-hash-key>"
 subject = "ops-admin"
 team = "platform"
 scopes = ["admin"]
+```
+
+For production external bind, record where TLS is terminated and where the
+operator evidence lives:
+
+```toml
+[security.tls-termination]
+enabled = true
+provider = "envoy-edge"
+evidence = "change-record-or-runbook-url"
+m-tls = true
 ```
 
 ## Policy And Reporting

@@ -18,6 +18,12 @@ production = true
 require_auth = true
 bind_external = true
 
+[security.tls-termination]
+enabled = true
+provider = "envoy-edge"
+evidence = "change-record-or-runbook-url"
+m-tls = true
+
 [[security.api_keys]]
 id = "prod-operator-placeholder"
 sha256 = "2222222222222222222222222222222222222222222222222222222222222222"

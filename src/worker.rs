@@ -575,12 +575,31 @@ impl LifecycleStep {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapPlan {
+    pub active: WorkerId,
+    pub replacement: WorkerId,
     pub steps: Vec<LifecycleStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwapMode {
+    Cold,
+    Hot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapExecution {
+    pub mode: SwapMode,
+    pub plan: SwapPlan,
+    pub statuses: Vec<WorkerStatus>,
+    pub success: bool,
 }
 
 impl SwapPlan {
     pub fn cold(active: WorkerId, replacement: WorkerId) -> Self {
         Self {
+            active: active.clone(),
+            replacement: replacement.clone(),
             steps: vec![
                 LifecycleStep::transition(active.clone(), WorkerState::Draining),
                 LifecycleStep::transition(active.clone(), WorkerState::Stopping),
@@ -593,6 +612,8 @@ impl SwapPlan {
 
     pub fn hot(active: WorkerId, replacement: WorkerId) -> Self {
         Self {
+            active: active.clone(),
+            replacement: replacement.clone(),
             steps: vec![
                 LifecycleStep::transition(replacement.clone(), WorkerState::Starting),
                 LifecycleStep::transition(replacement.clone(), WorkerState::Warming),
@@ -601,6 +622,82 @@ impl SwapPlan {
                 LifecycleStep::transition(active.clone(), WorkerState::Stopping),
                 LifecycleStep::transition(active, WorkerState::Stopped),
             ],
+        }
+    }
+}
+
+impl<R: WorkerRunner> WorkerSupervisor<R> {
+    pub async fn execute_swap(
+        &mut self,
+        mode: SwapMode,
+        active: &WorkerId,
+        replacement: &PlannedWorker,
+    ) -> SwapExecution {
+        match mode {
+            SwapMode::Cold => self.execute_cold_swap(active, replacement).await,
+            SwapMode::Hot => self.execute_hot_swap(active, replacement).await,
+        }
+    }
+
+    async fn execute_cold_swap(
+        &mut self,
+        active: &WorkerId,
+        replacement: &PlannedWorker,
+    ) -> SwapExecution {
+        let plan = SwapPlan::cold(active.clone(), replacement.worker.id.clone());
+        let mut statuses = Vec::new();
+        statuses.push(self.drain(active).await);
+        let stopped = self.stop(active).await;
+        let stop_ok = stopped.state == WorkerState::Stopped;
+        statuses.push(stopped);
+        if !stop_ok {
+            return SwapExecution {
+                mode: SwapMode::Cold,
+                plan,
+                statuses,
+                success: false,
+            };
+        }
+
+        let started = self.start(replacement).await;
+        let success = started.state == WorkerState::Ready;
+        statuses.push(started);
+        SwapExecution {
+            mode: SwapMode::Cold,
+            plan,
+            statuses,
+            success,
+        }
+    }
+
+    async fn execute_hot_swap(
+        &mut self,
+        active: &WorkerId,
+        replacement: &PlannedWorker,
+    ) -> SwapExecution {
+        let plan = SwapPlan::hot(active.clone(), replacement.worker.id.clone());
+        let mut statuses = Vec::new();
+        let started = self.start(replacement).await;
+        let start_ok = started.state == WorkerState::Ready;
+        statuses.push(started);
+        if !start_ok {
+            return SwapExecution {
+                mode: SwapMode::Hot,
+                plan,
+                statuses,
+                success: false,
+            };
+        }
+
+        statuses.push(self.drain(active).await);
+        let stopped = self.stop(active).await;
+        let success = stopped.state == WorkerState::Stopped;
+        statuses.push(stopped);
+        SwapExecution {
+            mode: SwapMode::Hot,
+            plan,
+            statuses,
+            success,
         }
     }
 }
@@ -945,6 +1042,125 @@ mod tests {
             supervisor.runner().stopped,
             vec![WorkerId::new("chat"), WorkerId::new("coder")]
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_executes_cold_swap_by_stopping_active_before_replacement() {
+        let active = planned_worker("old");
+        let replacement = planned_worker("new");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 11_000,
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&StartupPlan {
+                workers: vec![active.clone()],
+            })
+            .await;
+
+        let execution = supervisor
+            .execute_swap(SwapMode::Cold, &active.worker.id, &replacement)
+            .await;
+
+        assert!(execution.success);
+        assert_eq!(execution.mode, SwapMode::Cold);
+        assert_eq!(
+            execution
+                .statuses
+                .iter()
+                .map(|status| (&status.worker_id, status.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (&WorkerId::new("old"), WorkerState::Draining),
+                (&WorkerId::new("old"), WorkerState::Stopped),
+                (&WorkerId::new("new"), WorkerState::Ready),
+            ]
+        );
+        assert_eq!(
+            supervisor.runner().spawned,
+            vec![WorkerId::new("old"), WorkerId::new("new")]
+        );
+        assert_eq!(supervisor.runner().stopped, vec![WorkerId::new("old")]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_executes_hot_swap_by_warming_replacement_before_active_stop() {
+        let active = planned_worker("old");
+        let replacement = planned_worker("new");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 12_000,
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&StartupPlan {
+                workers: vec![active.clone()],
+            })
+            .await;
+
+        let execution = supervisor
+            .execute_swap(SwapMode::Hot, &active.worker.id, &replacement)
+            .await;
+
+        assert!(execution.success);
+        assert_eq!(execution.mode, SwapMode::Hot);
+        assert_eq!(
+            execution
+                .statuses
+                .iter()
+                .map(|status| (&status.worker_id, status.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (&WorkerId::new("new"), WorkerState::Ready),
+                (&WorkerId::new("old"), WorkerState::Draining),
+                (&WorkerId::new("old"), WorkerState::Stopped),
+            ]
+        );
+        assert_eq!(
+            supervisor.runner().spawned,
+            vec![WorkerId::new("old"), WorkerId::new("new")]
+        );
+        assert_eq!(supervisor.runner().stopped, vec![WorkerId::new("old")]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_hot_swap_keeps_active_when_replacement_readiness_fails() {
+        let active = planned_worker("old");
+        let replacement = planned_worker("new");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 13_000,
+            fail_ready_for: vec![WorkerId::new("new")],
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&StartupPlan {
+                workers: vec![active.clone()],
+            })
+            .await;
+
+        let execution = supervisor
+            .execute_swap(SwapMode::Hot, &active.worker.id, &replacement)
+            .await;
+
+        assert!(!execution.success);
+        assert_eq!(
+            execution
+                .statuses
+                .iter()
+                .map(|status| (&status.worker_id, status.state))
+                .collect::<Vec<_>>(),
+            vec![(&WorkerId::new("new"), WorkerState::Failed)]
+        );
+        assert_eq!(
+            supervisor.runner().spawned,
+            vec![WorkerId::new("old"), WorkerId::new("new")]
+        );
+        assert_eq!(supervisor.runner().stopped, vec![WorkerId::new("new")]);
+        let active_status = supervisor
+            .statuses()
+            .into_iter()
+            .find(|status| status.worker_id == active.worker.id)
+            .expect("active status");
+        assert_eq!(active_status.state, WorkerState::Ready);
     }
 
     #[test]

@@ -85,8 +85,20 @@ pub struct SecurityConfig {
     pub require_auth: bool,
     #[serde(alias = "bind_external")]
     pub bind_external: bool,
+    #[serde(default, alias = "tls_termination")]
+    pub tls_termination: TlsTerminationConfig,
     #[serde(alias = "api_keys")]
     pub api_keys: Vec<ApiKeyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TlsTerminationConfig {
+    pub enabled: bool,
+    pub provider: Option<String>,
+    pub evidence: Option<String>,
+    #[serde(alias = "mtls")]
+    pub m_tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

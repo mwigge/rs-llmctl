@@ -12,6 +12,26 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
             cfg.security.require_auth && !cfg.security.api_keys.is_empty(),
             "external/production serving requires authentication"
         );
+        anyhow::ensure!(
+            cfg.security.tls_termination.enabled,
+            "external/production serving requires documented TLS termination or mTLS"
+        );
+        anyhow::ensure!(
+            cfg.security
+                .tls_termination
+                .provider
+                .as_deref()
+                .is_some_and(|provider| !provider.trim().is_empty()),
+            "TLS termination must declare a provider"
+        );
+        anyhow::ensure!(
+            cfg.security
+                .tls_termination
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.trim().is_empty()),
+            "TLS termination must declare evidence"
+        );
     }
 
     Ok(())

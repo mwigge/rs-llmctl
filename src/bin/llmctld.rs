@@ -5,7 +5,9 @@ use rs_llmctl::observability::TelemetryRuntime;
 use rs_llmctl::storage::{Storage, StorageBackend};
 use rs_llmctl::worker::{StartupPlan, TokioWorkerRunner, WorkerState, WorkerSupervisor};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Parser)]
 #[command(name = "llmctld", version, about = "Run the rs-llmctl daemon")]
@@ -29,7 +31,7 @@ async fn main() -> Result<()> {
     let telemetry = TelemetryRuntime::install(&cfg, cli.json_logs)?;
 
     config::validate_production_security(&cfg)?;
-    init_storage(&cfg.storage).await?;
+    let storage = init_storage(&cfg.storage).await?;
     let worker_startup_plan = StartupPlan::from_config(&cfg);
     for planned in &worker_startup_plan.workers {
         let env_names = planned
@@ -62,13 +64,16 @@ async fn main() -> Result<()> {
         "starting daemon"
     );
 
-    let mut worker_supervisor = WorkerSupervisor::new(TokioWorkerRunner::new());
-    let worker_statuses = worker_supervisor.start_all(&worker_startup_plan).await;
+    let worker_supervisor = Arc::new(Mutex::new(WorkerSupervisor::new(TokioWorkerRunner::new())));
+    let worker_statuses = {
+        let mut supervisor = worker_supervisor.lock().await;
+        supervisor.start_all(&worker_startup_plan).await
+    };
     if let Some(failed) = worker_statuses
         .iter()
         .find(|status| status.state == WorkerState::Failed)
     {
-        worker_supervisor.stop_all().await;
+        worker_supervisor.lock().await.stop_all().await;
         anyhow::bail!(
             "failed to start worker {}: {}",
             failed.worker_id.as_str(),
@@ -79,9 +84,14 @@ async fn main() -> Result<()> {
         );
     }
 
-    let result =
-        rs_llmctl::server::serve_with_shutdown(cfg, rs_llmctl::server::shutdown_signal()).await;
-    worker_supervisor.stop_all().await;
+    let result = rs_llmctl::server::serve_with_storage_worker_control_and_shutdown(
+        cfg,
+        storage,
+        Some(worker_supervisor.clone()),
+        rs_llmctl::server::shutdown_signal(),
+    )
+    .await;
+    worker_supervisor.lock().await.stop_all().await;
     telemetry.shutdown()?;
     result
 }

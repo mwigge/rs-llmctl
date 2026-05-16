@@ -779,6 +779,49 @@ async fn chat_completions_returns_sanitized_504_when_upstream_times_out() {
     assert_eq!(body["error"]["message"], "upstream request timed out");
 }
 
+#[tokio::test]
+async fn admin_swap_requires_admin_scope_and_attached_worker_control() {
+    let app = test_app(config_with_models(vec![model("old"), model("new")])).await;
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/swap")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"active":"old","replacement":"new","mode":"hot"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let app = test_app(admin_config_with_models(vec![model("old"), model("new")])).await;
+    let unavailable = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/swap")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"active":"old","replacement":"new","mode":"hot"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(unavailable).await;
+    assert_eq!(body["error"]["code"], "worker_control_unavailable");
+}
+
 async fn test_app(cfg: Config) -> Router {
     let storage = Storage::in_memory().await.expect("storage");
     server::router(cfg, storage)
@@ -806,6 +849,12 @@ fn config_with_models(models: Vec<ModelConfig>) -> Config {
         scopes: vec!["chat".to_string(), "models.read".to_string()],
     }];
     cfg.models = models;
+    cfg
+}
+
+fn admin_config_with_models(models: Vec<ModelConfig>) -> Config {
+    let mut cfg = config_with_models(models);
+    cfg.security.api_keys[0].scopes.push("admin".to_string());
     cfg
 }
 
