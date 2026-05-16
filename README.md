@@ -217,9 +217,8 @@ quota/team reporting fields, and model aliases.
 ## Storage And Observability
 
 SQLite is the default runtime store. External database storage with Postgres is
-available as a planning surface with a redacted database URL and a migration
-plan before live attachment. Runtime Postgres storage is intentionally rejected
-until the backend is fully implemented.
+available through `storage.database-url`; the database URL is redacted in
+connection plans and migrations render dialect-specific DDL.
 
 Router controls include admission/backpressure limits, upstream timeout budgets,
 non-secret failure responses, and stable 429/504 errors that do not expose
@@ -230,10 +229,14 @@ OTel-oriented observability is configured through
 `observability.exporter.endpoint`, traces/metrics/logs switches, and
 environment-backed headers. Use `env:` for collector credentials.
 
+Compliance evidence is available through `llmctl compliance evidence`, with
+focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
+
 ## Deeper Docs
 
 - [Operations guide](docs/operations.md)
 - [Security model](docs/security.md)
+- [Compliance evidence](docs/compliance.md)
 - [Observability and reporting](docs/observability-reporting.md)
 - [Storage notes](docs/storage.md)
 - [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)

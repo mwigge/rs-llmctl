@@ -4,11 +4,10 @@ use crate::quota::{Principal, QuotaDecision};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::any::{install_default_drivers, AnyPoolOptions};
+use sqlx::{AnyPool, Row};
 use std::fmt;
 use std::path::Path;
-use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +112,13 @@ fn backend_for_url(database_url: &str) -> Result<StorageBackend> {
         "sqlite" => Ok(StorageBackend::Sqlite),
         "postgres" | "postgresql" => Ok(StorageBackend::Postgres),
         other => bail!("unsupported storage database-url scheme `{other}`"),
+    }
+}
+
+fn dialect_name(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Sqlite => "sqlite",
+        SqlDialect::Postgres => "postgres",
     }
 }
 
@@ -270,7 +276,8 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
 
 #[derive(Debug, Clone)]
 pub struct Storage {
-    pool: SqlitePool,
+    pool: AnyPool,
+    dialect: SqlDialect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,9 +337,7 @@ impl Storage {
         match plan.backend {
             StorageBackend::Sqlite => Self::connect_sqlite_target(plan.target()).await,
             StorageBackend::Postgres => {
-                bail!(
-                    "postgres runtime storage is not enabled in this build; use sqlite storage or run storage planning commands only"
-                )
+                Self::connect_any(plan.target(), SqlDialect::Postgres).await
             }
         }
     }
@@ -345,47 +350,71 @@ impl Storage {
                 .with_context(|| format!("create storage directory {}", parent.display()))?;
         }
 
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
+        Self::connect_any(
+            &format!("sqlite://{}?mode=rwc", db_path.display()),
+            SqlDialect::Sqlite,
+        )
+        .await
+    }
+
+    async fn connect_any(database_url: &str, dialect: SqlDialect) -> Result<Self> {
+        install_default_drivers();
+        let pool = AnyPoolOptions::new()
             .max_connections(5)
-            .connect_with(options)
+            .connect(database_url)
             .await
-            .with_context(|| format!("open sqlite database {}", db_path.display()))?;
-        let storage = Self { pool };
+            .with_context(|| format!("open {} database", dialect_name(dialect)))?;
+        let storage = Self { pool, dialect };
         storage.migrate().await?;
         Ok(storage)
     }
 
     async fn connect_sqlite_target(target: &str) -> Result<Self> {
         if let Some(path) = target.strip_prefix("sqlite://") {
-            Self::connect(path).await
+            if path != ":memory:" {
+                let path_without_query = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+                if let Some(parent) = Path::new(path_without_query).parent() {
+                    tokio::fs::create_dir_all(parent).await.with_context(|| {
+                        format!("create storage directory {}", parent.display())
+                    })?;
+                }
+            }
+            if path.contains("?mode=") || path == ":memory:" {
+                Self::connect_any(target, SqlDialect::Sqlite).await
+            } else {
+                Self::connect_any(&format!("{target}?mode=rwc"), SqlDialect::Sqlite).await
+            }
         } else {
             Self::connect(target).await
         }
     }
 
     pub async fn in_memory() -> Result<Self> {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?;
-        let pool = SqlitePoolOptions::new()
+        install_default_drivers();
+        let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .connect_with(options)
+            .connect("sqlite::memory:")
             .await
             .context("open in-memory sqlite database")?;
-        let storage = Self { pool };
+        let storage = Self {
+            pool,
+            dialect: SqlDialect::Sqlite,
+        };
         storage.migrate().await?;
         Ok(storage)
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        for statement in StorageMigrationPlan::new(SqlDialect::Sqlite).statements() {
+        for statement in StorageMigrationPlan::new(self.dialect).statements() {
             sqlx::query(statement).execute(&self.pool).await?;
         }
-        add_column_if_missing(&self.pool, "observation_events", "request_id TEXT").await?;
+        if self.dialect == SqlDialect::Sqlite {
+            add_column_if_missing(&self.pool, "observation_events", "request_id TEXT").await?;
+        }
 
         Ok(())
     }
@@ -666,7 +695,7 @@ impl Storage {
         .bind(&decision.actor)
         .bind(&decision.team)
         .bind(&decision.model)
-        .bind(if decision.allowed { 1_i64 } else { 0_i64 })
+        .bind(decision.allowed)
         .bind(&decision.reason)
         .bind(decision.policy_json.to_string())
         .execute(&self.pool)
@@ -725,11 +754,15 @@ impl Storage {
             &principal.team
         };
         let scope_column = if subject_scoped { "actor" } else { "team" };
+        let allowed_predicate = match self.dialect {
+            SqlDialect::Sqlite => "allowed = 1",
+            SqlDialect::Postgres => "allowed = TRUE",
+        };
         let query = format!(
             r#"
             SELECT COUNT(*) AS count
             FROM quota_decisions
-            WHERE allowed = 1
+            WHERE {allowed_predicate}
               AND at >= ?
               AND at < ?
               AND {scope_column} = ?
@@ -804,7 +837,7 @@ fn i64_to_u32(value: i64, field: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("read u32 integer field {field}"))
 }
 
-fn row_to_audit_event(row: sqlx::sqlite::SqliteRow) -> Result<AuditEvent> {
+fn row_to_audit_event(row: sqlx::any::AnyRow) -> Result<AuditEvent> {
     Ok(AuditEvent {
         id: parse_uuid(&row.try_get::<String, _>("id")?)?,
         request_id: parse_optional_uuid(row.try_get::<Option<String>, _>("request_id")?)?,
@@ -818,7 +851,7 @@ fn row_to_audit_event(row: sqlx::sqlite::SqliteRow) -> Result<AuditEvent> {
     })
 }
 
-fn row_to_usage_event(row: sqlx::sqlite::SqliteRow) -> Result<UsageEvent> {
+fn row_to_usage_event(row: sqlx::any::AnyRow) -> Result<UsageEvent> {
     Ok(UsageEvent {
         id: parse_uuid(&row.try_get::<String, _>("id")?)?,
         request_id: parse_uuid(&row.try_get::<String, _>("request_id")?)?,
@@ -833,7 +866,7 @@ fn row_to_usage_event(row: sqlx::sqlite::SqliteRow) -> Result<UsageEvent> {
     })
 }
 
-fn row_to_observation_event(row: sqlx::sqlite::SqliteRow) -> Result<ObservationEvent> {
+fn row_to_observation_event(row: sqlx::any::AnyRow) -> Result<ObservationEvent> {
     Ok(ObservationEvent {
         id: parse_uuid(&row.try_get::<String, _>("id")?)?,
         request_id: parse_optional_uuid(row.try_get::<Option<String>, _>("request_id")?)?,
@@ -847,7 +880,7 @@ fn row_to_observation_event(row: sqlx::sqlite::SqliteRow) -> Result<ObservationE
     })
 }
 
-async fn add_column_if_missing(pool: &SqlitePool, table: &str, column_sql: &str) -> Result<()> {
+async fn add_column_if_missing(pool: &AnyPool, table: &str, column_sql: &str) -> Result<()> {
     let column = column_sql
         .split_whitespace()
         .next()
@@ -865,7 +898,7 @@ async fn add_column_if_missing(pool: &SqlitePool, table: &str, column_sql: &str)
     Ok(())
 }
 
-fn row_to_model_inventory_record(row: sqlx::sqlite::SqliteRow) -> Result<ModelInventoryRecord> {
+fn row_to_model_inventory_record(row: sqlx::any::AnyRow) -> Result<ModelInventoryRecord> {
     Ok(ModelInventoryRecord {
         alias: row.try_get("alias")?,
         path: row.try_get("path")?,
@@ -875,8 +908,10 @@ fn row_to_model_inventory_record(row: sqlx::sqlite::SqliteRow) -> Result<ModelIn
     })
 }
 
-fn row_to_quota_decision_record(row: sqlx::sqlite::SqliteRow) -> Result<QuotaDecisionRecord> {
-    let allowed: i64 = row.try_get("allowed")?;
+fn row_to_quota_decision_record(row: sqlx::any::AnyRow) -> Result<QuotaDecisionRecord> {
+    let allowed = row
+        .try_get::<bool, _>("allowed")
+        .or_else(|_| row.try_get::<i64, _>("allowed").map(|value| value != 0))?;
     Ok(QuotaDecisionRecord {
         id: parse_uuid(&row.try_get::<String, _>("id")?)?,
         request_id: parse_optional_uuid(row.try_get::<Option<String>, _>("request_id")?)?,
@@ -884,7 +919,7 @@ fn row_to_quota_decision_record(row: sqlx::sqlite::SqliteRow) -> Result<QuotaDec
         actor: row.try_get("actor")?,
         team: row.try_get("team")?,
         model: row.try_get("model")?,
-        allowed: allowed != 0,
+        allowed,
         reason: row.try_get("reason")?,
         policy_json: parse_json(row.try_get("policy_json")?)?,
     })
@@ -938,9 +973,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn connect_config_rejects_postgres_runtime_storage_without_sqlite_fallback() -> Result<()>
-    {
+    #[test]
+    fn connect_config_accepts_postgres_runtime_plan_without_exposing_passwords() -> Result<()> {
         let cfg: Config = toml::from_str(
             r#"
             [storage]
@@ -948,16 +982,11 @@ mod tests {
             "#,
         )?;
 
-        let err = Storage::connect_config(&cfg.storage)
-            .await
-            .unwrap_err()
-            .to_string();
+        let plan = cfg.storage.connection_plan()?;
 
-        assert!(
-            err.contains("postgres runtime storage is not enabled"),
-            "{err}"
-        );
-        assert!(!err.contains("secret-token"));
+        assert_eq!(plan.backend, StorageBackend::Postgres);
+        assert_eq!(plan.dialect(), SqlDialect::Postgres);
+        assert!(!plan.display_target().contains("secret-token"));
         Ok(())
     }
 

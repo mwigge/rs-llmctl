@@ -295,6 +295,7 @@ async fn chat_completions_reports_requested_and_upstream_model_metadata() {
                 .uri("/v1/chat/completions")
                 .header("authorization", bearer())
                 .header("content-type", "application/json")
+                .header("x-request-id", Uuid::from_u128(2).to_string())
                 .body(Body::from(
                     json!({"model": "light", "messages": [], "stream": false}).to_string(),
                 ))
@@ -323,6 +324,127 @@ async fn chat_completions_reports_requested_and_upstream_model_metadata() {
 
     let upstream_request = upstream_requests.recv().await.expect("upstream request");
     assert_eq!(upstream_request["model"], "heavy");
+}
+
+#[tokio::test]
+async fn fallback_mode_retries_next_model_after_upstream_server_error() {
+    let (upstream, mut upstream_requests) = spawn_fallback_upstream().await;
+    let mut cfg = config_with_models(vec![model("primary"), model("backup")]);
+    cfg.mode = Mode::Fallback;
+    cfg.models[0].weight = 100;
+    cfg.models[1].weight = 0;
+    cfg.server.llama_server = upstream;
+    let app = test_app(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "backup", "messages": [], "stream": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-llmctl-upstream-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("backup")
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["model"], "backup");
+    assert_eq!(
+        upstream_requests.recv().await.expect("primary request")["model"],
+        "primary"
+    );
+    assert_eq!(
+        upstream_requests.recv().await.expect("backup request")["model"],
+        "backup"
+    );
+}
+
+#[tokio::test]
+async fn local_search_returns_ranked_hits_for_code_assistance_substrate() {
+    let app = test_app(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local/search")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "query": "worker readiness",
+                        "documents": [
+                            {
+                                "id": "ops",
+                                "title": "Operations",
+                                "path": "docs/operations.md",
+                                "content": "Worker readiness probes and restart backoff"
+                            },
+                            {
+                                "id": "billing",
+                                "title": "Usage",
+                                "content": "chargeback and token reports"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "search.results");
+    assert_eq!(body["data"][0]["id"], "ops");
+    assert!(body["data"][0]["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("readiness"));
+}
+
+#[tokio::test]
+async fn embeddings_endpoint_proxies_openai_compatible_payloads() {
+    let (upstream, mut upstream_requests) = spawn_embeddings_upstream().await;
+    let mut cfg = config_with_models(vec![model("embed")]);
+    cfg.server.llama_server = upstream;
+    let app = test_app(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "embed", "input": "hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "list");
+    assert_eq!(
+        upstream_requests.recv().await.expect("embedding request")["model"],
+        "embed"
+    );
 }
 
 #[tokio::test]
@@ -742,6 +864,84 @@ async fn spawn_mock_upstream() -> (String, mpsc::Receiver<Value>) {
     let (tx, rx) = mpsc::channel(4);
     let app = Router::new()
         .route("/v1/chat/completions", post(mock_chat_completion))
+        .with_state(tx);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve upstream");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+async fn spawn_fallback_upstream() -> (String, mpsc::Receiver<Value>) {
+    let (tx, rx) = mpsc::channel(4);
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(tx): State<mpsc::Sender<Value>>, Json(request): Json<Value>| async move {
+                    tx.send(request.clone()).await.expect("record request");
+                    if request["model"] == "primary" {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "primary failed")
+                            .into_response();
+                    }
+                    Json(json!({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "created": 1_700_000_000,
+                        "model": request["model"],
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "pong"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 3,
+                            "completion_tokens": 5,
+                            "total_tokens": 8
+                        }
+                    }))
+                    .into_response()
+                },
+            ),
+        )
+        .with_state(tx);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve upstream");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+async fn spawn_embeddings_upstream() -> (String, mpsc::Receiver<Value>) {
+    let (tx, rx) = mpsc::channel(4);
+    let app = Router::new()
+        .route(
+            "/v1/embeddings",
+            post(
+                |State(tx): State<mpsc::Sender<Value>>, Json(request): Json<Value>| async move {
+                    tx.send(request.clone()).await.expect("record request");
+                    Json(json!({
+                        "object": "list",
+                        "model": request["model"],
+                        "data": [{
+                            "object": "embedding",
+                            "index": 0,
+                            "embedding": [0.1, 0.2, 0.3]
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "total_tokens": 1
+                        }
+                    }))
+                },
+            ),
+        )
         .with_state(tx);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

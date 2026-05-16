@@ -19,15 +19,16 @@ The schema includes indexes for request lookup, retention windows, quota checks,
 and usage totals. Quota paths use composite indexes for actor/team and time
 range scans.
 
-## Postgres Planning
+## Postgres Runtime
 
-External database storage with Postgres is available as a planning surface for
-enterprise review. The plan uses a redacted database URL and emits dialect-specific migration SQL with UUID,
-TIMESTAMPTZ, JSONB, boolean, and numeric types where appropriate.
+External database storage with Postgres is available through
+`storage.database-url`. The database URL is redacted in plans and emits
+dialect-specific migration SQL with UUID, TIMESTAMPTZ, JSONB, boolean, and
+numeric types where appropriate.
 
-Runtime Postgres is not silently enabled. If a production config sets a
-Postgres `database-url`, runtime startup fails fast until the live backend is
-implemented and tested.
+SQLite remains the default for single-node installs. Postgres is the server-side
+choice when operators need central backup, HA, database-native monitoring, and
+separate database access controls.
 
 ## Migration Hygiene
 

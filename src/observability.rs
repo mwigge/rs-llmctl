@@ -1,9 +1,21 @@
 use crate::config::{Config, OtlpProtocol};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use opentelemetry::global;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::time::Duration;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 pub const REDACTED_ATTRIBUTE_VALUE: &str = "[REDACTED]";
 
@@ -28,6 +40,218 @@ pub enum Exporter {
         headers: BTreeMap<String, String>,
         timeout_ms: u64,
     },
+}
+
+#[derive(Debug, Default)]
+pub struct TelemetryRuntime {
+    tracer_provider: Option<SdkTracerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
+}
+
+impl TelemetryRuntime {
+    pub fn install(cfg: &Config, json_logs: bool) -> Result<Self> {
+        let plan = ObservabilityPlan::from_config(cfg)?;
+        Self::install_plan(&plan, json_logs)
+    }
+
+    pub fn install_plan(plan: &ObservabilityPlan, json_logs: bool) -> Result<Self> {
+        let mut runtime = Self::from_plan(plan)?;
+        runtime.install_tracing(json_logs)?;
+        Ok(runtime)
+    }
+
+    pub fn from_plan(plan: &ObservabilityPlan) -> Result<Self> {
+        let Exporter::Otlp {
+            endpoint,
+            protocol,
+            headers,
+            timeout_ms,
+        } = &plan.exporter
+        else {
+            return Ok(Self::default());
+        };
+
+        let resource = telemetry_resource(plan);
+        let timeout = Duration::from_millis(*timeout_ms);
+        let mut runtime = Self::default();
+
+        if plan.traces_enabled {
+            let exporter = build_span_exporter(endpoint, *protocol, headers, timeout)
+                .context("build OTLP trace exporter")?;
+            let provider = SdkTracerProvider::builder()
+                .with_resource(resource.clone())
+                .with_batch_exporter(exporter)
+                .build();
+            global::set_tracer_provider(provider.clone());
+            runtime.tracer_provider = Some(provider);
+        }
+
+        if plan.metrics_enabled {
+            let exporter = build_metric_exporter(endpoint, *protocol, headers, timeout)
+                .context("build OTLP metric exporter")?;
+            let provider = SdkMeterProvider::builder()
+                .with_resource(resource.clone())
+                .with_periodic_exporter(exporter)
+                .build();
+            global::set_meter_provider(provider.clone());
+            runtime.meter_provider = Some(provider);
+        }
+
+        if plan.logs_enabled {
+            let exporter = build_log_exporter(endpoint, *protocol, headers, timeout)
+                .context("build OTLP log exporter")?;
+            let provider = SdkLoggerProvider::builder()
+                .with_resource(resource)
+                .with_batch_exporter(exporter)
+                .build();
+            runtime.logger_provider = Some(provider);
+        }
+
+        Ok(runtime)
+    }
+
+    pub fn shutdown(self) -> Result<()> {
+        if let Some(provider) = self.tracer_provider {
+            provider
+                .shutdown()
+                .context("shutdown OTLP trace provider")?;
+        }
+        if let Some(provider) = self.meter_provider {
+            provider
+                .shutdown()
+                .context("shutdown OTLP meter provider")?;
+        }
+        if let Some(provider) = self.logger_provider {
+            provider.shutdown().context("shutdown OTLP log provider")?;
+        }
+        Ok(())
+    }
+
+    fn install_tracing(&mut self, json_logs: bool) -> Result<()> {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let fmt_layer = if json_logs {
+            tracing_subscriber::fmt::layer().json().boxed()
+        } else {
+            tracing_subscriber::fmt::layer().boxed()
+        };
+        let mut layers = vec![fmt_layer];
+
+        if let Some(logger_provider) = &self.logger_provider {
+            layers.push(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    logger_provider,
+                )
+                .boxed(),
+            );
+        }
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(layers)
+            .try_init()
+            .context("install tracing subscriber")?;
+        Ok(())
+    }
+}
+
+fn telemetry_resource(plan: &ObservabilityPlan) -> Resource {
+    let mut attributes = vec![KeyValue::new("service.name", plan.service_name.clone())];
+    if let Some(version) = &plan.service_version {
+        attributes.push(KeyValue::new("service.version", version.clone()));
+    }
+    if let Some(environment) = &plan.environment {
+        attributes.push(KeyValue::new(
+            "deployment.environment.name",
+            environment.clone(),
+        ));
+    }
+    attributes.extend(
+        plan.resource_attributes
+            .iter()
+            .map(|(key, value)| KeyValue::new(key.clone(), value.clone())),
+    );
+    Resource::builder().with_attributes(attributes).build()
+}
+
+fn otlp_protocol(protocol: OtlpProtocol) -> Protocol {
+    match protocol {
+        OtlpProtocol::HttpProtobuf => Protocol::HttpBinary,
+        OtlpProtocol::Grpc => Protocol::Grpc,
+    }
+}
+
+fn otlp_headers(headers: &BTreeMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn build_span_exporter(
+    endpoint: &str,
+    protocol: OtlpProtocol,
+    headers: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<opentelemetry_otlp::SpanExporter> {
+    match protocol {
+        OtlpProtocol::HttpProtobuf => Ok(opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_protocol(otlp_protocol(protocol))
+            .with_timeout(timeout)
+            .with_headers(otlp_headers(headers))
+            .build()?),
+        OtlpProtocol::Grpc => Ok(opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(timeout)
+            .build()?),
+    }
+}
+
+fn build_metric_exporter(
+    endpoint: &str,
+    protocol: OtlpProtocol,
+    headers: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<opentelemetry_otlp::MetricExporter> {
+    match protocol {
+        OtlpProtocol::HttpProtobuf => Ok(opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_protocol(otlp_protocol(protocol))
+            .with_timeout(timeout)
+            .with_headers(otlp_headers(headers))
+            .build()?),
+        OtlpProtocol::Grpc => Ok(opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(timeout)
+            .build()?),
+    }
+}
+
+fn build_log_exporter(
+    endpoint: &str,
+    protocol: OtlpProtocol,
+    headers: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<opentelemetry_otlp::LogExporter> {
+    match protocol {
+        OtlpProtocol::HttpProtobuf => Ok(opentelemetry_otlp::LogExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_protocol(otlp_protocol(protocol))
+            .with_timeout(timeout)
+            .with_headers(otlp_headers(headers))
+            .build()?),
+        OtlpProtocol::Grpc => Ok(opentelemetry_otlp::LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(timeout)
+            .build()?),
+    }
 }
 
 impl ObservabilityPlan {

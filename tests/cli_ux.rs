@@ -1840,6 +1840,37 @@ fn security_check_and_observe_plan_are_top_level_json_commands() {
 }
 
 #[test]
+fn compliance_evidence_reports_cra_pci_and_release_integrity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut evidence = llmctl();
+    evidence
+        .arg("--config")
+        .arg(&config)
+        .arg("compliance")
+        .arg("evidence");
+    let evidence = assert_success_json(evidence);
+
+    assert_eq!(
+        evidence["cra_article_14"]["regulatory_start_date"],
+        "2026-09-11"
+    );
+    assert_eq!(
+        evidence["pci_dss"]["baseline"],
+        "pci_dss_v4_0_1_aligned_controls"
+    );
+    assert_eq!(
+        evidence["release_integrity"]["sbom"],
+        "packaging/generate-sbom.sh"
+    );
+    assert_eq!(
+        evidence["release_integrity"]["signing"],
+        "packaging/sign-release.sh"
+    );
+}
+
+#[test]
 fn security_hash_key_outputs_sha256_metadata_without_plaintext() {
     let secret = "sk-test-super-secret-0123456789abcd";
     let mut hash = llmctl();

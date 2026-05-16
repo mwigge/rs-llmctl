@@ -16,6 +16,11 @@ The config exposes an OTel-oriented exporter plan:
 Runtime events include audit rows, usage rows, quota decisions, model inventory,
 and resource observations.
 
+When an OTLP endpoint is configured, the daemon installs trace, metric, and log
+providers and bridges `tracing` events into OpenTelemetry logs. Request IDs,
+model aliases, quota decisions, usage totals, and lifecycle events are the
+correlation keys operators should expect to search by.
+
 ## Reports
 
 Reports focus on:

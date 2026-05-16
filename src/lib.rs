@@ -4,6 +4,7 @@ pub mod integrations;
 pub mod model;
 pub mod observability;
 pub mod quota;
+pub mod rag;
 pub mod reporting;
 pub mod resources;
 pub mod security;

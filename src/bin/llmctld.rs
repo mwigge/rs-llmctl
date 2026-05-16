@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rs_llmctl::config::{self, StorageConfig};
+use rs_llmctl::observability::TelemetryRuntime;
 use rs_llmctl::storage::{Storage, StorageBackend};
 use rs_llmctl::worker::{StartupPlan, TokioWorkerRunner, WorkerState, WorkerSupervisor};
 use std::path::PathBuf;
 use tokio::fs;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "llmctld", version, about = "Run the rs-llmctl daemon")]
@@ -21,12 +21,12 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.json_logs);
 
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let cfg = config::load(&config_path)
         .await
         .with_context(|| format!("load config {}", config_path.display()))?;
+    let telemetry = TelemetryRuntime::install(&cfg, cli.json_logs)?;
 
     config::validate_production_security(&cfg)?;
     init_storage(&cfg.storage).await?;
@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
         .iter()
         .find(|status| status.state == WorkerState::Failed)
     {
+        worker_supervisor.stop_all().await;
         anyhow::bail!(
             "failed to start worker {}: {}",
             failed.worker_id.as_str(),
@@ -78,17 +79,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    rs_llmctl::server::serve_with_shutdown(cfg, rs_llmctl::server::shutdown_signal()).await
-}
-
-fn init_tracing(json_logs: bool) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
-    if json_logs {
-        subscriber.json().init();
-    } else {
-        subscriber.init();
-    }
+    let result =
+        rs_llmctl::server::serve_with_shutdown(cfg, rs_llmctl::server::shutdown_signal()).await;
+    worker_supervisor.stop_all().await;
+    telemetry.shutdown()?;
+    result
 }
 
 async fn init_storage(storage: &StorageConfig) -> Result<Storage> {

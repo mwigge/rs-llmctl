@@ -4,9 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::process::{Child, Command};
 
 const DEFAULT_GPU_LAYERS: u32 = 99;
+const READY_PROBE_ATTEMPTS: usize = 120;
+const READY_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkerId(String);
@@ -219,6 +222,7 @@ impl CommandSpec {
         for (key, value) in self.env {
             command.env(key, value);
         }
+        command.kill_on_drop(true);
         command
     }
 }
@@ -332,6 +336,13 @@ pub trait WorkerRunner {
         &'a mut self,
         worker_id: &'a WorkerId,
     ) -> BoxFuture<'a, Result<(), WorkerRunnerError>>;
+
+    fn wait_ready<'a>(
+        &'a mut self,
+        _planned: &'a PlannedWorker,
+    ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
+        async { Ok(()) }.boxed()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -369,6 +380,37 @@ impl WorkerRunner for TokioWorkerRunner {
             }
 
             Ok(())
+        }
+        .boxed()
+    }
+
+    fn wait_ready<'a>(
+        &'a mut self,
+        planned: &'a PlannedWorker,
+    ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
+        async move {
+            let client = reqwest::Client::new();
+            let urls = [
+                format!("{}/health", planned.worker.upstream()),
+                format!("{}/healthz", planned.worker.upstream()),
+                format!("{}/v1/models", planned.worker.upstream()),
+            ];
+
+            for _ in 0..READY_PROBE_ATTEMPTS {
+                for url in &urls {
+                    match client.get(url).send().await {
+                        Ok(response) if response.status().is_success() => return Ok(()),
+                        Ok(_) | Err(_) => {}
+                    }
+                }
+                tokio::time::sleep(READY_PROBE_INTERVAL).await;
+            }
+
+            Err(WorkerRunnerError::new(format!(
+                "worker {} did not become ready at {}",
+                planned.worker.id.as_str(),
+                planned.worker.upstream()
+            )))
         }
         .boxed()
     }
@@ -426,11 +468,28 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
         );
 
         match self.runner.spawn(planned).await {
-            Ok(spawned) => self.update_status(&worker_id, |status| {
-                status.pid = Some(spawned.pid);
-                status.state = WorkerState::Ready;
-                status.last_error = None;
-            }),
+            Ok(spawned) => {
+                self.update_status(&worker_id, |status| {
+                    status.pid = Some(spawned.pid);
+                    status.state = WorkerState::Warming;
+                    status.last_error = None;
+                });
+
+                match self.runner.wait_ready(planned).await {
+                    Ok(()) => self.update_status(&worker_id, |status| {
+                        status.state = WorkerState::Ready;
+                        status.last_error = None;
+                    }),
+                    Err(error) => {
+                        let _ = self.runner.stop(&worker_id).await;
+                        self.update_status(&worker_id, |status| {
+                            status.pid = None;
+                            status.state = WorkerState::Failed;
+                            status.last_error = Some(error.to_string());
+                        })
+                    }
+                }
+            }
             Err(error) => self.update_status(&worker_id, |status| {
                 status.pid = None;
                 status.state = WorkerState::Failed;
@@ -477,6 +536,15 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
         });
 
         self.start(planned).await
+    }
+
+    pub async fn stop_all(&mut self) -> Vec<WorkerStatus> {
+        let worker_ids = self.statuses.keys().cloned().collect::<Vec<WorkerId>>();
+        let mut statuses = Vec::with_capacity(worker_ids.len());
+        for worker_id in worker_ids {
+            statuses.push(self.stop(&worker_id).await);
+        }
+        statuses
     }
 
     fn update_status(
@@ -576,6 +644,7 @@ mod tests {
         next_pid: u32,
         fail_spawn_for: Vec<WorkerId>,
         fail_stop_for: Vec<WorkerId>,
+        fail_ready_for: Vec<WorkerId>,
         spawned: Vec<WorkerId>,
         stopped: Vec<WorkerId>,
     }
@@ -602,6 +671,17 @@ mod tests {
             self.stopped.push(worker_id.clone());
             if self.fail_stop_for.contains(worker_id) {
                 return ready(Err(WorkerRunnerError::new("stop failed"))).boxed();
+            }
+
+            ready(Ok(())).boxed()
+        }
+
+        fn wait_ready<'a>(
+            &'a mut self,
+            planned: &'a PlannedWorker,
+        ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
+            if self.fail_ready_for.contains(&planned.worker.id) {
+                return ready(Err(WorkerRunnerError::new("ready probe failed"))).boxed();
             }
 
             ready(Ok(())).boxed()
@@ -757,6 +837,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_stops_worker_when_readiness_probe_fails() {
+        let plan = StartupPlan {
+            workers: vec![planned_worker("chat")],
+        };
+        let runner = FakeRunner {
+            next_pid: 6000,
+            fail_ready_for: vec![WorkerId::new("chat")],
+            ..FakeRunner::default()
+        };
+        let mut supervisor = WorkerSupervisor::new(runner);
+
+        let statuses = supervisor.start_all(&plan).await;
+
+        assert_eq!(statuses[0].worker_id, WorkerId::new("chat"));
+        assert_eq!(statuses[0].pid, None);
+        assert_eq!(statuses[0].state, WorkerState::Failed);
+        assert_eq!(
+            statuses[0].last_error.as_deref(),
+            Some("ready probe failed")
+        );
+        assert_eq!(supervisor.runner().stopped, vec![WorkerId::new("chat")]);
+    }
+
+    #[tokio::test]
     async fn supervisor_drains_and_stops_running_workers() {
         let worker = planned_worker("chat");
         let plan = StartupPlan {
@@ -818,6 +922,29 @@ mod tests {
         assert_eq!(restarted.restart_count, 0);
         assert_eq!(restarted.last_error.as_deref(), Some("stop failed"));
         assert_eq!(supervisor.runner().spawned, vec![WorkerId::new("chat")]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_stop_all_cleans_up_every_known_worker() {
+        let plan = StartupPlan {
+            workers: vec![planned_worker("chat"), planned_worker("coder")],
+        };
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 10_000,
+            ..FakeRunner::default()
+        });
+        supervisor.start_all(&plan).await;
+
+        let statuses = supervisor.stop_all().await;
+
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses
+            .iter()
+            .all(|status| status.state == WorkerState::Stopped));
+        assert_eq!(
+            supervisor.runner().stopped,
+            vec![WorkerId::new("chat"), WorkerId::new("coder")]
+        );
     }
 
     #[test]

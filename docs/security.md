@@ -15,6 +15,10 @@ The production posture is PCI DSS v4.0.1-aligned:
 - response metadata is intentionally non-secret;
 - production CORS uses approved origins, not wildcard origins.
 
+Run `llmctl compliance pci-dss` when you need an evidence-oriented view for
+reviews or monthly control reporting. It does not replace a formal assessor
+report, but it keeps the operational evidence in one predictable shape.
+
 ## Secrets
 
 Use stdin or environment variables when creating key digests:

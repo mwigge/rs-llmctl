@@ -1,6 +1,7 @@
 use crate::audit::{AuditEvent, UsageEvent};
 use crate::config::{Config, Mode, ModelConfig};
 use crate::quota::{check_quota, matching_quota_policy, Principal};
+use crate::rag::{lexical_search, SearchDocument};
 use crate::storage::{QuotaDecisionRecord, Storage};
 use crate::worker::StartupPlan;
 use anyhow::{Context, Result};
@@ -13,6 +14,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures_util::StreamExt;
+use opentelemetry::global;
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -67,6 +70,8 @@ pub fn router_with_serving_limits(
         .route("/readyz", get(readyz))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(proxy_embeddings))
+        .route("/v1/local/search", post(local_search))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
@@ -335,6 +340,191 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
     with_model_count(response, state.cfg.models.len())
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalSearchRequest {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    documents: Vec<SearchDocument>,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+async fn local_search(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<LocalSearchRequest>,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let principal = match authenticate(&state.cfg, &headers) {
+        Ok(principal) => principal,
+        Err(err) => {
+            return with_request_id(
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
+                request_id,
+            );
+        }
+    };
+
+    if !principal.has_scope("chat") {
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "missing chat scope".to_string(),
+            ),
+            request_id,
+        );
+    }
+
+    let hits = lexical_search(&request.query, &request.documents, request.limit.min(50));
+    record_audit(
+        &state,
+        Some(request_id),
+        principal,
+        "local.search",
+        "documents",
+        "allowed",
+        json!({ "documents": request.documents.len(), "hits": hits.len() }),
+    )
+    .await;
+    with_request_id(
+        Json(json!({
+            "object": "search.results",
+            "query": request.query,
+            "data": hits
+        }))
+        .into_response(),
+        request_id,
+    )
+}
+
+async fn proxy_embeddings(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_openai_endpoint(state, headers, body, "/v1/embeddings", "embeddings", "chat").await
+}
+
+async fn proxy_openai_endpoint(
+    state: Arc<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+    path: &'static str,
+    action: &'static str,
+    required_scope: &'static str,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    let principal = match authenticate(&state.cfg, &headers) {
+        Ok(principal) => principal,
+        Err(err) => {
+            return with_request_id(
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
+                request_id,
+            );
+        }
+    };
+
+    if !principal.has_scope(required_scope) && !principal.has_scope("chat") {
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                format!("missing {required_scope} scope"),
+            ),
+            request_id,
+        );
+    }
+
+    let upstream = match state.upstreams.get("*").cloned().or_else(|| {
+        state
+            .upstreams
+            .iter()
+            .next()
+            .map(|(_alias, upstream)| upstream.clone())
+    }) {
+        Some(upstream) => upstream,
+        None => {
+            return with_request_id(
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unavailable",
+                    "no upstream configured".to_string(),
+                ),
+                request_id,
+            );
+        }
+    };
+
+    let response = match timeout(
+        upstream_timeout_budget(&state),
+        state
+            .client
+            .post(format!("{upstream}{path}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            let (status, code, message, _usage_status) = upstream_request_error(&err);
+            return with_request_id(error_response(status, code, message), request_id);
+        }
+        Err(_) => {
+            return with_request_id(
+                error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "upstream request timed out".to_string(),
+                ),
+                request_id,
+            );
+        }
+    };
+
+    record_audit(
+        &state,
+        Some(request_id),
+        principal,
+        action,
+        path,
+        if response.status().is_success() {
+            "allowed"
+        } else {
+            "upstream_error"
+        },
+        json!({ "status": response.status().as_u16() }),
+    )
+    .await;
+
+    let status = response.status();
+    let headers = response_headers(response.headers());
+    match timeout(upstream_timeout_budget(&state), response.bytes()).await {
+        Ok(Ok(bytes)) => build_response(status, headers, Body::from(bytes), request_id),
+        Ok(Err(_)) => with_request_id(
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream request failed".to_string(),
+            ),
+            request_id,
+        ),
+        Err(_) => with_request_id(
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "upstream request timed out".to_string(),
+            ),
+            request_id,
+        ),
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -407,7 +597,7 @@ async fn chat_completions(
         }
     };
 
-    let route = match resolve_model_route(&state.cfg, &request.model) {
+    let route = match resolve_model_route(&state.cfg, &request.model, request_id) {
         Ok(route) => route,
         Err(err) => {
             record_audit(
@@ -426,25 +616,7 @@ async fn chat_completions(
             );
         }
     };
-    let body = match rewrite_chat_model(&body, &route) {
-        Ok(body) => body,
-        Err(err) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                principal,
-                "chat.completions",
-                route.requested_alias,
-                "rejected",
-                json!({ "reason": err }),
-            )
-            .await;
-            return with_request_id(
-                error_response(StatusCode::BAD_REQUEST, "bad_request", err),
-                request_id,
-            );
-        }
-    };
+    let original_body = body.clone();
     let model = route.requested_alias.clone();
     let quota = match check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await {
         Ok(decision) => decision,
@@ -538,9 +710,19 @@ async fn chat_completions(
         }
     };
 
-    let upstream = match upstream_for_route(&state, &route) {
-        Ok(upstream) => format!("{upstream}/v1/chat/completions"),
-        Err(err) => {
+    let (upstream_response, upstream_alias) = match dispatch_chat_request(
+        &state,
+        &route,
+        &original_body,
+        request_id,
+        &principal,
+        &model,
+        started,
+    )
+    .await
+    {
+        Ok(dispatched) => dispatched,
+        Err(DispatchFailure::NoUpstream(err)) => {
             record_audit(
                 &state,
                 Some(request_id),
@@ -556,30 +738,28 @@ async fn chat_completions(
                 request_id,
             );
         }
-    };
-    let upstream_response = match timeout(
-        upstream_timeout_budget(&state),
-        state
-            .client
-            .post(upstream)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send(),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(err)) => {
-            let (status, code, message, usage_status) = upstream_request_error(&err);
-            record_upstream_failure(
+        Err(DispatchFailure::BadRequest(err)) => {
+            record_audit(
                 &state,
-                request_id,
-                &principal,
-                &model,
-                started,
-                usage_status,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                model,
+                "rejected",
+                json!({ "reason": err }),
             )
             .await;
+            return with_request_id(
+                error_response(StatusCode::BAD_REQUEST, "bad_request", err),
+                request_id,
+            );
+        }
+        Err(DispatchFailure::Request {
+            status,
+            code,
+            message,
+            usage_status,
+        }) => {
             record_audit(
                 &state,
                 Some(request_id),
@@ -592,28 +772,6 @@ async fn chat_completions(
             .await;
             return with_request_id(error_response(status, code, message), request_id);
         }
-        Err(_) => {
-            record_upstream_failure(&state, request_id, &principal, &model, started, "timeout")
-                .await;
-            record_audit(
-                &state,
-                Some(request_id),
-                principal,
-                "chat.completions",
-                model,
-                "error",
-                json!({ "reason": "timeout" }),
-            )
-            .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
-                    "upstream request timed out".to_string(),
-                ),
-                request_id,
-            );
-        }
     };
 
     if request.stream {
@@ -621,7 +779,7 @@ async fn chat_completions(
             request_id,
             principal,
             model,
-            upstream_model: route.upstream_alias,
+            upstream_model: upstream_alias,
             started,
             admission,
         };
@@ -631,7 +789,7 @@ async fn chat_completions(
             request_id,
             principal,
             model,
-            upstream_model: route.upstream_alias,
+            upstream_model: upstream_alias,
             started,
             admission,
         };
@@ -655,16 +813,108 @@ fn quota_admission_scope(cfg: &Config, principal: &Principal) -> Option<(String,
     })
 }
 
-fn upstream_for_route(
+fn upstream_for_alias(
     state: &ServerState,
-    route: &ResolvedModelRoute,
+    upstream_alias: &str,
 ) -> std::result::Result<String, String> {
     state
         .upstreams
-        .get(&route.upstream_alias)
+        .get(upstream_alias)
         .or_else(|| state.upstreams.get("*"))
         .cloned()
-        .ok_or_else(|| format!("no upstream configured for model {}", route.upstream_alias))
+        .ok_or_else(|| format!("no upstream configured for model {upstream_alias}"))
+}
+
+#[derive(Debug)]
+enum DispatchFailure {
+    NoUpstream(String),
+    BadRequest(String),
+    Request {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        usage_status: &'static str,
+    },
+}
+
+async fn dispatch_chat_request(
+    state: &ServerState,
+    route: &ResolvedModelRoute,
+    original_body: &[u8],
+    request_id: Uuid,
+    principal: &Principal,
+    model: &str,
+    started: Instant,
+) -> std::result::Result<(reqwest::Response, String), DispatchFailure> {
+    let mut aliases = vec![route.upstream_alias.clone()];
+    aliases.extend(route.fallback_aliases.clone());
+    let mut last_failure = None;
+
+    for alias in aliases {
+        let attempt_route = ResolvedModelRoute {
+            requested_alias: route.requested_alias.clone(),
+            upstream_alias: alias.clone(),
+            fallback_aliases: Vec::new(),
+        };
+        let body = rewrite_chat_model(original_body, &attempt_route)
+            .map_err(DispatchFailure::BadRequest)?;
+        let upstream = upstream_for_alias(state, &alias).map_err(DispatchFailure::NoUpstream)?;
+        let upstream = format!("{upstream}/v1/chat/completions");
+        match timeout(
+            upstream_timeout_budget(state),
+            state
+                .client
+                .post(upstream)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) if should_retry_upstream_status(response.status()) => {
+                last_failure = Some(DispatchFailure::Request {
+                    status: StatusCode::BAD_GATEWAY,
+                    code: "upstream_error",
+                    message: "upstream request failed".to_string(),
+                    usage_status: "upstream_error",
+                });
+                continue;
+            }
+            Ok(Ok(response)) => return Ok((response, alias)),
+            Ok(Err(err)) => {
+                let (status, code, message, usage_status) = upstream_request_error(&err);
+                record_upstream_failure(state, request_id, principal, model, started, usage_status)
+                    .await;
+                last_failure = Some(DispatchFailure::Request {
+                    status,
+                    code,
+                    message,
+                    usage_status,
+                });
+            }
+            Err(_) => {
+                record_upstream_failure(state, request_id, principal, model, started, "timeout")
+                    .await;
+                last_failure = Some(DispatchFailure::Request {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    code: "timeout",
+                    message: "upstream request timed out".to_string(),
+                    usage_status: "timeout",
+                });
+            }
+        }
+    }
+
+    Err(last_failure.unwrap_or_else(|| {
+        DispatchFailure::NoUpstream(format!(
+            "no upstream configured for model {}",
+            route.upstream_alias
+        ))
+    }))
+}
+
+fn should_retry_upstream_status(status: StatusCode) -> bool {
+    status.is_server_error()
 }
 
 struct UpstreamRequestContext {
@@ -988,6 +1238,7 @@ async fn record_upstream_failure(
 struct ResolvedModelRoute {
     requested_alias: String,
     upstream_alias: String,
+    fallback_aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1014,6 +1265,7 @@ fn routed_models(cfg: &Config) -> Vec<&ModelConfig> {
 fn resolve_model_route(
     cfg: &Config,
     requested_alias: &str,
+    request_id: Uuid,
 ) -> std::result::Result<ResolvedModelRoute, ModelRouteError> {
     if cfg.models.is_empty() {
         if requested_alias.trim().is_empty() {
@@ -1022,6 +1274,7 @@ fn resolve_model_route(
         return Ok(ResolvedModelRoute {
             requested_alias: requested_alias.to_string(),
             upstream_alias: requested_alias.to_string(),
+            fallback_aliases: Vec::new(),
         });
     }
 
@@ -1037,31 +1290,69 @@ fn resolve_model_route(
             .next()
             .ok_or(ModelRouteError::NoConfiguredModels)?,
         Mode::ColdSwap | Mode::HotSwap => requested,
-        Mode::Weighted => preferred_weighted_model(cfg).unwrap_or(requested),
+        Mode::Weighted => weighted_model_for_request(cfg, request_id).unwrap_or(requested),
         Mode::Fallback => {
             if requested.weight > 0 {
                 requested
             } else {
-                preferred_weighted_model(cfg).unwrap_or(requested)
+                weighted_model_for_request(cfg, request_id).unwrap_or(requested)
             }
         }
+    };
+    let fallback_aliases = if matches!(cfg.mode, Mode::Fallback) {
+        fallback_aliases(cfg, &upstream.alias)
+    } else {
+        Vec::new()
     };
 
     Ok(ResolvedModelRoute {
         requested_alias: requested_alias.to_string(),
         upstream_alias: upstream.alias.clone(),
+        fallback_aliases,
     })
 }
 
-fn preferred_weighted_model(cfg: &Config) -> Option<&ModelConfig> {
-    cfg.models
+fn weighted_model_for_request(cfg: &Config, request_id: Uuid) -> Option<&ModelConfig> {
+    let weighted = cfg
+        .models
         .iter()
         .filter(|model| model.weight > 0)
-        .max_by(|left, right| {
-            left.weight
-                .cmp(&right.weight)
-                .then_with(|| right.alias.cmp(&left.alias))
-        })
+        .collect::<Vec<_>>();
+    let total = weighted.iter().fold(0u64, |total, model| {
+        total.saturating_add(u64::from(model.weight))
+    });
+    if total == 0 {
+        return None;
+    }
+
+    let mut slot = request_id.as_u128() % u128::from(total);
+    for model in weighted {
+        let weight = u128::from(model.weight);
+        if slot < weight {
+            return Some(model);
+        }
+        slot -= weight;
+    }
+
+    None
+}
+
+fn fallback_aliases(cfg: &Config, selected_alias: &str) -> Vec<String> {
+    let mut models = cfg
+        .models
+        .iter()
+        .filter(|model| model.alias != selected_alias)
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        right
+            .weight
+            .cmp(&left.weight)
+            .then_with(|| left.alias.cmp(&right.alias))
+    });
+    models
+        .into_iter()
+        .map(|model| model.alias.clone())
+        .collect()
 }
 
 fn rewrite_chat_model(
@@ -1192,6 +1483,43 @@ async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
     if let Err(err) = state.storage.insert_usage_event(&event).await {
         tracing::warn!(error = %err, "failed to record usage event");
     }
+    record_usage_telemetry(&event);
+}
+
+fn record_usage_telemetry(event: &UsageEvent) {
+    let attributes = [
+        KeyValue::new("llmctl.model", event.model.clone()),
+        KeyValue::new("llmctl.actor", event.actor.clone()),
+        KeyValue::new("llmctl.team", event.team.clone()),
+        KeyValue::new("llmctl.status", event.status.clone()),
+    ];
+    let meter = global::meter(crate::SERVICE_NAME);
+    meter
+        .u64_counter("llmctl.tokens.input")
+        .with_description("Input tokens reported by model workers")
+        .build()
+        .add(event.input_tokens, &attributes);
+    meter
+        .u64_counter("llmctl.tokens.output")
+        .with_description("Output tokens reported by model workers")
+        .build()
+        .add(event.output_tokens, &attributes);
+    meter
+        .u64_histogram("llmctl.request.latency_ms")
+        .with_description("Model request latency in milliseconds")
+        .build()
+        .record(event.latency_ms, &attributes);
+    tracing::info!(
+        request_id = %event.request_id,
+        model = %event.model,
+        actor = %event.actor,
+        team = %event.team,
+        input_tokens = event.input_tokens,
+        output_tokens = event.output_tokens,
+        latency_ms = event.latency_ms,
+        status = %event.status,
+        "model usage recorded"
+    );
 }
 
 fn usage_tokens(bytes: &[u8]) -> (u64, u64) {
@@ -1277,24 +1605,17 @@ fn stream_status(input_tokens: u64, output_tokens: u64) -> &'static str {
 fn response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in upstream_headers {
-        if !is_hop_by_hop(name) {
+        if is_safe_upstream_response_header(name) {
             headers.insert(name.clone(), value.clone());
         }
     }
     headers
 }
 
-fn is_hop_by_hop(name: &HeaderName) -> bool {
+fn is_safe_upstream_response_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
+        "content-type" | "cache-control" | "x-request-id"
     )
 }
 
@@ -1761,7 +2082,7 @@ data: [DONE]
     fn single_mode_routes_to_the_only_configured_model() {
         let cfg = config_with_models(Mode::Single, vec![model("llama", 0, "chat")]);
 
-        let resolved = resolve_model_route(&cfg, "llama").unwrap();
+        let resolved = resolve_model_route(&cfg, "llama", Uuid::nil()).unwrap();
 
         assert_eq!(resolved.requested_alias, "llama");
         assert_eq!(resolved.upstream_alias, "llama");
@@ -1776,18 +2097,20 @@ data: [DONE]
             );
 
             assert_eq!(
-                resolve_model_route(&cfg, "beta").unwrap().upstream_alias,
+                resolve_model_route(&cfg, "beta", Uuid::nil())
+                    .unwrap()
+                    .upstream_alias,
                 "beta"
             );
             assert!(matches!(
-                resolve_model_route(&cfg, "missing"),
+                resolve_model_route(&cfg, "missing", Uuid::nil()),
                 Err(ModelRouteError::UnknownAlias(alias)) if alias == "missing"
             ));
         }
     }
 
     #[test]
-    fn weighted_mode_selects_highest_weight_deterministically() {
+    fn weighted_mode_selects_model_by_request_id_slot() {
         let cfg = config_with_models(
             Mode::Weighted,
             vec![
@@ -1797,10 +2120,10 @@ data: [DONE]
             ],
         );
 
-        let resolved = resolve_model_route(&cfg, "light").unwrap();
+        let resolved = resolve_model_route(&cfg, "light", Uuid::from_u128(2)).unwrap();
 
         assert_eq!(resolved.requested_alias, "light");
-        assert_eq!(resolved.upstream_alias, "heavy-a");
+        assert_eq!(resolved.upstream_alias, "heavy-b");
     }
 
     #[tokio::test]
@@ -1835,15 +2158,14 @@ data: [DONE]
         );
 
         assert_eq!(
-            resolve_model_route(&cfg, "backup").unwrap().upstream_alias,
-            "primary"
-        );
-        assert_eq!(
-            resolve_model_route(&cfg, "tertiary")
+            resolve_model_route(&cfg, "backup", Uuid::from_u128(1))
                 .unwrap()
                 .upstream_alias,
-            "tertiary"
+            "primary"
         );
+        let tertiary = resolve_model_route(&cfg, "tertiary", Uuid::from_u128(120)).unwrap();
+        assert_eq!(tertiary.upstream_alias, "tertiary");
+        assert_eq!(tertiary.fallback_aliases, vec!["primary", "backup"]);
     }
 
     #[test]
@@ -1852,6 +2174,7 @@ data: [DONE]
         let route = ResolvedModelRoute {
             requested_alias: "light".to_string(),
             upstream_alias: "heavy".to_string(),
+            fallback_aliases: Vec::new(),
         };
 
         let rewritten = rewrite_chat_model(body, &route).unwrap();
