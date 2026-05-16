@@ -1,0 +1,485 @@
+use anyhow::{bail, Context, Result};
+use chrono::{Datelike, Duration, Utc};
+use clap::{Args, Parser, Subcommand};
+use rs_llmctl::audit::{AuditEvent, ObservationEvent};
+use rs_llmctl::config::{self, Config, ModelConfig, QuotaConfig, StorageConfig};
+use rs_llmctl::model::{self, ModelInstallRequest, ModelSource};
+use rs_llmctl::reporting;
+use rs_llmctl::storage::Storage;
+use serde::Serialize;
+use serde_json::json;
+use std::path::{Path, PathBuf};
+use tokio::fs;
+use uuid::Uuid;
+
+#[derive(Debug, Parser)]
+#[command(name = "llmctl", version, about = "Control rs-llmctl model serving")]
+struct Cli {
+    #[arg(long, env = "LLMCTL_CONFIG", global = true)]
+    config: Option<PathBuf>,
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Init(InitArgs),
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
+    },
+    Observe {
+        #[command(subcommand)]
+        command: ObserveCommand,
+    },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+    Usage {
+        #[command(subcommand)]
+        command: UsageCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    production: bool,
+    #[arg(long)]
+    bind: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerCommand {
+    Run,
+    Check,
+    SecurityCheck,
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    Install(ModelInstallArgs),
+    List,
+}
+
+#[derive(Debug, Args)]
+struct ModelInstallArgs {
+    source: String,
+    #[arg(long)]
+    alias: String,
+    #[arg(long, default_value = "chat")]
+    role: String,
+    #[arg(long, default_value_t = 1)]
+    weight: u32,
+    #[arg(long)]
+    copy: bool,
+    #[arg(long)]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum QuotaCommand {
+    Set(QuotaSetArgs),
+    List,
+}
+
+#[derive(Debug, Args)]
+struct QuotaSetArgs {
+    #[arg(long)]
+    subject: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+    #[arg(long, default_value_t = 60)]
+    requests_per_minute: u32,
+    #[arg(long, default_value_t = 100_000)]
+    tokens_per_day: u64,
+    #[arg(long, default_value_t = 4)]
+    max_concurrency: u32,
+    #[arg(long = "model")]
+    allowed_models: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ObserveCommand {
+    Snapshot,
+    Drift(ObserveWindowArgs),
+    Usage(ObserveWindowArgs),
+    Show(ObserveShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct ObserveWindowArgs {
+    #[arg(long, default_value_t = 24)]
+    hours: i64,
+}
+
+#[derive(Debug, Args)]
+struct ObserveShowArgs {
+    #[arg(long, default_value_t = 20)]
+    limit: i64,
+    #[arg(long)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    Report {
+        #[command(subcommand)]
+        command: AuditReportCommand,
+    },
+    Request(AuditRequestArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditReportCommand {
+    Monthly,
+    Request(AuditReportRequestArgs),
+}
+
+#[derive(Debug, Args)]
+struct AuditReportRequestArgs {
+    request_id: Uuid,
+}
+
+#[derive(Debug, Args)]
+struct AuditRequestArgs {
+    #[arg(long)]
+    actor: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+    #[arg(long)]
+    action: String,
+    #[arg(long)]
+    resource: String,
+    #[arg(long, default_value = "requested")]
+    outcome: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum UsageCommand {
+    Report(ObserveWindowArgs),
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config_path = cli.config.unwrap_or_else(config::default_config_path);
+
+    match cli.command {
+        Command::Init(args) => init(&config_path, args, cli.json).await,
+        Command::Server { command } => server_command(&config_path, command, cli.json).await,
+        Command::Model { command } => model_command(&config_path, command, cli.json).await,
+        Command::Quota { command } => quota_command(&config_path, command, cli.json).await,
+        Command::Observe { command } => observe_command(&config_path, command, cli.json).await,
+        Command::Audit { command } => audit_command(&config_path, command, cli.json).await,
+        Command::Usage { command } => usage_command(&config_path, command, cli.json).await,
+    }
+}
+
+async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
+    if path.exists() && !args.force {
+        bail!(
+            "config already exists at {}; use --force to overwrite",
+            path.display()
+        );
+    }
+
+    let mut cfg = Config::default();
+    cfg.security.production = args.production;
+    if let Some(bind) = args.bind {
+        cfg.server.host = bind;
+        cfg.security.bind_external =
+            cfg.server.host != "127.0.0.1" && cfg.server.host != "localhost";
+    }
+
+    create_storage_dirs(&cfg.storage).await?;
+    config::save(path, &cfg).await?;
+    init_storage(&cfg.storage).await?;
+    emit(
+        as_json,
+        &json!({ "config": path, "database": cfg.storage.db_path, "model_dir": cfg.storage.model_dir }),
+    )
+}
+
+async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    match command {
+        ServerCommand::Run => {
+            config::validate_production_security(&cfg)?;
+            init_storage(&cfg.storage).await?;
+            emit(
+                as_json,
+                &json!({ "status": "ready", "bind": format!("{}:{}", cfg.server.host, cfg.server.port) }),
+            )?;
+            rs_llmctl::server::serve(cfg).await
+        }
+        ServerCommand::Check => {
+            create_storage_dirs(&cfg.storage).await?;
+            init_storage(&cfg.storage).await?;
+            emit(
+                as_json,
+                &json!({ "status": "ok", "config": path, "models": cfg.models.len(), "quotas": cfg.quotas.len() }),
+            )
+        }
+        ServerCommand::SecurityCheck => {
+            config::validate_production_security(&cfg)?;
+            emit(
+                as_json,
+                &json!({ "status": "ok", "production": cfg.security.production, "require_auth": cfg.security.require_auth }),
+            )
+        }
+    }
+}
+
+async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Result<()> {
+    let mut cfg = load_config(path).await?;
+    match command {
+        ModelCommand::Install(args) => {
+            create_storage_dirs(&cfg.storage).await?;
+            let installed = model::install_model(&ModelInstallRequest {
+                alias: args.alias.clone(),
+                source: model_source(&args.source),
+                cache_dir: cfg.storage.model_dir.clone(),
+                copy_to_cache: args.copy,
+                expected_sha256: args.sha256,
+                role: args.role.clone(),
+                weight: args.weight,
+            })
+            .await?;
+
+            upsert_model(&mut cfg.models, installed.config.clone());
+            config::save(path, &cfg).await?;
+
+            let storage = init_storage(&cfg.storage).await?;
+            for model in &cfg.models {
+                storage.upsert_model(model).await?;
+            }
+
+            emit(
+                as_json,
+                &json!({ "status": "installed", "model": installed, "models": cfg.models }),
+            )
+        }
+        ModelCommand::List => emit(as_json, &cfg.models),
+    }
+}
+
+async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Result<()> {
+    let mut cfg = load_config(path).await?;
+    match command {
+        QuotaCommand::Set(args) => {
+            upsert_quota(
+                &mut cfg.quotas,
+                QuotaConfig {
+                    subject: args.subject,
+                    team: args.team,
+                    requests_per_minute: args.requests_per_minute,
+                    tokens_per_day: args.tokens_per_day,
+                    max_concurrency: args.max_concurrency,
+                    allowed_models: args.allowed_models,
+                },
+            );
+            config::save(path, &cfg).await?;
+            emit(as_json, &json!({ "status": "set", "quotas": cfg.quotas }))
+        }
+        QuotaCommand::List => emit(as_json, &cfg.quotas),
+    }
+}
+
+async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    let storage = init_storage(&cfg.storage).await?;
+    match command {
+        ObserveCommand::Snapshot => {
+            let (snapshot, plan) = rs_llmctl::resources::snapshot_and_plan(&cfg.resources);
+            let value = if snapshot.total_memory_bytes == 0 {
+                0.0
+            } else {
+                (snapshot.total_memory_bytes - snapshot.available_memory_bytes) as f64
+                    / snapshot.total_memory_bytes as f64
+            };
+            let event = ObservationEvent {
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                kind: "resource.snapshot".to_string(),
+                model: "system".to_string(),
+                source: "llmctl".to_string(),
+                value,
+                unit: "ratio".to_string(),
+                attributes_json: json!({ "snapshot": snapshot, "budget_plan": plan }),
+            };
+            storage.insert_observation_event(&event).await?;
+            emit(as_json, &event)
+        }
+        ObserveCommand::Drift(args) => {
+            report_observations(&storage, "drift", args.hours, as_json).await
+        }
+        ObserveCommand::Usage(args) => report_usage(&storage, args.hours, as_json).await,
+        ObserveCommand::Show(args) => show_observations(&storage, args, as_json).await,
+    }
+}
+
+async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    let storage = init_storage(&cfg.storage).await?;
+    match command {
+        AuditCommand::Report { command } => match command {
+            AuditReportCommand::Monthly => {
+                let now = Utc::now();
+                let report =
+                    reporting::monthly_audit_report(&storage, now.year(), now.month()).await?;
+                emit(as_json, &report)
+            }
+            AuditReportCommand::Request(args) => {
+                let report = reporting::per_request_audit_report(&storage, args.request_id).await?;
+                emit(as_json, &report)
+            }
+        },
+        AuditCommand::Request(args) => {
+            let event = AuditEvent::new(
+                None,
+                args.actor,
+                args.team,
+                args.action,
+                args.resource,
+                args.outcome,
+                json!({ "source": "llmctl audit request" }),
+            );
+            storage.insert_audit_event(&event).await?;
+            emit(as_json, &event)
+        }
+    }
+}
+
+async fn usage_command(path: &Path, command: UsageCommand, as_json: bool) -> Result<()> {
+    let cfg = load_config(path).await?;
+    let storage = init_storage(&cfg.storage).await?;
+    match command {
+        UsageCommand::Report(args) => report_usage(&storage, args.hours, as_json).await,
+    }
+}
+
+async fn load_config(path: &Path) -> Result<Config> {
+    config::load(path)
+        .await
+        .with_context(|| format!("load {}", path.display()))
+}
+
+async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
+    if let Some(parent) = storage.db_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::create_dir_all(&storage.model_dir).await?;
+    Ok(())
+}
+
+async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
+    create_storage_dirs(storage).await?;
+    Storage::connect(&storage.db_path).await
+}
+
+fn upsert_model(models: &mut Vec<ModelConfig>, model: ModelConfig) {
+    if let Some(existing) = models.iter_mut().find(|m| m.alias == model.alias) {
+        *existing = model;
+    } else {
+        models.push(model);
+    }
+}
+
+fn upsert_quota(quotas: &mut Vec<QuotaConfig>, quota: QuotaConfig) {
+    if let Some(existing) = quotas.iter_mut().find(|q| q.subject == quota.subject) {
+        *existing = quota;
+    } else {
+        quotas.push(quota);
+    }
+}
+
+fn model_source(source: &str) -> ModelSource {
+    if let Some(model) = model::catalog_model(source) {
+        return ModelSource::HuggingFace {
+            repo: model.repo.to_string(),
+            filename: model.filename.to_string(),
+            revision: model.revision.to_string(),
+        };
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        ModelSource::DirectUrl {
+            url: source.to_string(),
+        }
+    } else {
+        ModelSource::LocalPath {
+            path: PathBuf::from(source),
+        }
+    }
+}
+
+async fn report_observations(
+    storage: &Storage,
+    kind: &str,
+    hours: i64,
+    as_json: bool,
+) -> Result<()> {
+    let (from, to) = window(hours);
+    let events = storage.observation_events_between(from, to).await?;
+    let values: Vec<f64> = events
+        .iter()
+        .filter(|event| event.kind.contains(kind))
+        .map(|event| event.value)
+        .collect();
+    let count = values.len();
+    let avg_value = if count == 0 {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / count as f64)
+    };
+    let max_value = values.iter().copied().reduce(f64::max);
+    emit(
+        as_json,
+        &json!({ "hours": hours, "count": count, "avg_value": avg_value, "max_value": max_value }),
+    )
+}
+
+async fn report_usage(storage: &Storage, hours: i64, as_json: bool) -> Result<()> {
+    let (from, to) = window(hours);
+    let summary = reporting::usage_summary(storage, from, to).await?;
+    emit(as_json, &json!({ "hours": hours, "summary": summary }))
+}
+
+async fn show_observations(storage: &Storage, args: ObserveShowArgs, as_json: bool) -> Result<()> {
+    let from = Utc::now() - Duration::days(3650);
+    let mut events = storage.observation_events_between(from, Utc::now()).await?;
+    if let Some(kind) = args.kind {
+        events.retain(|event| event.kind == kind);
+    }
+    events.sort_by_key(|event| std::cmp::Reverse(event.at));
+    events.truncate(args.limit.max(0) as usize);
+    emit(as_json, &events)
+}
+
+fn window(hours: i64) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+    let to = Utc::now();
+    let from = if hours <= 0 {
+        to - Duration::hours(24)
+    } else {
+        to - Duration::hours(hours)
+    };
+    (from, to)
+}
+
+fn emit<T: Serialize>(_: bool, value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
