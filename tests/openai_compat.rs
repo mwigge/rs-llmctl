@@ -389,7 +389,7 @@ async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage(
 }
 
 #[tokio::test]
-async fn chat_completions_streaming_passthrough_returns_sse_and_records_zero_token_usage_status() {
+async fn chat_completions_streaming_passthrough_returns_sse_and_marks_unmetered_zero_token_usage() {
     let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
     let mut cfg = config_with_models(vec![model("llama")]);
     cfg.server.llama_server = upstream;
@@ -484,7 +484,7 @@ async fn chat_completions_streaming_passthrough_returns_sse_and_records_zero_tok
     assert_eq!(usage_events.len(), 1);
     assert_eq!(usage_events[0].input_tokens, 0);
     assert_eq!(usage_events[0].output_tokens, 0);
-    assert_eq!(usage_events[0].status, "ok");
+    assert_eq!(usage_events[0].status, "stream_unmetered");
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
@@ -209,7 +210,10 @@ enum SecurityCommand {
 
 #[derive(Debug, Args)]
 struct SecurityHashKeyArgs {
-    secret: String,
+    #[arg(long, conflicts_with = "env")]
+    stdin: bool,
+    #[arg(long)]
+    env: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -277,6 +281,7 @@ enum AuditReportCommand {
 #[derive(Debug, Subcommand)]
 enum AuditRetentionCommand {
     Plan(AuditRetentionPlanArgs),
+    Apply(AuditRetentionApplyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -298,6 +303,14 @@ struct AuditReportRequestArgs {
 
 #[derive(Debug, Args)]
 struct AuditRetentionPlanArgs {
+    #[arg(long)]
+    envelope: bool,
+}
+
+#[derive(Debug, Args)]
+struct AuditRetentionApplyArgs {
+    #[arg(long)]
+    yes: bool,
     #[arg(long)]
     envelope: bool,
 }
@@ -662,7 +675,9 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
             )
         }
         SecurityCommand::HashKey(args) => {
-            let sha256 = hex::encode(Sha256::digest(args.secret.as_bytes()));
+            let (secret, input) = read_api_key_secret(args).await?;
+            rs_llmctl::security::validate_api_secret_material(&secret)?;
+            let sha256 = hex::encode(Sha256::digest(secret.as_bytes()));
             emit(
                 as_json,
                 &json!({
@@ -670,7 +685,7 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                     "metadata": {
                         "algorithm": "sha256",
                         "encoding": "hex",
-                        "input": "argument",
+                        "input": input,
                         "purpose": "api-key"
                     }
                 }),
@@ -711,6 +726,24 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
             emit(as_json, &report)
         }
     }
+}
+
+async fn read_api_key_secret(args: SecurityHashKeyArgs) -> Result<(String, &'static str)> {
+    if let Some(name) = args.env {
+        let secret =
+            std::env::var(&name).with_context(|| format!("read secret from env {name}"))?;
+        return Ok((secret, "env"));
+    }
+
+    if args.stdin {
+        let mut secret = String::new();
+        std::io::stdin()
+            .read_to_string(&mut secret)
+            .context("read secret from stdin")?;
+        return Ok((secret.trim_end_matches(['\r', '\n']).to_string(), "stdin"));
+    }
+
+    bail!("security hash-key requires --stdin or --env NAME so secrets are not exposed in process arguments")
 }
 
 async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) -> Result<()> {
@@ -800,6 +833,20 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
                     emit(as_json, &report)
                 }
             }
+            AuditRetentionCommand::Apply(args) => {
+                anyhow::ensure!(
+                    args.yes,
+                    "audit retention apply requires --yes; run audit retention plan first"
+                );
+                let report = audit_retention_apply(&cfg, &storage).await?;
+                if args.envelope {
+                    let envelope =
+                        reporting::report_envelope(reporting::ReportKind::RetentionPlan, report)?;
+                    emit(as_json, &envelope)
+                } else {
+                    emit(as_json, &report)
+                }
+            }
         },
         AuditCommand::Request(args) => {
             let event = AuditEvent::new(
@@ -836,6 +883,32 @@ async fn audit_retention_plan(cfg: &Config, storage: &Storage) -> Result<serde_j
             "monthly_reports": cfg.audit.monthly_reports
         },
         "counts": counts
+    }))
+}
+
+async fn audit_retention_apply(cfg: &Config, storage: &Storage) -> Result<serde_json::Value> {
+    let generated_at = Utc::now();
+    let cutoff = generated_at - Duration::days(i64::from(cfg.audit.retention_days));
+    let before = storage.audit_retention_counts(cutoff).await?;
+    let deleted = storage.delete_audit_events_before(cutoff).await?;
+    let after = storage.audit_retention_counts(cutoff).await?;
+
+    Ok(json!({
+        "status": "applied",
+        "operation": "audit_retention",
+        "dry_run": false,
+        "deletes": true,
+        "generated_at": generated_at,
+        "retention": {
+            "days": cfg.audit.retention_days,
+            "cutoff": cutoff,
+            "report_directory": cfg.audit.report_directory,
+            "report_formats": cfg.audit.report_formats,
+            "monthly_reports": cfg.audit.monthly_reports
+        },
+        "deleted": deleted,
+        "counts_before": before,
+        "counts_after": after
     }))
 }
 
@@ -908,8 +981,11 @@ async fn read_startup_plan(path: &Path) -> Result<StartupPlan> {
 }
 
 async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
-    if let Some(parent) = storage.db_path.parent() {
-        fs::create_dir_all(parent).await?;
+    let plan = storage.connection_plan()?;
+    if plan.backend == rs_llmctl::storage::StorageBackend::Sqlite {
+        if let Some(parent) = storage.db_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
     }
     fs::create_dir_all(&storage.model_dir).await?;
     Ok(())
@@ -917,7 +993,7 @@ async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
 
 async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
     create_storage_dirs(storage).await?;
-    Storage::connect(&storage.db_path).await
+    Storage::connect_config(storage).await
 }
 
 fn upsert_model(models: &mut Vec<ModelConfig>, model: ModelConfig) {

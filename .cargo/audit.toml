@@ -1,0 +1,5 @@
+[advisories]
+# `rsa` is present only through sqlx's inactive MySQL optional dependency in
+# Cargo.lock. rs-llmctl builds sqlx with default-features=false and only the
+# sqlite/runtime/chrono features, confirmed by `cargo tree -e features`.
+ignore = ["RUSTSEC-2023-0071"]

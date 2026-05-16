@@ -9,6 +9,9 @@ port = 8765
 worker_base_port = 18765
 llama_server = "/usr/local/bin/llama-server"
 context_size = 16384
+# Required for browser-based OpenAI/AQE clients. Keep empty when access is
+# server-to-server only.
+cors_allowed_origins = ["https://aqe.example.com"]
 
 [security]
 production = true

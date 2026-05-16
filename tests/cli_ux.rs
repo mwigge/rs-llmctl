@@ -5,8 +5,9 @@ use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -1840,11 +1841,23 @@ fn security_check_and_observe_plan_are_top_level_json_commands() {
 
 #[test]
 fn security_hash_key_outputs_sha256_metadata_without_plaintext() {
-    let secret = "sk-test-super-secret";
+    let secret = "sk-test-super-secret-0123456789abcd";
     let mut hash = llmctl();
-    hash.arg("security").arg("hash-key").arg(secret);
+    hash.arg("security")
+        .arg("hash-key")
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let output = hash.output().expect("run llmctl");
+    let mut child = hash.spawn().expect("spawn llmctl");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(secret.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("run llmctl");
     assert!(
         output.status.success(),
         "status: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1871,18 +1884,20 @@ fn security_hash_key_outputs_sha256_metadata_without_plaintext() {
 fn security_hash_key_does_not_require_config_file() {
     let dir = TempDir::new().expect("tempdir");
     let missing_config = dir.path().join("missing.toml");
-    let secret = "standalone-admin-secret";
+    let secret = "standalone-admin-secret-0123456789abcd";
 
     let mut hash = llmctl();
     hash.arg("--config")
         .arg(&missing_config)
         .arg("security")
         .arg("hash-key")
-        .arg(secret);
+        .arg("--env")
+        .arg("LLMCTL_TEST_HASH_KEY_SECRET")
+        .env("LLMCTL_TEST_HASH_KEY_SECRET", secret);
 
     let report = assert_success_json(hash);
     assert_eq!(report["sha256"], sha256(secret.as_bytes()));
-    assert_eq!(report["metadata"]["input"], "argument");
+    assert_eq!(report["metadata"]["input"], "env");
 }
 
 #[test]

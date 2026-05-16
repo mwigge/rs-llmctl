@@ -1,11 +1,36 @@
 # rs-llmctl
 
-Rust implementation of `llmctl` for enterprise model delivery.
+`rs-llmctl` is a standalone operations tool for running local and private LLM
+models like real server infrastructure. It gives operators a small Rust control
+plane, an OpenAI-compatible serving endpoint, model lifecycle commands,
+resource budgeting, quotas, audit trails, usage reporting, and OTel-ready
+observability.
 
-`rs-llmctl` owns the server-side data plane and control plane: OpenAI-compatible
-serving, model lifecycle, hot/cold swap routing, resource budgeting, quotas,
-audit trails, reporting, and observability. Milliways remains the developer
-client.
+![rs-llmctl operations overview](docs/images/rs-llmctl-operations-hero.png)
+
+The goal is simple: make model delivery boring in the best way. You should be
+able to stage a model, verify it, budget CPU/RAM/VRAM, serve it to internal
+clients, swap it safely, and keep useful evidence about what happened.
+
+## What It Does
+
+- Serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints.
+- Runs CPU-only servers and GPU-backed workers for NVIDIA, AMD/Vulkan, and
+  Apple Metal style deployments.
+- Supports offline model import from local manifests and verified local model
+  files, plus controlled direct downloads when networking is allowed.
+- Plans and runs hot-swap, cold-swap, weighted, fallback, and single-model
+  serving modes.
+- Applies an 80% default resource budget so the host keeps room for the OS and
+  neighboring services.
+- Enforces API key auth, scopes, team/user quotas, admission/backpressure
+  limits, and upstream timeout budgets.
+- Records audit events, usage events, quota decisions, resource observations,
+  data exports, and monthly/per-request reporting.
+- Keeps production CORS explicit so browser-based clients only work from
+  approved origins.
+
+## Quick Start
 
 ```bash
 cargo run --bin llmctl -- init
@@ -15,115 +40,42 @@ cargo run --bin llmctl -- server check
 cargo run --bin llmctld -- --config ~/.config/rs-llmctl/config.toml
 ```
 
-Default production posture requires authentication before binding externally.
-Use dev mode for local unauthenticated experiments only.
-
-Production configs store API keys as SHA-256 digests only. Plaintext secret
-fields in the security section are rejected, and sensitive observability
-headers such as authorization, API key, token, or secret headers must use an
-`env:NAME` reference instead of embedding the value in TOML.
-
-## Development Gates
-
-Changes are expected to be test-driven: add or update the focused test first,
-watch it fail for the intended reason, implement the smallest change, then run
-the relevant gate locally before opening a review. CI enforces the baseline Rust
-gates and verifies that production binaries compile in release mode:
+For an OpenAI-compatible client:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-cargo build --release --bins
+export OPENAI_BASE_URL=http://host:8765/v1
+export OPENAI_API_KEY=<your-rs-llmctl-api-key>
 ```
 
-For narrow documentation or release changes, add focused tests that pin the
-release surface and still run the full CI gate before merging.
+External bind is intentionally strict. Production configs must enable
+`security.require-auth` and `security.bind-external`, define hashed API keys,
+set quota policy, and use reviewed CORS origins for browser clients.
 
-## Release Package Readiness
+## Model Operations
 
-The package publishes two binary entry points from `Cargo.toml`:
+![rs-llmctl model lifecycle](docs/images/rs-llmctl-lifecycle.png)
 
-- `llmctl`, built from `src/bin/llmctl.rs`, is the operator CLI.
-- `llmctld`, built from `src/bin/llmctld.rs`, is the production daemon.
+The normal production flow is offline-first:
 
-Before cutting an archive or installer, run `cargo build --release --bins` and
-package the resulting `target/release/llmctl` and `target/release/llmctld`
-binaries together with this README, the release notes, license metadata, and an
-example production config. Generate and publish checksums for the release
-binaries:
-
-```bash
-packaging/generate-checksums.sh
-sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS
-```
-
-CI runs the checksum script after the release build and uploads `SHA256SUMS` as
-the `release-checksums` artifact. Package checks should fail if either binary
-name changes because downstream automation, systemd units, and air-gapped
-install runbooks address those names directly.
-
-Server packages should install the release binaries at stable paths:
-
-```bash
-install -D -m 0755 target/release/llmctl /usr/local/bin/llmctl
-install -D -m 0755 target/release/llmctld /usr/local/bin/llmctld
-install -D -m 0644 packaging/systemd/llmctld.service /etc/systemd/system/llmctld.service
-install -d -m 0750 -o llmctl -g llmctl /etc/rs-llmctl /var/lib/rs-llmctl/models /var/log/rs-llmctl
-```
-
-Stage a reviewed starter config explicitly before validation. The helper prints
-the selected example and requires the operator to type `COPY` before it writes
-`TARGET=/etc/rs-llmctl/config.toml`:
-
-```bash
-packaging/stage-config.sh production-external-bind
-TARGET=/etc/rs-llmctl/config.toml packaging/stage-config.sh cpu-only
-```
-
-Available profiles are `cpu-only`, `gpu-amd`, `gpu-auto`, `gpu-metal`,
-`gpu-nvidia`, `local-dev`, and `production-external-bind`. This config staging
-flow is offline and passive: it copies only the reviewed TOML file.
-It does not start or enable services. Run it with privileges appropriate for writing
-`/etc/rs-llmctl/config.toml`, or set `TARGET` to a package-root path for
-review in CI or image builds.
-
-The production daemon template is `packaging/systemd/llmctld.service`. It
-starts `/usr/local/bin/llmctld --config ${LLMCTL_CONFIG}` with
-`LLMCTL_CONFIG=/etc/rs-llmctl/config.toml`, runs as the dedicated `llmctl`
-user/group, and grants write access only to `/var/lib/rs-llmctl` and
-`/var/log/rs-llmctl`.
-
-Dry-run validation for a staged server should run before enabling systemd:
-
-```bash
-packaging/validate-install.sh
-```
-
-The validation script is safe to run offline: it performs the daemon dry-run
-startup plan, runs `security check`, prints `server status`, `server plan`,
-`audit retention plan`, and `observe plan`, and verifies the systemd unit only
-when `systemd-analyze` is available. It does not start or enable services,
-install packages, download models, or contact remote endpoints. Override staged
-paths or binary locations with `CONFIG=...`, `UNIT=...`, `LLMCTL=...`, or
-`LLMCTLD=...` when validating a package root.
-
-External bind is a release-blocking deployment control, not a packaging default.
-Before setting `server.host = "0.0.0.0"` or `security.bind-external = true`,
-the staged config must also set `security.production = true`,
-`security.require-auth = true`, at least one hashed `[[security.api-keys]]`
-entry with scopes, quota policy for served subjects, audit retention/reporting,
-and an approved `observability.exporter.endpoint`. Store model data under
-`/var/lib/rs-llmctl/models` and keep runtime secrets in `env:` references.
-
-Offline deployments should ship an offline install manifest next to the staged
-model files. Operators import it with:
+1. Put approved `.gguf` files under a staged model bundle.
+2. Ship an offline install manifest with SHA-256 hashes.
+3. Import the manifest into the reviewed config.
+4. Run dry-run and security checks.
+5. Start `llmctld` through the deployment system.
+6. Export audit/data evidence for the deployment window.
 
 ```bash
 llmctl --config /etc/rs-llmctl/config.toml model import-manifest ./manifest.toml
+llmctl --config /etc/rs-llmctl/config.toml server check
+llmctl --config /etc/rs-llmctl/config.toml server status
+llmctl --config /etc/rs-llmctl/config.toml server plan
+llmctl --config /etc/rs-llmctl/config.toml security check
+llmctl --config /etc/rs-llmctl/config.toml audit retention plan
+llmctl --config /etc/rs-llmctl/config.toml observe plan
+llmctl --config /etc/rs-llmctl/config.toml data export --hours 24
 ```
 
-Minimal manifest shape:
+Minimal manifest:
 
 ```toml
 [[models]]
@@ -134,95 +86,81 @@ weight = 1
 sha256 = "hex-encoded-sha256"
 ```
 
-Relative paths resolve from the manifest directory. Include `sha256` whenever a
-bundle is copied across trust boundaries so the install rejects unexpected model
-bytes before registration.
+Relative paths resolve from the manifest directory. Direct URL installs require
+HTTPS, SHA-256 verification, redirect blocking, and network timeouts.
 
-Hardened starter configs live under `examples/`: `local-dev.toml`,
-`production-external-bind.toml`, `cpu-only.toml`, `gpu-auto.toml`,
-`gpu-nvidia.toml`, `gpu-amd.toml`, and `gpu-metal.toml`. Each profile references
-`examples/offline-model-manifest.toml`, uses SHA-256 API key digest
-placeholders, and keeps observability authorization in an `env:` reference.
+## Production Shape
 
-## Ordered Deployment Operations
+The release package publishes two binaries:
 
-Production deployments should follow this order so every gate is captured before
-traffic reaches the daemon:
+- `llmctl`: operator CLI for config, model, quota, audit, usage, data, and
+  validation work.
+- `llmctld`: daemon that starts planned workers and serves the API.
 
-1. Import the offline install manifest after staging the approved bundle under
-   `/var/lib/rs-llmctl/models`:
-
-   ```bash
-   llmctl --config /etc/rs-llmctl/config.toml model import-manifest ./manifest.toml
-   ```
-
-2. Run the dry-run validation gate without starting the daemon:
-
-   ```bash
-   llmctl --config /etc/rs-llmctl/config.toml server check
-   llmctl --config /etc/rs-llmctl/config.toml server status
-   llmctl --config /etc/rs-llmctl/config.toml server plan
-   ```
-
-3. Run the security audit for production/external-bind controls:
-
-   ```bash
-   llmctl --config /etc/rs-llmctl/config.toml security check
-   llmctl --config /etc/rs-llmctl/config.toml audit retention plan
-   ```
-
-4. Run readiness checks for observability and the systemd unit:
-
-   ```bash
-   llmctl --config /etc/rs-llmctl/config.toml observe plan
-   systemd-analyze verify /etc/systemd/system/llmctld.service
-   ```
-
-5. Hand off service activation only after the dry-run, security audit, and
-   readiness checks pass. Keep the release package documentation passive: the
-   operator change record should reference the approved activation procedure
-   instead of embedding service-control commands here.
-
-6. Verify AQE/OpenAI client access against the OpenAI-compatible endpoint with
-   `OPENAI_BASE_URL=http://host:8765/v1` and the production API key scope
-   intended for the client.
-
-7. Export the audit envelope for the deployment window:
-
-   ```bash
-   llmctl --config /etc/rs-llmctl/config.toml data export --hours 24
-   ```
-
-## Policy Operations Runbook
-
-Quota policy can be moved between environments without editing unrelated server
-settings. Export the reviewed policy set from the source environment, then
-import it into the staged target config:
+Build and package:
 
 ```bash
-llmctl --config /etc/rs-llmctl/config.toml quota export > quotas.json
-llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json
-llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo build --release --bins
+packaging/generate-checksums.sh
+sha256sum target/release/llmctl target/release/llmctld > SHA256SUMS
 ```
 
-Quota import rejects policies with blank subjects or teams,
-`requests_per_minute`, `tokens_per_day`, or `max_concurrency` values that are
-not greater than zero, or `allowed_models` entries that contain empty model
-aliases. Treat those failures as policy review findings, not as runtime
-overrides. After import, capture the effective policy list:
+Development is TDD-oriented: add or update the focused test first, make the
+smallest implementation change, then run the Rust gates before review.
+
+Typical install paths:
 
 ```bash
-llmctl --config /etc/rs-llmctl/config.toml quota list
+install -D -m 0755 target/release/llmctl /usr/local/bin/llmctl
+install -D -m 0755 target/release/llmctld /usr/local/bin/llmctld
+install -D -m 0644 packaging/systemd/llmctld.service /etc/systemd/system/llmctld.service
+install -d -m 0750 -o llmctl -g llmctl /etc/rs-llmctl /var/lib/rs-llmctl/models /var/log/rs-llmctl
 ```
 
-The add-key workflow hashes the operator-provided API key first and stores only
-the digest in config:
+Stage a reviewed config:
 
 ```bash
-llmctl security hash-key "$LLMCTL_NEW_API_KEY"
+packaging/stage-config.sh production-external-bind
+TARGET=/etc/rs-llmctl/config.toml packaging/stage-config.sh cpu-only
 ```
 
-Add the returned digest to the reviewed config as a scoped key entry:
+The script asks you to type `COPY`, writes only the selected TOML profile, and
+does not start or enable services. Available profiles are `cpu-only`,
+`gpu-amd`, `gpu-auto`, `gpu-metal`, `gpu-nvidia`, `local-dev`, and
+`production-external-bind`.
+
+Validate a staged package offline:
+
+```bash
+packaging/validate-install.sh
+```
+
+The validation script runs daemon dry-run planning, `security check`,
+`server status`, `server plan`, `audit retention plan`, `observe plan`, and
+`systemd-analyze verify` when available.
+
+## Security Baseline
+
+`rs-llmctl` uses a PCI DSS v4.0.1-aligned baseline for production posture:
+
+- external bind requires authentication and scoped API keys;
+- raw API keys are never stored in config;
+- sensitive exporter headers must use `env:` references;
+- response headers expose only safe metadata such as request IDs, model aliases,
+  quota state, and policy status;
+- audit, usage, quota, and data export records are available for review;
+- production CORS origins are explicit, not wildcard.
+
+Hash a new key without putting it in process arguments:
+
+```bash
+printf '%s' "$LLMCTL_NEW_API_KEY" | llmctl security hash-key --stdin
+```
+
+Then add only the digest:
 
 ```toml
 [[security.api_keys]]
@@ -233,157 +171,73 @@ team = "platform"
 scopes = ["admin"]
 ```
 
-Do not place raw API key material in TOML. The `sha256` field is for the digest
-printed by `security hash-key`.
+## Policy And Reporting
 
-Capture a server plan export before any production service activation change:
+Quota policy moves between environments as reviewed data:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml quota export > quotas.json
+llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json
+llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml
+llmctl --config /etc/rs-llmctl/config.toml quota list
+```
+
+Quota import rejects policies with blank subjects or teams,
+`requests_per_minute`, `tokens_per_day`, or `max_concurrency` values that are
+not greater than zero, and `allowed_models` entries with empty model aliases.
+
+Useful evidence commands:
 
 ```bash
 llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json
-```
-
-The plan artifact records the worker commands the daemon would launch and can be
-attached to the same change record as the quota import and key digest review.
-For policy changes, keep a before/after pair and review the diff before
-approving the rollout:
-
-```bash
 llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.before.json
 llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.after.json
 llmctl server plan-diff server-plan.before.json server-plan.after.json
-```
-
-Retention review should use the signed envelope form so the payload can be
-verified offline and attached to the change record:
-
-```bash
 llmctl --config /etc/rs-llmctl/config.toml audit retention plan --envelope > retention-plan-envelope.json
 llmctl --config /etc/rs-llmctl/config.toml data verify-envelope retention-plan-envelope.json
 ```
 
-Review the envelope `metadata sha256` against the verification output and
-confirm the payload keeps `dry_run` set to true and `deletes` set to false.
-See `examples/policy-operations-runbook.md` for a compact operator checklist.
+Review the envelope `metadata sha256`, confirm `dry_run`, confirm `deletes`,
+and attach the result to the change record. `audit.retention-days` controls the
+review window. `audit retention apply --yes` exists for deliberate pruning after
+review.
 
-## Enterprise Security Posture
-
-`rs-llmctl` uses a PCI DSS v4.0.1-aligned baseline for enterprise deployments:
-external bind and production mode require API key authentication, scoped keys,
-quotas, audit events, usage reports, and resource budget enforcement. Binding
-to `0.0.0.0` or setting `security.bind-external = true` must be paired with
-`security.require-auth = true` and at least one configured API key.
-
-Observability is configured as an OTel-oriented exporter plan. Set
-`observability.service-name`, enable or disable traces, metrics, and logs, and
-configure `observability.exporter.endpoint` with `http-protobuf` or `grpc`
-protocols for an OTLP collector. Collector authentication belongs in
-environment-backed header references, for example `env:OTEL_EXPORTER_OTLP_HEADERS`,
-not plaintext config.
-
-Audit retention and report generation are explicit config: `audit.retention-days`
-defaults to 365, `audit.report-directory` can point at an operator-managed
-artifact path, `audit.report-formats` defaults to JSON, and
-`audit.monthly-reports` controls scheduled monthly report generation.
-
-Model lifecycle is designed for offline install paths as well as direct URL
-downloads: operators can pre-stage approved model bundles and register local
-files with `llmctl model install`. Runtime planning defaults to an 80% resource
-budget, with CPU-only and GPU-aware detection available through the resource
-configuration and observation commands.
-
-Enterprise runtime controls belong in config, not release packaging scripts:
-`security.require-auth = true` for production, `security.bind-external = true`
-only when API keys are configured, quota policies for every served subject,
-`audit.retention-days` and report output for compliance review, and
-`observability.exporter.endpoint` pointed at the approved collector. Secrets and
-collector headers should use `env:` references so archives and manifests never
-carry plaintext runtime credentials.
-
-The serving API is OpenAI-compatible for enterprise clients, including Agentic
-QE (AQE), by pointing `OPENAI_BASE_URL` at `http://host:8765/v1`. AQE/OpenAI
-endpoint usage is captured through audit trails, usage reports, quota checks,
-and per-request reporting so regulated deployments can review who used which
-model, when, and under which policy.
-
-Enterprise reporting should publish data/audit summaries and quota/team
-governance summaries as reviewed artifacts. The data/audit summaries should
-include usage totals, audit event counts, retention windows, and export envelope
-hashes. The quota/team governance summaries should include quota limits, team
-attribution, model aliases, and policy status so reviewers can compare intended
-policy with observed use.
-
-External client non-secret response metadata is safe for AQE/OpenAI-compatible
-clients when it contains only request identifiers, model aliases, policy status,
-quota state, and audit correlation fields. AQE/OpenAI-compatible clients can
-consume these summaries without exposing secrets because API keys, bearer
-tokens, collector headers, and raw prompts remain outside reporting metadata.
-
-Server deployments can plan external database storage with Postgres while the
-default local path remains SQLite. Postgres configuration must use a database
-URL that is redacted in reports and operational output; migration plans are
-reviewable before a live external database is attached.
-
-Router maturity controls include admission/backpressure limits, upstream timeout
-budgets, and non-secret failure responses for saturated or slow model workers.
-These controls are part of the serving contract so OpenAI-compatible clients see
-stable 429/504 errors without upstream URLs, prompts, file paths, API keys, or
-bearer tokens.
-
-External governance tools can consume the AQE/OpenAI-compatible contract with:
+Enterprise reporting covers data/audit summaries, quota/team governance
+summaries, usage totals, audit event counts, retention windows, quota limits,
+team attribution, request identifiers, model aliases, and policy status. The
+AQE/OpenAI-compatible contract is available without secrets:
 
 ```bash
 llmctl --config /etc/rs-llmctl/config.toml integration aqe-contract
 ```
 
-The contract lists OpenAI paths, required auth scopes, safe response headers,
-quota/team reporting fields, and model aliases without exposing runtime secrets.
+It lists OpenAI paths, required auth scopes, safe response headers,
+quota/team reporting fields, and model aliases.
 
-## CLI
+## Storage And Observability
 
-`llmctl init` writes the default TOML config, creates the model directory, and
-initializes SQLite storage.
+SQLite is the default runtime store. External database storage with Postgres is
+available as a planning surface with a redacted database URL and a migration
+plan before live attachment. Runtime Postgres storage is intentionally rejected
+until the backend is fully implemented.
 
-Server commands:
+Router controls include admission/backpressure limits, upstream timeout budgets,
+non-secret failure responses, and stable 429/504 errors that do not expose
+database passwords, raw connection secrets, upstream URLs, prompts, file paths,
+API keys, or bearer tokens.
 
-- `llmctl server run` validates startup state and runs the serving API.
-- `llmctl server check` verifies config and storage initialization.
-- `llmctl server security-check` enforces the production/external-bind auth
-  policy without starting the daemon.
+OTel-oriented observability is configured through
+`observability.exporter.endpoint`, traces/metrics/logs switches, and
+environment-backed headers. Use `env:` for collector credentials.
 
-Model commands:
+## Deeper Docs
 
-- `llmctl model install <path-url-or-catalog-id> --alias <name>` registers a
-  local model, downloads a URL, or installs a built-in catalog model into the
-  configured model directory.
-- `llmctl model list` prints configured models.
+- [Operations guide](docs/operations.md)
+- [Security model](docs/security.md)
+- [Observability and reporting](docs/observability-reporting.md)
+- [Storage notes](docs/storage.md)
+- [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)
 
-Swap commands:
+## License
 
-- `llmctl swap set --mode hot-swap` enables hot model swapping in config.
-- `llmctl swap set --mode cold-swap` enables cold model swapping in config.
-- `llmctl swap show` prints the configured swap mode and model aliases.
-
-Quota commands:
-
-- `llmctl quota set --subject <id> --team <team> --model <alias>` upserts a
-  quota policy in config.
-- `llmctl quota export` prints configured quota policies as a portable JSON
-  document.
-- `llmctl quota import <path>` replaces configured quota policies from a JSON
-  export or a TOML policy file.
-- `llmctl quota list` prints configured quota policies.
-
-Operations commands:
-
-- `llmctl observe snapshot` records a local resource snapshot.
-- `llmctl observe drift --hours 24` summarizes drift observations.
-- `llmctl observe usage --hours 24` summarizes usage events.
-- `llmctl observe show --limit 20` prints recent observations.
-- `llmctl audit report monthly --year 2026 --month 5` emits a monthly audit
-  report; omitted bounds default to the current month.
-- `llmctl audit report request <request-id>` emits a per-request audit report.
-- `llmctl audit request --actor <id> --action <name> --resource <target>`
-  records a manual audit request.
-- `llmctl usage report --hours 24` summarizes usage events.
-- `llmctl data export --hours 24` exports audit, usage, observation, quota, and
-  model inventory records for the time window.
+Apache License 2.0. See [LICENSE](LICENSE).

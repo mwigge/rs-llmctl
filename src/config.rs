@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub worker_base_port: u16,
     pub llama_server: String,
     pub context_size: u32,
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -70,6 +72,7 @@ impl Default for ServerConfig {
             worker_base_port: 18765,
             llama_server: "llama-server".to_string(),
             context_size: 8192,
+            cors_allowed_origins: Vec::new(),
         }
     }
 }

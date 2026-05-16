@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rs_llmctl::config::{self, StorageConfig};
-use rs_llmctl::storage::Storage;
-use rs_llmctl::worker::StartupPlan;
+use rs_llmctl::storage::{Storage, StorageBackend};
+use rs_llmctl::worker::{StartupPlan, TokioWorkerRunner, WorkerState, WorkerSupervisor};
 use std::path::PathBuf;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
@@ -32,13 +32,19 @@ async fn main() -> Result<()> {
     init_storage(&cfg.storage).await?;
     let worker_startup_plan = StartupPlan::from_config(&cfg);
     for planned in &worker_startup_plan.workers {
+        let env_names = planned
+            .command
+            .env
+            .iter()
+            .map(|(key, _value)| key.as_str())
+            .collect::<Vec<_>>();
         tracing::debug!(
             worker = planned.worker.id.as_str(),
             model = planned.worker.model.alias.as_str(),
             upstream = %planned.worker.upstream(),
             program = %planned.command.program.display(),
             args = ?planned.command.args,
-            env = ?planned.command.env,
+            env = ?env_names,
             "planned worker command"
         );
     }
@@ -56,6 +62,22 @@ async fn main() -> Result<()> {
         "starting daemon"
     );
 
+    let mut worker_supervisor = WorkerSupervisor::new(TokioWorkerRunner::new());
+    let worker_statuses = worker_supervisor.start_all(&worker_startup_plan).await;
+    if let Some(failed) = worker_statuses
+        .iter()
+        .find(|status| status.state == WorkerState::Failed)
+    {
+        anyhow::bail!(
+            "failed to start worker {}: {}",
+            failed.worker_id.as_str(),
+            failed
+                .last_error
+                .as_deref()
+                .unwrap_or("unknown worker error")
+        );
+    }
+
     rs_llmctl::server::serve_with_shutdown(cfg, rs_llmctl::server::shutdown_signal()).await
 }
 
@@ -70,9 +92,12 @@ fn init_tracing(json_logs: bool) {
 }
 
 async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
-    if let Some(parent) = storage.db_path.parent() {
-        fs::create_dir_all(parent).await?;
+    let plan = storage.connection_plan()?;
+    if plan.backend == StorageBackend::Sqlite {
+        if let Some(parent) = storage.db_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
     }
     fs::create_dir_all(&storage.model_dir).await?;
-    Storage::connect(&storage.db_path).await
+    Storage::connect_config(storage).await
 }

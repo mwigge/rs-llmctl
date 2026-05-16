@@ -22,7 +22,12 @@ impl Principal {
     }
 
     pub fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|s| s == scope || s == "admin")
+        self.scopes.iter().any(|s| {
+            s == scope
+                || s == "admin"
+                || (scope.starts_with("models.") && s == "models")
+                || (scope.starts_with("chat.") && s == "chat")
+        })
     }
 }
 
@@ -157,9 +162,7 @@ pub async fn check_quota(
     principal: &Principal,
     model: &str,
 ) -> Result<QuotaDecision> {
-    let Some(q) = quotas.iter().find(|q| {
-        q.subject == principal.subject || (!q.team.is_empty() && q.team == principal.team)
-    }) else {
+    let Some(q) = matching_quota_policy(quotas, principal) else {
         return Ok(QuotaDecision {
             allowed: true,
             reason: "no quota configured".to_string(),
@@ -216,6 +219,20 @@ pub async fn check_quota(
         allowed: true,
         reason: "quota policy allowed".to_string(),
     })
+}
+
+pub fn matching_quota_policy<'a>(
+    quotas: &'a [QuotaConfig],
+    principal: &Principal,
+) -> Option<&'a QuotaConfig> {
+    quotas
+        .iter()
+        .find(|q| q.subject == principal.subject)
+        .or_else(|| {
+            quotas
+                .iter()
+                .find(|q| !q.team.is_empty() && q.team == principal.team)
+        })
 }
 
 fn quota_scope_label(q: &QuotaConfig, principal: &Principal) -> String {

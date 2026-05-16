@@ -14,6 +14,22 @@ fn normalize_doc_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn product_docs() -> String {
+    [
+        "README.md",
+        "docs/operations.md",
+        "docs/security.md",
+        "docs/observability-reporting.md",
+        "docs/storage.md",
+        "docs/blog-local-model-operations.md",
+        "examples/policy-operations-runbook.md",
+    ]
+    .into_iter()
+    .map(read)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 #[test]
 fn ci_workflow_enforces_core_rust_gates() {
     let workflow = read(".github/workflows/ci.yml");
@@ -48,7 +64,7 @@ fn package_manifest_publishes_expected_binaries() {
 
 #[test]
 fn docs_cover_tdd_lints_and_enterprise_security_posture() {
-    let docs = format!("{}\n{}", read("README.md"), read("llmctl-to-rust.md")).to_lowercase();
+    let docs = product_docs().to_lowercase();
 
     for topic in [
         "tdd",
@@ -95,7 +111,7 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
 
 #[test]
 fn docs_cover_ordered_deployment_operations() {
-    let docs = format!("{}\n{}", read("README.md"), read("llmctl-to-rust.md")).to_lowercase();
+    let docs = product_docs().to_lowercase();
 
     let ordered_steps = [
         "1. import the offline install manifest",
@@ -136,10 +152,7 @@ fn docs_cover_ordered_deployment_operations() {
 
 #[test]
 fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
-    let readme = read("README.md");
-    let rust_plan = read("llmctl-to-rust.md");
-    let runbook = read("examples/policy-operations-runbook.md");
-    let docs = format!("{readme}\n{rust_plan}\n{runbook}");
+    let docs = product_docs();
     let docs_lower = docs.to_lowercase();
 
     for required in [
@@ -147,7 +160,7 @@ fn docs_pin_policy_operation_runbook_commands_without_plaintext_key_guidance() {
         "llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.json",
         "llmctl --config /etc/rs-llmctl/config.toml quota import ./quotas.toml",
         "llmctl --config /etc/rs-llmctl/config.toml quota list",
-        "llmctl security hash-key \"$LLMCTL_NEW_API_KEY\"",
+        "printf '%s' \"$LLMCTL_NEW_API_KEY\" | llmctl security hash-key --stdin",
         "[[security.api_keys]]",
         "sha256 = \"<sha256-from-hash-key>\"",
         "llmctld --config /etc/rs-llmctl/config.toml --dry-run > server-plan.json",

@@ -4,11 +4,13 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const HF_BASE_URL: &str = "https://huggingface.co";
+const MODEL_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -160,7 +162,10 @@ pub fn huggingface_download_url(repo: &str, filename: &str, revision: &str) -> R
 pub fn source_url(source: &ModelSource) -> Result<Option<String>> {
     match source {
         ModelSource::LocalPath { .. } => Ok(None),
-        ModelSource::DirectUrl { url } => Ok(Some(url.clone())),
+        ModelSource::DirectUrl { url } => {
+            validate_direct_download_url(url)?;
+            Ok(Some(url.clone()))
+        }
         ModelSource::HuggingFace {
             repo,
             filename,
@@ -375,6 +380,7 @@ pub async fn download_model(
     name_hint: &str,
     expected_sha256: &str,
 ) -> Result<PathBuf> {
+    validate_direct_download_url(url)?;
     let expected_sha256 = normalized_sha256(expected_sha256)?;
     fs::create_dir_all(cache_dir)
         .await
@@ -387,7 +393,11 @@ pub async fn download_model(
         Ok(metadata) if metadata.is_file() => metadata.len(),
         _ => 0,
     };
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(MODEL_DOWNLOAD_TIMEOUT)
+        .build()
+        .context("build model download client")?;
     let mut request = client.get(url);
     if partial_len > 0 {
         request = request.header(
@@ -533,6 +543,43 @@ fn ensure_gguf_name(name: &str) -> Result<()> {
         name.to_ascii_lowercase().ends_with(".gguf"),
         "model file must use .gguf extension: {name}"
     );
+    Ok(())
+}
+
+fn validate_direct_download_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("parse model URL {url}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "https",
+        "direct model downloads require https URLs"
+    );
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("direct model download URL must include a host"))?;
+    anyhow::ensure!(
+        !matches!(host, "localhost" | "metadata.google.internal"),
+        "direct model download URL host is not allowed"
+    );
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let blocked = match ip {
+            IpAddr::V4(ip) => {
+                ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.octets() == [169, 254, 169, 254]
+            }
+            IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+            }
+        };
+        anyhow::ensure!(
+            !blocked,
+            "direct model download URL must not target local or private addresses"
+        );
+    }
     Ok(())
 }
 
@@ -742,6 +789,39 @@ sha256 = "{expected}"
             err.contains("expected_sha256 is required for downloaded model sources"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_direct_download_urls_before_network() {
+        let dir = tempdir().unwrap();
+        let request = |url: &str| ModelInstallRequest {
+            alias: "tiny".to_string(),
+            source: ModelSource::DirectUrl {
+                url: url.to_string(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: Some("0".repeat(64)),
+            role: "chat".to_string(),
+            weight: 0,
+        };
+
+        let http = install_plan(&request("http://models.example/tiny.gguf"))
+            .unwrap_err()
+            .to_string();
+        assert!(http.contains("require https"), "{http}");
+
+        let localhost = install_plan(&request("https://127.0.0.1/tiny.gguf"))
+            .unwrap_err()
+            .to_string();
+        assert!(localhost.contains("local or private"), "{localhost}");
+
+        let metadata = install_plan(&request(
+            "https://169.254.169.254/latest/meta-data/tiny.gguf",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(metadata.contains("local or private"), "{metadata}");
     }
 
     #[tokio::test]

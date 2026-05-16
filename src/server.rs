@@ -1,6 +1,6 @@
 use crate::audit::{AuditEvent, UsageEvent};
 use crate::config::{Config, Mode, ModelConfig};
-use crate::quota::{check_quota, Principal};
+use crate::quota::{check_quota, matching_quota_policy, Principal};
 use crate::storage::{QuotaDecisionRecord, Storage};
 use crate::worker::StartupPlan;
 use anyhow::{Context, Result};
@@ -16,12 +16,13 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -33,7 +34,7 @@ pub struct ServerState {
     cfg: Arc<Config>,
     storage: Storage,
     client: reqwest::Client,
-    upstream: String,
+    upstreams: BTreeMap<String, String>,
     admission: AdmissionController,
     serving_limits: ServingLimits,
 }
@@ -48,13 +49,14 @@ pub fn router_with_serving_limits(
     storage: Storage,
     serving_limits: ServingLimits,
 ) -> Router {
-    let upstream = normalize_upstream(&cfg.server.llama_server);
+    let upstreams = serving_upstreams(&cfg);
     let admission = AdmissionController::new(serving_limits.max_in_flight);
+    let cors = cors_layer(&cfg);
     let state = ServerState {
         cfg: Arc::new(cfg),
         storage,
         client: reqwest::Client::new(),
-        upstream,
+        upstreams,
         admission,
         serving_limits,
     };
@@ -65,21 +67,37 @@ pub fn router_with_serving_limits(
         .route("/readyz", get(readyz))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE, request_id_header_name()])
-                .expose_headers([
-                    request_id_header_name(),
-                    model_count_header_name(),
-                    model_header_name(),
-                    upstream_model_header_name(),
-                    quota_decision_header_name(),
-                ]),
-        )
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
+}
+
+fn cors_layer(cfg: &Config) -> CorsLayer {
+    let mut layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE, request_id_header_name()])
+        .expose_headers([
+            request_id_header_name(),
+            model_count_header_name(),
+            model_header_name(),
+            upstream_model_header_name(),
+            quota_decision_header_name(),
+        ]);
+
+    if cfg.security.production || cfg.security.bind_external || is_external_host(&cfg.server.host) {
+        let origins = cfg
+            .server
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect::<Vec<_>>();
+        if !origins.is_empty() {
+            layer = layer.allow_origin(AllowOrigin::list(origins));
+        }
+        layer
+    } else {
+        layer.allow_origin(Any)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,27 +137,56 @@ impl ServingLimits {
 
 #[derive(Clone)]
 struct AdmissionController {
-    permits: Arc<Semaphore>,
+    global: Arc<Semaphore>,
+    scoped: Arc<Mutex<BTreeMap<String, Arc<Semaphore>>>>,
 }
 
 impl AdmissionController {
     fn new(max_in_flight: usize) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            global: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            scoped: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    fn try_acquire(&self) -> std::result::Result<AdmissionPermit, AdmissionError> {
-        self.permits
+    fn try_acquire_for(
+        &self,
+        scope: Option<(String, usize)>,
+    ) -> std::result::Result<AdmissionPermit, AdmissionError> {
+        let global = self
+            .global
             .clone()
             .try_acquire_owned()
-            .map(|permit| AdmissionPermit { _permit: permit })
-            .map_err(|_| AdmissionError::Busy)
+            .map_err(|_| AdmissionError::Busy)?;
+
+        let scoped = match scope {
+            Some((scope, limit)) => {
+                let semaphore = {
+                    let mut scoped = self.scoped.lock().map_err(|_| AdmissionError::Busy)?;
+                    scoped
+                        .entry(scope)
+                        .or_insert_with(|| Arc::new(Semaphore::new(limit.max(1))))
+                        .clone()
+                };
+                Some(
+                    semaphore
+                        .try_acquire_owned()
+                        .map_err(|_| AdmissionError::Busy)?,
+                )
+            }
+            None => None,
+        };
+
+        Ok(AdmissionPermit {
+            _global: global,
+            _scoped: scoped,
+        })
     }
 }
 
 struct AdmissionPermit {
-    _permit: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+    _scoped: Option<OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for AdmissionPermit {
@@ -464,7 +511,10 @@ async fn chat_completions(
     )
     .await;
 
-    let admission = match state.admission.try_acquire() {
+    let admission = match state
+        .admission
+        .try_acquire_for(quota_admission_scope(&state.cfg, &principal))
+    {
         Ok(permit) => permit,
         Err(AdmissionError::Busy) => {
             record_audit(
@@ -488,7 +538,25 @@ async fn chat_completions(
         }
     };
 
-    let upstream = format!("{}/v1/chat/completions", state.upstream);
+    let upstream = match upstream_for_route(&state, &route) {
+        Ok(upstream) => format!("{upstream}/v1/chat/completions"),
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                model,
+                "rejected",
+                json!({ "reason": err }),
+            )
+            .await;
+            return with_request_id(
+                error_response(StatusCode::BAD_GATEWAY, "upstream_unavailable", err),
+                request_id,
+            );
+        }
+    };
     let upstream_response = match timeout(
         upstream_timeout_budget(&state),
         state
@@ -569,6 +637,34 @@ async fn chat_completions(
         };
         json_upstream(state, upstream_response, upstream_context).await
     }
+}
+
+fn quota_admission_scope(cfg: &Config, principal: &Principal) -> Option<(String, usize)> {
+    matching_quota_policy(&cfg.quotas, principal).and_then(|quota| {
+        usize::try_from(quota.max_concurrency)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .map(|limit| {
+                let scope = if quota.subject == principal.subject {
+                    format!("subject:{}", principal.subject)
+                } else {
+                    format!("team:{}", principal.team)
+                };
+                (scope, limit)
+            })
+    })
+}
+
+fn upstream_for_route(
+    state: &ServerState,
+    route: &ResolvedModelRoute,
+) -> std::result::Result<String, String> {
+    state
+        .upstreams
+        .get(&route.upstream_alias)
+        .or_else(|| state.upstreams.get("*"))
+        .cloned()
+        .ok_or_else(|| format!("no upstream configured for model {}", route.upstream_alias))
 }
 
 struct UpstreamRequestContext {
@@ -683,21 +779,90 @@ async fn stream_upstream(
         admission,
     } = context;
     let status = upstream_response.status();
+    if !status.is_success() {
+        record_usage(
+            &state,
+            UsageRecordInput {
+                request_id,
+                principal: &principal,
+                model: &model,
+                input_tokens: 0,
+                output_tokens: 0,
+                latency_ms: elapsed_ms(started),
+                status: "upstream_error",
+            },
+        )
+        .await;
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "chat.completions",
+            model,
+            "upstream_error",
+            json!({ "status": status.as_u16(), "stream": true }),
+        )
+        .await;
+        return with_request_id(
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream request failed".to_string(),
+            ),
+            request_id,
+        );
+    }
+
     let mut headers = response_headers(upstream_response.headers());
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    let stream_status = if status.is_success() {
-        "ok"
-    } else {
-        "upstream_error"
-    };
     let response_model = model.clone();
     let response_upstream_model = upstream_model.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
+    let idle_timeout = upstream_timeout_budget(&state);
     let stream = async_stream::stream! {
         let _admission = admission;
-        while let Some(chunk) = upstream_stream.next().await {
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut usage_parser = SseUsageParser::default();
+        loop {
+            let chunk = match timeout(idle_timeout, upstream_stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    record_usage(
+                        &state,
+                        UsageRecordInput {
+                            request_id,
+                            principal: &principal,
+                            model: &model,
+                            input_tokens,
+                            output_tokens,
+                            latency_ms: elapsed_ms(started),
+                            status: "timeout",
+                        },
+                    )
+                    .await;
+                    record_audit(
+                        &state,
+                        Some(request_id),
+                        principal.clone(),
+                        "chat.completions",
+                        model.clone(),
+                        "timeout",
+                        json!({ "status": status.as_u16(), "stream": true }),
+                    )
+                    .await;
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream stream timed out"));
+                    return;
+                }
+            };
             match chunk {
-                Ok(bytes) => yield Ok::<Bytes, std::io::Error>(bytes),
+                Ok(bytes) => {
+                    let (input, output) = usage_parser.push(&bytes);
+                    input_tokens = input_tokens.saturating_add(input);
+                    output_tokens = output_tokens.saturating_add(output);
+                    yield Ok::<Bytes, std::io::Error>(bytes)
+                }
                 Err(err) => {
                     record_usage(
                         &state,
@@ -705,8 +870,8 @@ async fn stream_upstream(
                             request_id,
                             principal: &principal,
                             model: &model,
-                            input_tokens: 0,
-                            output_tokens: 0,
+                            input_tokens,
+                            output_tokens,
                             latency_ms: elapsed_ms(started),
                             status: "stream_error",
                         },
@@ -733,10 +898,10 @@ async fn stream_upstream(
                 request_id,
                 principal: &principal,
                 model: &model,
-                input_tokens: 0,
-                output_tokens: 0,
+                input_tokens,
+                output_tokens,
                 latency_ms: elapsed_ms(started),
-                status: stream_status,
+                status: stream_status(input_tokens, output_tokens),
             },
         )
         .await;
@@ -746,8 +911,8 @@ async fn stream_upstream(
             principal.clone(),
             "chat.completions",
             model.clone(),
-            stream_status,
-            json!({ "status": status.as_u16(), "stream": true }),
+            stream_status(input_tokens, output_tokens),
+            json!({ "status": status.as_u16(), "stream": true, "metered": input_tokens > 0 || output_tokens > 0 }),
         )
         .await;
     };
@@ -937,13 +1102,25 @@ fn authenticate(cfg: &Config, headers: &HeaderMap) -> std::result::Result<Princi
     cfg.security
         .api_keys
         .iter()
-        .find(|key| key.sha256.eq_ignore_ascii_case(&digest))
+        .find(|key| constant_time_eq_case_insensitive(&key.sha256, &digest))
         .map(|key| Principal {
             subject: key.subject.clone(),
             team: key.team.clone(),
             scopes: key.scopes.clone(),
         })
         .ok_or_else(|| "invalid bearer token".to_string())
+}
+
+fn constant_time_eq_case_insensitive(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (left, right) in left.bytes().zip(right.bytes()) {
+        diff |= left.to_ascii_lowercase() ^ right.to_ascii_lowercase();
+    }
+    diff == 0
 }
 
 async fn record_audit(
@@ -1021,6 +1198,10 @@ fn usage_tokens(bytes: &[u8]) -> (u64, u64) {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return (0, 0);
     };
+    usage_tokens_from_value(&value)
+}
+
+fn usage_tokens_from_value(value: &Value) -> (u64, u64) {
     let Some(usage) = value.get("usage") else {
         return (0, 0);
     };
@@ -1035,6 +1216,62 @@ fn usage_tokens(bytes: &[u8]) -> (u64, u64) {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     (input, output)
+}
+
+#[derive(Debug, Default)]
+struct SseUsageParser {
+    buffer: String,
+}
+
+impl SseUsageParser {
+    fn push(&mut self, bytes: &[u8]) -> (u64, u64) {
+        let text = String::from_utf8_lossy(bytes);
+        self.buffer.push_str(&text);
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+
+        while let Some(frame_end) = self.buffer.find("\n\n") {
+            let frame = self.buffer[..frame_end].to_string();
+            self.buffer.drain(..frame_end + 2);
+            let (input, output) = sse_frame_usage_tokens(&frame);
+            input_tokens = input_tokens.saturating_add(input);
+            output_tokens = output_tokens.saturating_add(output);
+        }
+
+        (input_tokens, output_tokens)
+    }
+}
+
+#[cfg(test)]
+fn sse_usage_tokens(bytes: &[u8]) -> (u64, u64) {
+    SseUsageParser::default().push(bytes)
+}
+
+fn sse_frame_usage_tokens(frame: &str) -> (u64, u64) {
+    frame
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .map(|value| usage_tokens_from_value(&value))
+        .fold(
+            (0u64, 0u64),
+            |(total_input, total_output), (input, output)| {
+                (
+                    total_input.saturating_add(input),
+                    total_output.saturating_add(output),
+                )
+            },
+        )
+}
+
+fn stream_status(input_tokens: u64, output_tokens: u64) -> &'static str {
+    if input_tokens == 0 && output_tokens == 0 {
+        "stream_unmetered"
+    } else {
+        "ok"
+    }
 }
 
 fn response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
@@ -1172,6 +1409,29 @@ fn normalize_upstream(raw: &str) -> String {
     }
 }
 
+fn serving_upstreams(cfg: &Config) -> BTreeMap<String, String> {
+    let raw = cfg.server.llama_server.trim();
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return BTreeMap::from([("*".to_string(), normalize_upstream(raw))]);
+    }
+
+    let upstreams = StartupPlan::from_config(cfg)
+        .workers
+        .into_iter()
+        .map(|planned| {
+            (
+                planned.worker.model.alias.clone(),
+                planned.worker.upstream(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if upstreams.is_empty() {
+        BTreeMap::from([("*".to_string(), normalize_upstream(raw))])
+    } else {
+        upstreams
+    }
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -1214,7 +1474,7 @@ pub async fn serve_with_shutdown<S>(cfg: Config, shutdown: S) -> Result<()>
 where
     S: Future<Output = ()> + Send + 'static,
 {
-    let storage = Storage::connect(&cfg.storage.db_path).await?;
+    let storage = Storage::connect_config(&cfg.storage).await?;
     serve_with_storage_and_shutdown(cfg, storage, shutdown).await
 }
 
@@ -1295,6 +1555,59 @@ mod tests {
     }
 
     #[test]
+    fn extracts_streaming_sse_usage_tokens() {
+        let chunk = br#"event: completion
+data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9}}
+
+data: [DONE]
+"#;
+
+        assert_eq!(sse_usage_tokens(chunk), (7, 9));
+        assert_eq!(stream_status(0, 0), "stream_unmetered");
+        assert_eq!(stream_status(7, 9), "ok");
+    }
+
+    #[test]
+    fn extracts_split_streaming_sse_usage_tokens() {
+        let mut parser = SseUsageParser::default();
+
+        assert_eq!(
+            parser.push(br#"data: {"choices":[],"usage":{"prompt_tokens":7"#),
+            (0, 0)
+        );
+        assert_eq!(
+            parser.push(
+                br#","completion_tokens":9}}
+
+"#
+            ),
+            (7, 9)
+        );
+    }
+
+    #[test]
+    fn executable_llama_server_routes_to_planned_worker_upstream() {
+        let cfg = Config {
+            server: ServerConfig {
+                llama_server: "/usr/local/bin/llama-server".to_string(),
+                ..ServerConfig::default()
+            },
+            models: vec![ModelConfig {
+                alias: "llama".to_string(),
+                path: "/models/llama.gguf".into(),
+                role: "chat".to_string(),
+                weight: 1,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            serving_upstreams(&cfg).get("llama").map(String::as_str),
+            Some("http://127.0.0.1:18765")
+        );
+    }
+
+    #[test]
     fn request_id_from_headers_accepts_valid_uuid() {
         let request_id = Uuid::new_v4();
         let mut headers = HeaderMap::new();
@@ -1363,12 +1676,38 @@ mod tests {
     #[test]
     fn admission_controller_rejects_when_in_flight_limit_is_full() {
         let controller = AdmissionController::new(1);
-        let first = controller.try_acquire().expect("first permit");
+        let first = controller.try_acquire_for(None).expect("first permit");
 
-        assert_eq!(controller.try_acquire().unwrap_err(), AdmissionError::Busy);
+        assert_eq!(
+            controller.try_acquire_for(None).unwrap_err(),
+            AdmissionError::Busy
+        );
 
         drop(first);
-        assert!(controller.try_acquire().is_ok());
+        assert!(controller.try_acquire_for(None).is_ok());
+    }
+
+    #[test]
+    fn admission_controller_applies_scoped_limits() {
+        let controller = AdmissionController::new(8);
+        let first = controller
+            .try_acquire_for(Some(("subject:alice".to_string(), 1)))
+            .expect("scoped permit");
+
+        assert_eq!(
+            controller
+                .try_acquire_for(Some(("subject:alice".to_string(), 1)))
+                .unwrap_err(),
+            AdmissionError::Busy
+        );
+        assert!(controller
+            .try_acquire_for(Some(("subject:bob".to_string(), 1)))
+            .is_ok());
+
+        drop(first);
+        assert!(controller
+            .try_acquire_for(Some(("subject:alice".to_string(), 1)))
+            .is_ok());
     }
 
     #[test]

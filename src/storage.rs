@@ -146,55 +146,86 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
         SqlDialect::Sqlite => "REAL",
         SqlDialect::Postgres => "DOUBLE PRECISION",
     };
+    let id_type = match dialect {
+        SqlDialect::Sqlite => "TEXT",
+        SqlDialect::Postgres => "UUID",
+    };
+    let time_type = match dialect {
+        SqlDialect::Sqlite => "TEXT",
+        SqlDialect::Postgres => "TIMESTAMPTZ",
+    };
+    let json_type = match dialect {
+        SqlDialect::Sqlite => "TEXT",
+        SqlDialect::Postgres => "JSONB",
+    };
+    let bool_check = match dialect {
+        SqlDialect::Sqlite => " CHECK (allowed IN (0, 1))",
+        SqlDialect::Postgres => "",
+    };
 
     vec![
-        r#"
-            CREATE TABLE IF NOT EXISTS audit_events (
+        format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
                 id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT,
-                at TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at {time_type} NOT NULL
+            )
+            "#
+        ),
+        format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id {id_type} PRIMARY KEY NOT NULL,
+                request_id {id_type},
+                at {time_type} NOT NULL,
                 actor TEXT NOT NULL,
                 team TEXT NOT NULL,
                 action TEXT NOT NULL,
                 resource TEXT NOT NULL,
                 outcome TEXT NOT NULL,
-                detail_json TEXT NOT NULL
+                detail_json {json_type} NOT NULL
             )
             "#
-        .to_string(),
+        ),
         "CREATE INDEX IF NOT EXISTS idx_audit_events_at ON audit_events(at)".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_audit_events_request_id ON audit_events(request_id)"
             .to_string(),
-        r#"
+        format!(
+            r#"
             CREATE TABLE IF NOT EXISTS usage_events (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT NOT NULL,
-                at TEXT NOT NULL,
+                id {id_type} PRIMARY KEY NOT NULL,
+                request_id {id_type} NOT NULL,
+                at {time_type} NOT NULL,
                 model TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 team TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                latency_ms INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+                output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+                latency_ms INTEGER NOT NULL CHECK (latency_ms >= 0),
                 status TEXT NOT NULL
             )
             "#
-        .to_string(),
+        ),
         "CREATE INDEX IF NOT EXISTS idx_usage_events_at ON usage_events(at)".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_usage_events_request_id ON usage_events(request_id)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_usage_events_actor_at ON usage_events(actor, at)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_usage_events_team_at ON usage_events(team, at)"
             .to_string(),
         format!(
             r#"
             CREATE TABLE IF NOT EXISTS observation_events (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT,
-                at TEXT NOT NULL,
+                id {id_type} PRIMARY KEY NOT NULL,
+                request_id {id_type},
+                at {time_type} NOT NULL,
                 kind TEXT NOT NULL,
                 model TEXT NOT NULL,
                 source TEXT NOT NULL,
                 value {float_type} NOT NULL,
                 unit TEXT NOT NULL,
-                attributes_json TEXT NOT NULL
+                attributes_json {json_type} NOT NULL
             )
             "#
         ),
@@ -207,7 +238,7 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
                 alias TEXT PRIMARY KEY NOT NULL,
                 path TEXT NOT NULL,
                 role TEXT NOT NULL,
-                weight INTEGER NOT NULL,
+                weight INTEGER NOT NULL CHECK (weight >= 0),
                 updated_at TEXT NOT NULL
             )
             "#
@@ -215,20 +246,24 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
         format!(
             r#"
             CREATE TABLE IF NOT EXISTS quota_decisions (
-                id TEXT PRIMARY KEY NOT NULL,
-                request_id TEXT,
-                at TEXT NOT NULL,
+                id {id_type} PRIMARY KEY NOT NULL,
+                request_id {id_type},
+                at {time_type} NOT NULL,
                 actor TEXT NOT NULL,
                 team TEXT NOT NULL,
                 model TEXT NOT NULL,
-                allowed {bool_type} NOT NULL,
+                allowed {bool_type} NOT NULL{bool_check},
                 reason TEXT NOT NULL,
-                policy_json TEXT NOT NULL
+                policy_json {json_type} NOT NULL
             )
             "#
         ),
         "CREATE INDEX IF NOT EXISTS idx_quota_decisions_at ON quota_decisions(at)".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_quota_decisions_request_id ON quota_decisions(request_id)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_quota_decisions_actor_allowed_at ON quota_decisions(actor, allowed, at)"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_quota_decisions_team_allowed_at ON quota_decisions(team, allowed, at)"
             .to_string(),
     ]
 }
@@ -290,6 +325,18 @@ impl QuotaDecisionRecord {
 }
 
 impl Storage {
+    pub async fn connect_config(config: &StorageConfig) -> Result<Self> {
+        let plan = config.connection_plan()?;
+        match plan.backend {
+            StorageBackend::Sqlite => Self::connect_sqlite_target(plan.target()).await,
+            StorageBackend::Postgres => {
+                bail!(
+                    "postgres runtime storage is not enabled in this build; use sqlite storage or run storage planning commands only"
+                )
+            }
+        }
+    }
+
     pub async fn connect(db_path: impl AsRef<Path>) -> Result<Self> {
         let db_path = db_path.as_ref();
         if let Some(parent) = db_path.parent() {
@@ -308,6 +355,14 @@ impl Storage {
         let storage = Self { pool };
         storage.migrate().await?;
         Ok(storage)
+    }
+
+    async fn connect_sqlite_target(target: &str) -> Result<Self> {
+        if let Some(path) = target.strip_prefix("sqlite://") {
+            Self::connect(path).await
+        } else {
+            Self::connect(target).await
+        }
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -421,6 +476,14 @@ impl Storage {
                 "outside_retention_window",
             )?,
         })
+    }
+
+    pub async fn delete_audit_events_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM audit_events WHERE at < ?")
+            .bind(encode_time(cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn insert_usage_event(&self, event: &UsageEvent) -> Result<()> {
@@ -872,6 +935,29 @@ mod tests {
         );
         assert!(!plan.to_string().contains("secret-token"));
         assert!(plan.to_string().contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_config_rejects_postgres_runtime_storage_without_sqlite_fallback() -> Result<()>
+    {
+        let cfg: Config = toml::from_str(
+            r#"
+            [storage]
+            database-url = "postgres://llmctl:secret-token@db.internal:5432/llmctl"
+            "#,
+        )?;
+
+        let err = Storage::connect_config(&cfg.storage)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("postgres runtime storage is not enabled"),
+            "{err}"
+        );
+        assert!(!err.contains("secret-token"));
         Ok(())
     }
 

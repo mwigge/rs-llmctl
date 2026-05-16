@@ -17,6 +17,19 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_api_secret_material(secret: &str) -> Result<()> {
+    anyhow::ensure!(
+        secret.len() >= 32,
+        "api key secret must be at least 32 bytes"
+    );
+    anyhow::ensure!(
+        secret.chars().any(|ch| ch.is_ascii_alphabetic())
+            && secret.chars().any(|ch| ch.is_ascii_digit()),
+        "api key secret must include both letters and digits"
+    );
+    Ok(())
+}
+
 fn validate_no_plaintext_observability_secrets(cfg: &Config) -> Result<()> {
     for (name, value) in &cfg.observability.exporter.headers {
         if is_sensitive_name(name) {
