@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const TOKEN: &str = "test-token";
 
@@ -43,6 +44,71 @@ async fn lists_openai_compatible_models() {
     assert_eq!(body["data"][0]["owned_by"], "rs-llmctl");
     assert_eq!(body["data"][1]["id"], "middle");
     assert_eq!(body["data"][2]["id"], "zeta");
+}
+
+#[tokio::test]
+async fn models_echoes_inbound_request_id_and_audits_it() {
+    let request_id = Uuid::new_v4();
+    let (app, storage) = test_app_with_storage(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", bearer())
+                .header("x-request-id", request_id.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-request-id"].to_str().unwrap(),
+        request_id.to_string()
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "list");
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    assert_eq!(audit_events.len(), 1);
+    assert_eq!(audit_events[0].action, "models.list");
+}
+
+#[tokio::test]
+async fn models_generates_request_id_header_and_audits_it() {
+    let (app, storage) = test_app_with_storage(config_with_models(vec![model("llama")])).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", bearer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .expect("generated request id");
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "list");
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    assert_eq!(audit_events.len(), 1);
+    assert_eq!(audit_events[0].request_id, Some(request_id));
 }
 
 #[tokio::test]
@@ -148,6 +214,11 @@ async fn chat_completions_non_streaming_passthrough_returns_upstream_response() 
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .expect("generated request id");
     let body = response_json(response).await;
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["model"], "llama");
@@ -159,6 +230,69 @@ async fn chat_completions_non_streaming_passthrough_returns_upstream_response() 
     assert_eq!(upstream_request["model"], "llama");
     assert_eq!(upstream_request["messages"], request_body["messages"]);
     assert_eq!(upstream_request["stream"], false);
+}
+
+#[tokio::test]
+async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage() {
+    let request_id = Uuid::new_v4();
+    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
+    let mut cfg = config_with_models(vec![model("llama")]);
+    cfg.server.llama_server = upstream;
+    cfg.quotas = vec![QuotaConfig {
+        subject: "alice".to_string(),
+        team: "".to_string(),
+        requests_per_minute: 10,
+        tokens_per_day: 100,
+        max_concurrency: 0,
+        allowed_models: vec!["llama".to_string()],
+    }];
+    let (app, storage) = test_app_with_storage(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(
+                    json!({"model": "llama", "messages": [], "stream": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-request-id"].to_str().unwrap(),
+        request_id.to_string()
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "chat.completion");
+    upstream_requests.recv().await.expect("upstream request");
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    let usage_events = storage
+        .usage_events_for_request(request_id)
+        .await
+        .expect("usage events");
+    let quota_decisions = storage
+        .quota_decisions_for_request(request_id)
+        .await
+        .expect("quota decisions");
+    assert!(
+        audit_events.len() >= 2,
+        "expected allowed and completion audit events"
+    );
+    assert_eq!(usage_events.len(), 1);
+    assert_eq!(usage_events[0].request_id, request_id);
+    assert_eq!(quota_decisions.len(), 1);
+    assert_eq!(quota_decisions[0].request_id, Some(request_id));
 }
 
 #[tokio::test]
@@ -260,6 +394,12 @@ async fn chat_completions_returns_429_when_quota_denies_model() {
 async fn test_app(cfg: Config) -> Router {
     let storage = Storage::in_memory().await.expect("storage");
     server::router(cfg, storage)
+}
+
+async fn test_app_with_storage(cfg: Config) -> (Router, Storage) {
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router(cfg, storage.clone());
+    (app, storage)
 }
 
 fn config_with_models(models: Vec<ModelConfig>) -> Config {

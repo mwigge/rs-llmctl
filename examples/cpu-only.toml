@@ -1,0 +1,65 @@
+# CPU-only profile for hosts without accelerator access.
+# Import staged model bytes first:
+# llmctl --config examples/cpu-only.toml model import-manifest examples/offline-model-manifest.toml
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 4096
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+
+[[security.api_keys]]
+id = "cpu-only-placeholder"
+sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+subject = "cpu-user"
+team = "platform"
+scopes = ["chat", "models"]
+
+[resources]
+budget = 0.70
+cpu_only = true
+gpu_vendor = "none"
+
+[storage]
+db_path = "./.local/rs-llmctl-cpu/llmctl.db"
+model_dir = "./.local/rs-llmctl-cpu/models"
+
+[observability]
+service_name = "rs-llmctl-cpu"
+environment = "staging"
+traces_enabled = true
+metrics_enabled = true
+logs_enabled = true
+
+[observability.exporter]
+endpoint = "http://otel-collector.internal:4318"
+protocol = "http-protobuf"
+headers = { authorization = "env:OTEL_EXPORTER_OTLP_AUTHORIZATION" }
+timeout_ms = 5000
+
+[audit]
+retention_days = 180
+report_directory = "./.local/rs-llmctl-cpu/reports"
+report_formats = ["json"]
+monthly_reports = true
+
+[[models]]
+alias = "qwen-cpu"
+path = "./.local/rs-llmctl-cpu/models/qwen.gguf"
+role = "chat"
+weight = 1
+
+[[quotas]]
+subject = "cpu-user"
+team = "platform"
+requests_per_minute = 60
+tokens_per_day = 500000
+max_concurrency = 1
+allowed_models = ["qwen-cpu"]

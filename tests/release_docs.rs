@@ -1,8 +1,13 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[test]
@@ -262,5 +267,90 @@ fn release_checksum_artifact_generation_is_pinned() {
             readme.contains(required),
             "README should document `{required}`"
         );
+    }
+}
+
+#[test]
+fn hardened_example_configs_parse_and_do_not_embed_plaintext_secrets() {
+    let examples_dir = Path::new("examples");
+    let entries = fs::read_dir(examples_dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", examples_dir.display()));
+
+    let mut config_paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|err| panic!("read examples entry: {err}"))
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("toml")
+            && path.file_name().and_then(|name| name.to_str())
+                != Some("offline-model-manifest.toml")
+        {
+            config_paths.push(path);
+        }
+    }
+    config_paths.sort();
+
+    let expected = [
+        "cpu-only.toml",
+        "gpu-amd.toml",
+        "gpu-auto.toml",
+        "gpu-metal.toml",
+        "gpu-nvidia.toml",
+        "local-dev.toml",
+        "production-external-bind.toml",
+    ];
+    assert_eq!(
+        config_paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected,
+        "examples should cover the hardened deployment profiles"
+    );
+
+    for path in config_paths {
+        let body = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let cfg: rs_llmctl::config::Config =
+            toml::from_str(&body).unwrap_or_else(|err| panic!("parse {}: {err}", path.display()));
+
+        assert!(
+            body.contains("offline-model-manifest.toml"),
+            "{} should reference the offline model manifest",
+            path.display()
+        );
+        assert!(
+            !body.contains("sk-") && !body.contains("plaintext") && !body.contains("changeme"),
+            "{} should not contain plaintext secret placeholders",
+            path.display()
+        );
+        assert!(
+            !cfg.security.api_keys.is_empty(),
+            "{} should include hashed API key placeholders",
+            path.display()
+        );
+        for key in &cfg.security.api_keys {
+            assert!(
+                is_sha256_hex(&key.sha256),
+                "{} API key `{}` should be a sha256 hex digest placeholder",
+                path.display(),
+                key.id
+            );
+        }
+        for (name, value) in &cfg.observability.exporter.headers {
+            let sensitive = ["authorization", "api-key", "apikey", "token", "secret"]
+                .iter()
+                .any(|needle| name.to_ascii_lowercase().contains(needle));
+            if sensitive {
+                assert!(
+                    value.starts_with("env:"),
+                    "{} observability header `{name}` should use env:NAME",
+                    path.display()
+                );
+            }
+        }
+
+        rs_llmctl::config::validate_production_security(&cfg)
+            .unwrap_or_else(|err| panic!("validate {}: {err}", path.display()));
     }
 }

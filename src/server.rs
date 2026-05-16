@@ -50,7 +50,8 @@ pub fn router(cfg: Config, storage: Storage) -> Router {
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods([Method::GET, Method::POST])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE, request_id_header_name()])
+                .expose_headers([request_id_header_name()]),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
@@ -124,7 +125,7 @@ fn is_external_host(host: &str) -> bool {
 }
 
 async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
-    let request_id = Uuid::new_v4();
+    let request_id = request_id_from_headers(&headers);
     let principal = match authenticate(&state.cfg, &headers) {
         Ok(principal) => principal,
         Err(err) => {
@@ -138,7 +139,10 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
                 json!({ "reason": err }),
             )
             .await;
-            return error_response(StatusCode::UNAUTHORIZED, "unauthorized", err);
+            return with_request_id(
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
+                request_id,
+            );
         }
     };
 
@@ -153,10 +157,13 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
             json!({ "reason": "missing models.read scope" }),
         )
         .await;
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "missing models.read scope".to_string(),
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "missing models.read scope".to_string(),
+            ),
+            request_id,
         );
     }
 
@@ -171,14 +178,17 @@ async fn list_models(State(state): State<Arc<ServerState>>, headers: HeaderMap) 
     )
     .await;
 
-    Json(ModelList {
-        object: "list",
-        data: routed_models(&state.cfg)
-            .into_iter()
-            .map(ModelObject::from)
-            .collect(),
-    })
-    .into_response()
+    with_request_id(
+        Json(ModelList {
+            object: "list",
+            data: routed_models(&state.cfg)
+                .into_iter()
+                .map(ModelObject::from)
+                .collect(),
+        })
+        .into_response(),
+        request_id,
+    )
 }
 
 async fn chat_completions(
@@ -186,7 +196,7 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let request_id = Uuid::new_v4();
+    let request_id = request_id_from_headers(&headers);
     let started = Instant::now();
     let principal = match authenticate(&state.cfg, &headers) {
         Ok(principal) => principal,
@@ -201,7 +211,10 @@ async fn chat_completions(
                 json!({ "reason": err }),
             )
             .await;
-            return error_response(StatusCode::UNAUTHORIZED, "unauthorized", err);
+            return with_request_id(
+                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
+                request_id,
+            );
         }
     };
 
@@ -216,10 +229,13 @@ async fn chat_completions(
             json!({ "reason": "missing chat scope" }),
         )
         .await;
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "missing chat scope".to_string(),
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "missing chat scope".to_string(),
+            ),
+            request_id,
         );
     }
 
@@ -236,10 +252,13 @@ async fn chat_completions(
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "request body must be valid JSON".to_string(),
+            return with_request_id(
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "request body must be valid JSON".to_string(),
+                ),
+                request_id,
             );
         }
     };
@@ -257,7 +276,10 @@ async fn chat_completions(
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return error_response(StatusCode::BAD_REQUEST, "unknown_model", err.to_string());
+            return with_request_id(
+                error_response(StatusCode::BAD_REQUEST, "unknown_model", err.to_string()),
+                request_id,
+            );
         }
     };
     let body = match rewrite_chat_model(&body, &route) {
@@ -273,7 +295,10 @@ async fn chat_completions(
                 json!({ "reason": err }),
             )
             .await;
-            return error_response(StatusCode::BAD_REQUEST, "bad_request", err);
+            return with_request_id(
+                error_response(StatusCode::BAD_REQUEST, "bad_request", err),
+                request_id,
+            );
         }
     };
     let model = route.requested_alias.clone();
@@ -290,10 +315,13 @@ async fn chat_completions(
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "quota_error",
-                err.to_string(),
+            return with_request_id(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "quota_error",
+                    err.to_string(),
+                ),
+                request_id,
             );
         }
     };
@@ -318,10 +346,13 @@ async fn chat_completions(
             json!({ "reason": quota.reason }),
         )
         .await;
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "quota_exceeded",
-            quota.reason,
+        return with_request_id(
+            error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "quota_exceeded",
+                quota.reason,
+            ),
+            request_id,
         );
     }
 
@@ -371,7 +402,10 @@ async fn chat_completions(
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return error_response(StatusCode::BAD_GATEWAY, "upstream_error", err.to_string());
+            return with_request_id(
+                error_response(StatusCode::BAD_GATEWAY, "upstream_error", err.to_string()),
+                request_id,
+            );
         }
     };
 
@@ -425,7 +459,10 @@ async fn json_upstream(
                 },
             )
             .await;
-            return error_response(StatusCode::BAD_GATEWAY, "upstream_error", err.to_string());
+            return with_request_id(
+                error_response(StatusCode::BAD_GATEWAY, "upstream_error", err.to_string()),
+                request_id,
+            );
         }
     };
 
@@ -460,7 +497,7 @@ async fn json_upstream(
     )
     .await;
 
-    build_response(status, headers, Body::from(bytes))
+    build_response(status, headers, Body::from(bytes), request_id)
 }
 
 async fn stream_upstream(
@@ -537,7 +574,7 @@ async fn stream_upstream(
         )
         .await;
     };
-    build_response(status, headers, Body::from_stream(stream))
+    build_response(status, headers, Body::from_stream(stream), request_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -782,11 +819,16 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
-fn build_response(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
+fn build_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Body,
+    request_id: Uuid,
+) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
-    response
+    with_request_id(response, request_id)
 }
 
 fn error_response(status: StatusCode, code: &str, message: String) -> Response {
@@ -801,6 +843,26 @@ fn error_response(status: StatusCode, code: &str, message: String) -> Response {
         })),
     )
         .into_response()
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Uuid {
+    headers
+        .get(request_id_header_name())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(Uuid::new_v4)
+}
+
+fn with_request_id(mut response: Response, request_id: Uuid) -> Response {
+    response.headers_mut().insert(
+        request_id_header_name(),
+        HeaderValue::from_str(&request_id.to_string()).expect("uuid is a valid header value"),
+    );
+    response
+}
+
+fn request_id_header_name() -> HeaderName {
+    HeaderName::from_static("x-request-id")
 }
 
 fn normalize_upstream(raw: &str) -> String {
@@ -932,6 +994,33 @@ mod tests {
     fn extracts_openai_usage_tokens() {
         let body = br#"{"usage":{"prompt_tokens":11,"completion_tokens":13}}"#;
         assert_eq!(usage_tokens(body), (11, 13));
+    }
+
+    #[test]
+    fn request_id_from_headers_accepts_valid_uuid() {
+        let request_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            request_id_header_name(),
+            HeaderValue::from_str(&request_id.to_string()).unwrap(),
+        );
+
+        assert_eq!(request_id_from_headers(&headers), request_id);
+    }
+
+    #[test]
+    fn request_id_from_headers_generates_uuid_when_missing_or_invalid() {
+        let missing = request_id_from_headers(&HeaderMap::new());
+        assert_ne!(missing, Uuid::nil());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            request_id_header_name(),
+            HeaderValue::from_static("not-a-uuid"),
+        );
+        let invalid = request_id_from_headers(&headers);
+        assert_ne!(invalid, Uuid::nil());
+        assert_ne!(invalid, missing);
     }
 
     #[test]

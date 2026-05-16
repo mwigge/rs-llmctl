@@ -10,6 +10,8 @@ use rs_llmctl::reporting;
 use rs_llmctl::storage::Storage;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
@@ -88,6 +90,7 @@ enum ServerCommand {
 enum ModelCommand {
     Install(ModelInstallArgs),
     ImportManifest(ModelImportManifestArgs),
+    Inventory,
     List,
 }
 
@@ -167,7 +170,13 @@ struct QuotaStatusArgs {
 #[derive(Debug, Subcommand)]
 enum SecurityCommand {
     Check,
+    HashKey(SecurityHashKeyArgs),
     AuditConfig(SecurityAuditConfigArgs),
+}
+
+#[derive(Debug, Args)]
+struct SecurityHashKeyArgs {
+    secret: String,
 }
 
 #[derive(Debug, Args)]
@@ -397,6 +406,11 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
                 &json!({ "status": "imported", "imported": installed, "models": cfg.models }),
             )
         }
+        ModelCommand::Inventory => {
+            let storage = init_storage(&cfg.storage).await?;
+            let inventory = model_inventory(&cfg, &storage).await?;
+            emit(as_json, &inventory)
+        }
         ModelCommand::List => emit(as_json, &cfg.models),
     }
 }
@@ -497,9 +511,9 @@ async fn quota_command(path: &Path, command: QuotaCommand, as_json: bool) -> Res
 }
 
 async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) -> Result<()> {
-    let cfg = load_config(path).await?;
     match command {
         SecurityCommand::Check => {
+            let cfg = load_config(path).await?;
             config::validate_production_security(&cfg)?;
             emit(
                 as_json,
@@ -513,7 +527,23 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                 }),
             )
         }
+        SecurityCommand::HashKey(args) => {
+            let sha256 = hex::encode(Sha256::digest(args.secret.as_bytes()));
+            emit(
+                as_json,
+                &json!({
+                    "sha256": sha256,
+                    "metadata": {
+                        "algorithm": "sha256",
+                        "encoding": "hex",
+                        "input": "argument",
+                        "purpose": "api-key"
+                    }
+                }),
+            )
+        }
         SecurityCommand::AuditConfig(args) => {
+            let cfg = load_config(path).await?;
             let report = audit_config_report(path, &cfg, args.systemd_unit.as_deref()).await?;
             emit(as_json, &report)
         }
@@ -686,6 +716,57 @@ fn upsert_quota(quotas: &mut Vec<QuotaConfig>, quota: QuotaConfig) {
     } else {
         quotas.push(quota);
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ModelInventoryOutput {
+    configured: usize,
+    models: Vec<ModelInventoryItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelInventoryItem {
+    alias: String,
+    role: String,
+    weight: u32,
+    path: String,
+    updated_at: Option<chrono::DateTime<Utc>>,
+}
+
+async fn model_inventory(cfg: &Config, storage: &Storage) -> Result<ModelInventoryOutput> {
+    let persisted = storage
+        .list_models()
+        .await?
+        .into_iter()
+        .map(|record| (record.alias.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+
+    let models = cfg
+        .models
+        .iter()
+        .map(|model| {
+            let persisted = persisted.get(&model.alias);
+            ModelInventoryItem {
+                alias: model.alias.clone(),
+                role: model.role.clone(),
+                weight: model.weight,
+                path: path_basename(&model.path),
+                updated_at: persisted.map(|record| record.updated_at),
+            }
+        })
+        .collect();
+
+    Ok(ModelInventoryOutput {
+        configured: cfg.models.len(),
+        models,
+    })
+}
+
+fn path_basename(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn quota_status_principal(quotas: &[QuotaConfig], args: &QuotaStatusArgs) -> Principal {

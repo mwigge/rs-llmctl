@@ -1,0 +1,65 @@
+# Local loopback profile for developer machines.
+# Import staged model bytes first:
+# llmctl --config examples/local-dev.toml model import-manifest examples/offline-model-manifest.toml
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = false
+bind_external = false
+
+[[security.api_keys]]
+id = "local-dev-placeholder"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+subject = "developer"
+team = "local"
+scopes = ["chat", "models"]
+
+[resources]
+budget = 0.50
+cpu_only = false
+gpu_vendor = "auto"
+
+[storage]
+db_path = "./.local/rs-llmctl/llmctl.db"
+model_dir = "./.local/rs-llmctl/models"
+
+[observability]
+service_name = "rs-llmctl-local"
+environment = "local"
+traces_enabled = true
+metrics_enabled = true
+logs_enabled = true
+
+[observability.exporter]
+endpoint = "http://127.0.0.1:4318"
+protocol = "http-protobuf"
+headers = { authorization = "env:OTEL_EXPORTER_OTLP_AUTHORIZATION" }
+timeout_ms = 5000
+
+[audit]
+retention_days = 30
+report_directory = "./.local/rs-llmctl/reports"
+report_formats = ["json"]
+monthly_reports = false
+
+[[models]]
+alias = "qwen-local"
+path = "./.local/rs-llmctl/models/qwen.gguf"
+role = "chat"
+weight = 1
+
+[[quotas]]
+subject = "developer"
+team = "local"
+requests_per_minute = 120
+tokens_per_day = 1000000
+max_concurrency = 2
+allowed_models = ["qwen-local"]

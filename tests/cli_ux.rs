@@ -461,6 +461,78 @@ sha256 = "{}"
 }
 
 #[test]
+fn model_inventory_reports_configured_models_without_full_paths() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+    let bundle = dir.path().join("bundle");
+    fs::create_dir(&bundle).expect("create bundle");
+    fs::write(bundle.join("chat.gguf"), b"chat-model").expect("write chat model");
+    fs::write(bundle.join("review.gguf"), b"review-model").expect("write review model");
+    let manifest = bundle.join("manifest.toml");
+    fs::write(
+        &manifest,
+        format!(
+            r#"
+[[models]]
+alias = "chat"
+path = "chat.gguf"
+role = "chat"
+weight = 10
+sha256 = "{}"
+
+[[models]]
+alias = "review"
+path = "review.gguf"
+role = "review"
+weight = 3
+sha256 = "{}"
+"#,
+            sha256(b"chat-model"),
+            sha256(b"review-model")
+        ),
+    )
+    .expect("write manifest");
+
+    let mut import = llmctl();
+    import
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("import-manifest")
+        .arg(&manifest);
+    assert_success_json(import);
+
+    let mut inventory = llmctl();
+    inventory
+        .arg("--config")
+        .arg(&config)
+        .arg("model")
+        .arg("inventory");
+    let output = inventory.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = String::from_utf8(output.stdout).expect("stdout utf8");
+    let inventory: Value = serde_json::from_str(&raw).expect("stdout is json");
+
+    assert_eq!(inventory["configured"], 2);
+    assert_eq!(inventory["models"][0]["alias"], "chat");
+    assert_eq!(inventory["models"][0]["role"], "chat");
+    assert_eq!(inventory["models"][0]["weight"], 10);
+    assert_eq!(inventory["models"][0]["path"], "chat.gguf");
+    assert!(inventory["models"][0]["updated_at"].is_string());
+    assert_eq!(inventory["models"][1]["alias"], "review");
+    assert_eq!(inventory["models"][1]["path"], "review.gguf");
+    assert!(inventory["models"][1]["updated_at"].is_string());
+    assert!(!raw.contains(&dir.path().display().to_string()));
+    assert!(!raw.contains(&bundle.display().to_string()));
+}
+
+#[test]
 fn quota_status_and_report_are_scriptable_json() {
     let dir = TempDir::new().expect("tempdir");
     let config = write_config(&dir);
@@ -540,6 +612,53 @@ fn security_check_and_observe_plan_are_top_level_json_commands() {
     assert_eq!(plan["metrics_enabled"], true);
     assert_eq!(plan["logs_enabled"], true);
     assert_eq!(plan["exporter"]["type"], "none");
+}
+
+#[test]
+fn security_hash_key_outputs_sha256_metadata_without_plaintext() {
+    let secret = "sk-test-super-secret";
+    let mut hash = llmctl();
+    hash.arg("security").arg("hash-key").arg(secret);
+
+    let output = hash.output().expect("run llmctl");
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains(secret));
+    assert!(!stderr.contains(secret));
+
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(report["sha256"], sha256(secret.as_bytes()));
+    assert_eq!(report["metadata"]["algorithm"], "sha256");
+    assert_eq!(report["metadata"]["encoding"], "hex");
+    assert_eq!(report["metadata"]["purpose"], "api-key");
+    assert!(report.get("secret").is_none());
+    assert!(report["metadata"].get("secret").is_none());
+}
+
+#[test]
+fn security_hash_key_does_not_require_config_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let missing_config = dir.path().join("missing.toml");
+    let secret = "standalone-admin-secret";
+
+    let mut hash = llmctl();
+    hash.arg("--config")
+        .arg(&missing_config)
+        .arg("security")
+        .arg("hash-key")
+        .arg(secret);
+
+    let report = assert_success_json(hash);
+    assert_eq!(report["sha256"], sha256(secret.as_bytes()));
+    assert_eq!(report["metadata"]["input"], "argument");
 }
 
 #[test]

@@ -83,6 +83,12 @@ resolve from the manifest directory, and `sha256` pins the bytes shipped in the
 approved bundle. Server bundles should stage model files under
 `/var/lib/rs-llmctl/models` before importing the offline install manifest.
 
+Config examples are release-owned artifacts under `examples/`: local dev,
+production external bind, CPU-only, GPU auto, NVIDIA, AMD, and Metal profiles.
+They must parse as `Config`, point at `examples/offline-model-manifest.toml`,
+use SHA-256 API key digest placeholders, and keep observability credentials in
+`env:` references.
+
 Enterprise runtime controls are release-blocking documentation requirements:
 `security.require-auth`, `security.bind-external`, quota policy, resource budget
 limits, `audit.retention-days`, usage report retention, and

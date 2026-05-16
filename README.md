@@ -121,6 +121,12 @@ Relative paths resolve from the manifest directory. Include `sha256` whenever a
 bundle is copied across trust boundaries so the install rejects unexpected model
 bytes before registration.
 
+Hardened starter configs live under `examples/`: `local-dev.toml`,
+`production-external-bind.toml`, `cpu-only.toml`, `gpu-auto.toml`,
+`gpu-nvidia.toml`, `gpu-amd.toml`, and `gpu-metal.toml`. Each profile references
+`examples/offline-model-manifest.toml`, uses SHA-256 API key digest
+placeholders, and keeps observability authorization in an `env:` reference.
+
 ## Ordered Deployment Operations
 
 Production deployments should follow this order so every gate is captured before

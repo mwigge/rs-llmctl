@@ -1,0 +1,65 @@
+# Apple Metal GPU profile.
+# Import staged model bytes first:
+# llmctl --config examples/gpu-metal.toml model import-manifest examples/offline-model-manifest.toml
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+llama_server = "llama-server"
+context_size = 8192
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+
+[[security.api_keys]]
+id = "gpu-metal-placeholder"
+sha256 = "7777777777777777777777777777777777777777777777777777777777777777"
+subject = "gpu-user"
+team = "platform"
+scopes = ["chat", "models"]
+
+[resources]
+budget = 0.80
+cpu_only = false
+gpu_vendor = "metal"
+
+[storage]
+db_path = "./.local/rs-llmctl-gpu-metal/llmctl.db"
+model_dir = "./.local/rs-llmctl-gpu-metal/models"
+
+[observability]
+service_name = "rs-llmctl-gpu-metal"
+environment = "staging"
+traces_enabled = true
+metrics_enabled = true
+logs_enabled = true
+
+[observability.exporter]
+endpoint = "http://otel-collector.internal:4318"
+protocol = "http-protobuf"
+headers = { authorization = "env:OTEL_EXPORTER_OTLP_AUTHORIZATION" }
+timeout_ms = 5000
+
+[audit]
+retention_days = 180
+report_directory = "./.local/rs-llmctl-gpu-metal/reports"
+report_formats = ["json"]
+monthly_reports = true
+
+[[models]]
+alias = "qwen-gpu-metal"
+path = "./.local/rs-llmctl-gpu-metal/models/qwen.gguf"
+role = "chat"
+weight = 1
+
+[[quotas]]
+subject = "gpu-user"
+team = "platform"
+requests_per_minute = 120
+tokens_per_day = 2000000
+max_concurrency = 4
+allowed_models = ["qwen-gpu-metal"]

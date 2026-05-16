@@ -1,0 +1,65 @@
+# Production external-bind profile.
+# Import staged model bytes first:
+# llmctl --config /etc/rs-llmctl/config.toml model import-manifest examples/offline-model-manifest.toml
+mode = "weighted"
+
+[server]
+host = "0.0.0.0"
+port = 8765
+worker_base_port = 18765
+llama_server = "/usr/local/bin/llama-server"
+context_size = 16384
+
+[security]
+production = true
+require_auth = true
+bind_external = true
+
+[[security.api_keys]]
+id = "prod-operator-placeholder"
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+subject = "aqe-prod"
+team = "platform"
+scopes = ["chat", "models", "admin"]
+
+[resources]
+budget = 0.80
+cpu_only = false
+gpu_vendor = "auto"
+
+[storage]
+db_path = "/var/lib/rs-llmctl/llmctl.db"
+model_dir = "/var/lib/rs-llmctl/models"
+
+[observability]
+service_name = "rs-llmctl"
+environment = "production"
+traces_enabled = true
+metrics_enabled = true
+logs_enabled = true
+
+[observability.exporter]
+endpoint = "https://otel-collector.example.internal/v1/traces"
+protocol = "http-protobuf"
+headers = { authorization = "env:OTEL_EXPORTER_OTLP_AUTHORIZATION", "x-tenant" = "platform" }
+timeout_ms = 5000
+
+[audit]
+retention_days = 365
+report_directory = "/var/log/rs-llmctl/reports"
+report_formats = ["json", "jsonl"]
+monthly_reports = true
+
+[[models]]
+alias = "qwen-prod"
+path = "/var/lib/rs-llmctl/models/qwen.gguf"
+role = "chat"
+weight = 100
+
+[[quotas]]
+subject = "aqe-prod"
+team = "platform"
+requests_per_minute = 600
+tokens_per_day = 50000000
+max_concurrency = 16
+allowed_models = ["qwen-prod"]

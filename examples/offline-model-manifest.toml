@@ -1,0 +1,9 @@
+# Sample offline install manifest referenced by the config examples.
+# Replace path and sha256 with the approved model bundle values.
+
+[[models]]
+alias = "qwen"
+path = "models/qwen.gguf"
+role = "chat"
+weight = 1
+sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
