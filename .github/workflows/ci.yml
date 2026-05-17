@@ -82,15 +82,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file CHANGELOG.md \
-            dist/rs-llmctl-*.tar.gz \
-            dist/SHA256SUMS \
-            dist/SHA256SUMS.* \
-            dist/rs-llmctl*.cdx.json \
-            dist/rs-llmctl.sbom-fallback.json \
+          shopt -s nullglob
+          assets=(
+            dist/rs-llmctl-*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.*
+            dist/rs-llmctl*.cdx.json
+            dist/rs-llmctl.sbom-fallback.json
             dist/Cargo.lock
+          )
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" --clobber "${assets[@]}"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG.md \
+              "${assets[@]}"
+          fi
 
   native-release-smoke:
     name: Native release smoke
