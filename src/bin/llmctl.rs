@@ -1,9 +1,10 @@
 use anyhow::{bail, Context, Result};
-use base64::Engine;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Datelike, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
+use rand_core::{OsRng, RngCore};
 use regex::Regex;
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{
@@ -24,7 +25,7 @@ use rs_llmctl::runtime;
 use rs_llmctl::storage::Storage;
 use rs_llmctl::worker::{StartupPlan, SwapPlan, WorkerId};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs as stdfs;
@@ -385,9 +386,20 @@ struct QuotaImportArgs {
 #[derive(Debug, Subcommand)]
 enum SecurityCommand {
     Check,
+    GenerateKey(SecurityGenerateKeyArgs),
     HashKey(SecurityHashKeyArgs),
     AddKey(SecurityAddKeyArgs),
+    ListKeys,
+    RotateKey(SecurityRotateKeyArgs),
+    RevokeKey(SecurityRevokeKeyArgs),
+    KeyUsage(SecurityKeyUsageArgs),
     AuditConfig(SecurityAuditConfigArgs),
+}
+
+#[derive(Debug, Args)]
+struct SecurityGenerateKeyArgs {
+    #[arg(long, default_value = "llmctl")]
+    prefix: String,
 }
 
 #[derive(Debug, Args)]
@@ -410,6 +422,28 @@ struct SecurityAddKeyArgs {
     team: String,
     #[arg(long = "scope")]
     scopes: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct SecurityRotateKeyArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    sha256: String,
+}
+
+#[derive(Debug, Args)]
+struct SecurityRevokeKeyArgs {
+    #[arg(long)]
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct SecurityKeyUsageArgs {
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long, default_value_t = 24)]
+    hours: i64,
 }
 
 #[derive(Debug, Args)]
@@ -1463,6 +1497,25 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                 }),
             )
         }
+        SecurityCommand::GenerateKey(args) => {
+            let secret = generate_api_key_secret(&args.prefix);
+            let sha256 = hex::encode(Sha256::digest(secret.as_bytes()));
+            emit(
+                as_json,
+                &json!({
+                    "status": "generated",
+                    "secret": secret,
+                    "sha256": sha256,
+                    "metadata": {
+                        "purpose": "api-key",
+                        "algorithm": "sha256",
+                        "encoding": "hex",
+                        "store_secret_once": true,
+                        "next": "llmctl security add-key --id <id> --sha256 <sha256> --subject <subject> --team <team> --scope chat"
+                    }
+                }),
+            )
+        }
         SecurityCommand::HashKey(args) => {
             let (secret, input) = read_api_key_secret(args).await?;
             rs_llmctl::security::validate_api_secret_material(&secret)?;
@@ -1479,6 +1532,60 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                     }
                 }),
             )
+        }
+        SecurityCommand::ListKeys => {
+            let cfg = load_config(path).await?;
+            emit(as_json, &api_key_inventory_report(&cfg))
+        }
+        SecurityCommand::RotateKey(args) => {
+            let mut cfg = load_config(path).await?;
+            let sha256 = args.sha256.to_ascii_lowercase();
+            validate_sha256_digest(&sha256)?;
+            let Some(key) = cfg
+                .security
+                .api_keys
+                .iter_mut()
+                .find(|key| key.id == args.id)
+            else {
+                bail!("api key id `{}` was not found", args.id);
+            };
+            key.sha256 = sha256;
+            config::save(path, &cfg).await?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "rotated",
+                    "id": args.id,
+                    "sha256_present": true,
+                    "restart_required": true,
+                    "restart_hint": default_restart_hint()
+                }),
+            )
+        }
+        SecurityCommand::RevokeKey(args) => {
+            let mut cfg = load_config(path).await?;
+            let before = cfg.security.api_keys.len();
+            cfg.security.api_keys.retain(|key| key.id != args.id);
+            if cfg.security.api_keys.len() == before {
+                bail!("api key id `{}` was not found", args.id);
+            }
+            config::save(path, &cfg).await?;
+            emit(
+                as_json,
+                &json!({
+                    "status": "revoked",
+                    "id": args.id,
+                    "api_keys": cfg.security.api_keys.len(),
+                    "restart_required": true,
+                    "restart_hint": default_restart_hint()
+                }),
+            )
+        }
+        SecurityCommand::KeyUsage(args) => {
+            let cfg = load_config(path).await?;
+            let storage = init_storage(&cfg.storage).await?;
+            let report = api_key_usage_report(&storage, args.id.as_deref(), args.hours).await?;
+            emit(as_json, &report)
         }
         SecurityCommand::AddKey(args) => {
             let mut cfg = load_config(path).await?;
@@ -1515,6 +1622,96 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
             emit(as_json, &report)
         }
     }
+}
+
+fn generate_api_key_secret(prefix: &str) -> String {
+    let cleaned = prefix
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect::<String>();
+    let prefix = if cleaned.is_empty() {
+        "llmctl"
+    } else {
+        cleaned.as_str()
+    };
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn api_key_inventory_report(cfg: &Config) -> Value {
+    json!({
+        "status": "ok",
+        "require_auth": cfg.security.require_auth,
+        "api_keys": cfg.security.api_keys.iter().map(|key| {
+            json!({
+                "id": key.id,
+                "subject": key.subject,
+                "team": key.team,
+                "scopes": key.scopes,
+                "sha256_present": !key.sha256.trim().is_empty()
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+async fn api_key_usage_report(storage: &Storage, id: Option<&str>, hours: i64) -> Result<Value> {
+    let now = Utc::now();
+    let from = now - Duration::hours(hours.max(1));
+    let audit_events = storage.audit_events_between(from, now).await?;
+    let mut by_key: BTreeMap<String, ApiKeyUsageSummary> = BTreeMap::new();
+    for event in audit_events {
+        let Some(key_id) = event.detail_json.get("api_key_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_some_and(|expected| expected != key_id) {
+            continue;
+        }
+        let summary = by_key.entry(key_id.to_string()).or_default();
+        summary.request_count = summary.request_count.saturating_add(1);
+        if event.outcome != "ok" && event.outcome != "allowed" {
+            summary.error_count = summary.error_count.saturating_add(1);
+        }
+        summary.last_seen = Some(
+            summary
+                .last_seen
+                .map_or(event.at, |last| last.max(event.at)),
+        );
+        summary.actors.insert(event.actor);
+        summary.teams.insert(event.team);
+        summary.actions.insert(event.action);
+        summary.resources.insert(event.resource);
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "from": from,
+        "to": now,
+        "filter": { "id": id },
+        "keys": by_key.into_iter().map(|(key_id, summary)| {
+            json!({
+                "id": key_id,
+                "request_count": summary.request_count,
+                "error_count": summary.error_count,
+                "last_seen": summary.last_seen,
+                "actors": summary.actors.into_iter().collect::<Vec<_>>(),
+                "teams": summary.teams.into_iter().collect::<Vec<_>>(),
+                "actions": summary.actions.into_iter().collect::<Vec<_>>(),
+                "resources": summary.resources.into_iter().collect::<Vec<_>>()
+            })
+        }).collect::<Vec<_>>()
+    }))
+}
+
+#[derive(Debug, Default)]
+struct ApiKeyUsageSummary {
+    request_count: u64,
+    error_count: u64,
+    last_seen: Option<chrono::DateTime<Utc>>,
+    actors: std::collections::BTreeSet<String>,
+    teams: std::collections::BTreeSet<String>,
+    actions: std::collections::BTreeSet<String>,
+    resources: std::collections::BTreeSet<String>,
 }
 
 async fn read_api_key_secret(args: SecurityHashKeyArgs) -> Result<(String, &'static str)> {
@@ -3629,14 +3826,19 @@ fn validate_add_key_args(id: &str, sha256: &str, subject: &str, team: &str) -> R
     if id.trim().is_empty() {
         bail!("id must not be empty");
     }
-    if !is_sha256_hex(sha256) {
-        bail!("sha256 must be 64 hexadecimal characters");
-    }
+    validate_sha256_digest(sha256)?;
     if subject.trim().is_empty() {
         bail!("subject must not be empty");
     }
     if team.trim().is_empty() {
         bail!("team must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_sha256_digest(sha256: &str) -> Result<()> {
+    if !is_sha256_hex(sha256) {
+        bail!("sha256 must be 64 hexadecimal characters");
     }
     Ok(())
 }
@@ -3705,6 +3907,7 @@ fn quota_status_principal(quotas: &[QuotaConfig], args: &QuotaStatusArgs) -> Pri
         subject: args.subject.clone(),
         team,
         scopes: vec![],
+        key_id: None,
     }
 }
 

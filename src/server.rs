@@ -2529,6 +2529,7 @@ fn authenticate(cfg: &Config, headers: &HeaderMap) -> std::result::Result<Princi
             subject: key.subject.clone(),
             team: key.team.clone(),
             scopes: key.scopes.clone(),
+            key_id: Some(key.id.clone()),
         })
         .ok_or_else(|| "invalid bearer token".to_string())
 }
@@ -2592,6 +2593,25 @@ async fn record_audit(
     outcome: impl Into<String>,
     detail_json: Value,
 ) {
+    let detail_json = if let Some(key_id) = principal.key_id.as_ref() {
+        let mut detail = detail_json;
+        match detail.as_object_mut() {
+            Some(object) => {
+                object
+                    .entry("api_key_id".to_string())
+                    .or_insert_with(|| json!(key_id));
+            }
+            None => {
+                detail = json!({
+                    "detail": detail,
+                    "api_key_id": key_id,
+                });
+            }
+        }
+        detail
+    } else {
+        detail_json
+    };
     let event = AuditEvent::new(
         request_id,
         principal.subject,
@@ -3651,6 +3671,7 @@ data: [DONE]
             subject: "alice".to_string(),
             team: "platform".to_string(),
             scopes: vec!["chat".to_string()],
+            key_id: Some("alice-key".to_string()),
         };
 
         assert_eq!(

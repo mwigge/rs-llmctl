@@ -1305,6 +1305,7 @@ mod tests {
             subject: "alice".to_string(),
             team: "platform".to_string(),
             scopes: vec!["chat".to_string()],
+            key_id: Some("alice-key".to_string()),
         };
         assert_eq!(storage.audit_events_between(from, to).await?.len(), 1);
         assert_eq!(storage.audit_events_for_request(request_id).await?.len(), 1);

@@ -3319,6 +3319,119 @@ fn security_hash_key_does_not_require_config_file() {
     assert_eq!(report["metadata"]["input"], "env");
 }
 
+#[tokio::test]
+async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_usage() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut generate = llmctl();
+    generate
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("generate-key")
+        .arg("--prefix")
+        .arg("llmctl-test");
+    let generated = assert_success_json(generate);
+    let secret = generated["secret"].as_str().expect("secret");
+    let digest = generated["sha256"].as_str().expect("sha256");
+    assert!(secret.starts_with("llmctl-test_"));
+    assert_eq!(digest, sha256(secret.as_bytes()));
+    assert_eq!(generated["metadata"]["store_secret_once"], true);
+
+    let mut add = llmctl();
+    add.arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("add-key")
+        .arg("--id")
+        .arg("platform-chat")
+        .arg("--sha256")
+        .arg(digest)
+        .arg("--subject")
+        .arg("alice")
+        .arg("--team")
+        .arg("platform")
+        .arg("--scope")
+        .arg("chat");
+    assert_eq!(assert_success_json(add)["action"], "inserted");
+
+    let mut list = llmctl();
+    list.arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("list-keys");
+    let listed = assert_success_json(list);
+    assert_eq!(listed["api_keys"][0]["id"], "platform-chat");
+    assert!(listed["api_keys"][0].get("sha256").is_none());
+    assert_eq!(listed["api_keys"][0]["sha256_present"], true);
+
+    let replacement = sha256(b"replacement-token-0123456789abcdef");
+    let mut rotate = llmctl();
+    rotate
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("rotate-key")
+        .arg("--id")
+        .arg("platform-chat")
+        .arg("--sha256")
+        .arg(&replacement);
+    let rotated = assert_success_json(rotate);
+    assert_eq!(rotated["status"], "rotated");
+    assert_eq!(rotated["restart_required"], true);
+    let saved = read_config(&config);
+    assert!(!saved.contains(digest));
+    assert!(saved.contains(&replacement));
+
+    let cfg = rs_llmctl::config::load(&config).await.expect("load config");
+    let storage = Storage::connect_config(&cfg.storage)
+        .await
+        .expect("storage");
+    storage
+        .insert_audit_event(&AuditEvent::new(
+            Some(Uuid::new_v4()),
+            "alice",
+            "platform",
+            "chat.completions",
+            "qwen",
+            "ok",
+            json!({ "api_key_id": "platform-chat" }),
+        ))
+        .await
+        .expect("insert api key audit event");
+
+    let mut usage = llmctl();
+    usage
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("key-usage")
+        .arg("--id")
+        .arg("platform-chat")
+        .arg("--hours")
+        .arg("24");
+    let usage_report = assert_success_json(usage);
+    assert_eq!(usage_report["keys"][0]["id"], "platform-chat");
+    assert_eq!(usage_report["keys"][0]["request_count"], 1);
+    assert_eq!(usage_report["keys"][0]["actors"], json!(["alice"]));
+
+    let mut revoke = llmctl();
+    revoke
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("revoke-key")
+        .arg("--id")
+        .arg("platform-chat");
+    let revoked = assert_success_json(revoke);
+    assert_eq!(revoked["status"], "revoked");
+    assert_eq!(revoked["api_keys"], 0);
+    assert_eq!(revoked["restart_required"], true);
+    let saved = read_config(&config);
+    assert!(!saved.contains("platform-chat"));
+}
+
 #[test]
 fn security_add_key_inserts_and_updates_hashed_api_key_without_leaking_digest() {
     let dir = TempDir::new().expect("tempdir");

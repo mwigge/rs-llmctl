@@ -10,6 +10,7 @@ pub struct Principal {
     pub subject: String,
     pub team: String,
     pub scopes: Vec<String>,
+    pub key_id: Option<String>,
 }
 
 impl Principal {
@@ -18,6 +19,7 @@ impl Principal {
             subject: "anonymous".to_string(),
             team: "public".to_string(),
             scopes: vec!["chat".to_string(), "models.read".to_string()],
+            key_id: None,
         }
     }
 
@@ -477,6 +479,7 @@ mod tests {
             subject: subject.to_string(),
             team: team.to_string(),
             scopes: vec!["chat".to_string()],
+            key_id: Some(format!("{subject}-key")),
         }
     }
 

@@ -334,21 +334,70 @@ The validation script checks the installed `llmctl` binary, systemd unit,
 - audit, usage, quota, and data export records are available for review;
 - production CORS origins are explicit, not wildcard.
 
-Hash a new key without putting it in process arguments:
+Generate a new API key when you want `rs-llmctl` to mint strong random key
+material for a client. The secret is printed once; store it in a password
+manager or secret store, then keep only the SHA-256 digest in config:
+
+```bash
+llmctl security generate-key --prefix llmctl-prod
+llmctl --config /etc/rs-llmctl/config.toml security add-key \
+  --id ops-admin-2026-q2 \
+  --sha256 <sha256-from-generate-key> \
+  --subject ops-admin \
+  --team platform \
+  --scope admin
+```
+
+If your secret store generates the raw key, hash it without putting it in
+process arguments:
 
 ```bash
 printf '%s' "$LLMCTL_NEW_API_KEY" | llmctl security hash-key --stdin
 ```
 
-Then add only the digest:
+Then add or review only the digest:
 
 ```toml
 [[security.api_keys]]
-id = "ops-admin"
+id = "ops-admin-2026-q2"
 sha256 = "<sha256-from-hash-key>"
 subject = "ops-admin"
 team = "platform"
 scopes = ["admin"]
+```
+
+Keep key IDs stable and non-secret. Use IDs that encode owner and rotation
+window, such as `platform-chat-2026-q2`, then track them without exposing
+digests:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml security list-keys
+llmctl --config /etc/rs-llmctl/config.toml security key-usage --id platform-chat-2026-q2 --hours 168
+```
+
+Rotate by adding the new digest to the same ID, restart the service, then
+confirm usage has moved to the rotated key ID. Revoke stale IDs when clients no
+longer use them:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml security rotate-key --id platform-chat-2026-q2 --sha256 <new-sha256>
+sudo systemctl restart llmctld.service
+llmctl --config /etc/rs-llmctl/config.toml security key-usage --hours 24
+llmctl --config /etc/rs-llmctl/config.toml security revoke-key --id old-platform-chat-2026-q1
+sudo systemctl restart llmctld.service
+```
+
+Every authenticated request is audited with actor, team, action, model/resource,
+outcome, request ID, and non-secret `api_key_id`, so key usage can be reviewed
+without storing or exporting raw secrets. Developer clients stay simple:
+
+```bash
+export OPENAI_BASE_URL=http://host:8765/v1
+export OPENAI_API_KEY="$LLMCTL_CLIENT_API_KEY"
+curl -sS "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 For production external bind, record where TLS is terminated and where the

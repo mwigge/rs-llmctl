@@ -25,7 +25,22 @@ report, but it keeps the operational evidence in one predictable shape.
 
 ## Secrets
 
-Use stdin or environment variables when creating key digests:
+Generate keys with the CLI when you want rs-llmctl to mint strong random
+client material:
+
+```bash
+llmctl security generate-key --prefix llmctl-prod
+llmctl --config /etc/rs-llmctl/config.toml security add-key \
+  --id platform-chat-2026-q2 \
+  --sha256 <sha256-from-generate-key> \
+  --subject alice \
+  --team platform \
+  --scope chat
+```
+
+The raw secret is printed once. Put it in the client secret store and keep only
+the digest in config. Use stdin or environment variables when an external
+secret store generates the key material:
 
 ```bash
 printf '%s' "$LLMCTL_NEW_API_KEY" | llmctl security hash-key --stdin
@@ -34,6 +49,33 @@ printf '%s' "$LLMCTL_NEW_API_KEY" | llmctl security hash-key --stdin
 Config must not contain raw API keys, bearer tokens, database passwords, raw
 connection secrets, or plaintext collector credentials. Sensitive exporter
 headers use `env:NAME` references.
+
+Track the non-secret inventory and rotation state through the config-backed
+commands:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml security list-keys
+llmctl --config /etc/rs-llmctl/config.toml security rotate-key --id platform-chat-2026-q2 --sha256 <new-sha256>
+llmctl --config /etc/rs-llmctl/config.toml security revoke-key --id platform-chat-2026-q1
+```
+
+Rotation and revocation update config and require a service restart so the
+running daemon reloads its in-memory key set.
+
+## API Key Usage Audit
+
+Each successful authentication attaches the configured key ID to the request
+principal. Audit rows then include `api_key_id` in `detail_json` alongside the
+actor, team, action, model/resource, outcome, and request ID. Review usage by
+key without exposing SHA-256 digests or raw keys:
+
+```bash
+llmctl --config /etc/rs-llmctl/config.toml security key-usage --hours 24
+llmctl --config /etc/rs-llmctl/config.toml security key-usage --id platform-chat-2026-q2 --hours 168
+```
+
+Use this report during rotation windows to confirm traffic has moved off an old
+key before revoking it.
 
 ## External Clients
 
