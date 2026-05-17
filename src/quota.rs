@@ -11,6 +11,9 @@ pub struct Principal {
     pub team: String,
     pub scopes: Vec<String>,
     pub key_id: Option<String>,
+    pub key_owner: Option<String>,
+    pub key_purpose: Option<String>,
+    pub key_status: Option<String>,
 }
 
 impl Principal {
@@ -20,6 +23,9 @@ impl Principal {
             team: "public".to_string(),
             scopes: vec!["chat".to_string(), "models.read".to_string()],
             key_id: None,
+            key_owner: None,
+            key_purpose: None,
+            key_status: None,
         }
     }
 
@@ -480,6 +486,9 @@ mod tests {
             team: team.to_string(),
             scopes: vec!["chat".to_string()],
             key_id: Some(format!("{subject}-key")),
+            key_owner: None,
+            key_purpose: None,
+            key_status: Some("active".to_string()),
         }
     }
 

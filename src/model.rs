@@ -47,6 +47,8 @@ pub struct ModelInstallRequest {
     #[serde(default = "default_role")]
     pub role: String,
     #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
     pub weight: u32,
 }
 
@@ -98,6 +100,8 @@ pub struct OfflineManifestModel {
     pub path: PathBuf,
     #[serde(default = "default_role")]
     pub role: String,
+    #[serde(default)]
+    pub family: Option<String>,
     #[serde(default)]
     pub weight: u32,
     pub sha256: String,
@@ -268,6 +272,7 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         alias: req.alias.clone(),
         path: path.clone(),
         role: req.role.clone(),
+        family: req.family.clone(),
         weight: req.weight,
     };
     let verification = ModelInstallVerification {
@@ -348,6 +353,7 @@ pub async fn install_offline_manifest(
             alias: entry.alias.clone(),
             path: path.clone(),
             role: entry.role.clone(),
+            family: entry.family.clone(),
             weight: entry.weight,
         };
         installed.push(InstalledModel {
@@ -687,6 +693,7 @@ mod tests {
             copy_to_cache: false,
             expected_sha256: None,
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 7,
         })
         .await
@@ -710,6 +717,7 @@ mod tests {
             copy_to_cache: true,
             expected_sha256: Some(expected.clone()),
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 0,
         })
         .await
@@ -761,6 +769,7 @@ sha256 = "{expected}"
                 alias: "tiny".to_string(),
                 path: PathBuf::from("tiny.gguf"),
                 role: "chat".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
                 sha256: "0".repeat(64),
             }],
@@ -787,6 +796,7 @@ sha256 = "{expected}"
                     alias: "chat".to_string(),
                     path: PathBuf::from("chat.gguf"),
                     role: "chat".to_string(),
+                    family: Some("qwen3".to_string()),
                     weight: 10,
                     sha256: sha256_file(&chat).await.unwrap(),
                 },
@@ -794,6 +804,7 @@ sha256 = "{expected}"
                     alias: "embed".to_string(),
                     path: PathBuf::from("embed.gguf"),
                     role: "embedding".to_string(),
+                    family: Some("qwen3".to_string()),
                     weight: 2,
                     sha256: sha256_file(&embed).await.unwrap(),
                 },
@@ -833,6 +844,7 @@ sha256 = "{expected}"
             copy_to_cache: false,
             expected_sha256: None,
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 0,
         })
         .await
@@ -857,6 +869,7 @@ sha256 = "{expected}"
             copy_to_cache: false,
             expected_sha256: Some("0".repeat(64)),
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 0,
         };
 
@@ -892,6 +905,7 @@ sha256 = "{expected}"
             copy_to_cache: false,
             expected_sha256: None,
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 0,
         })
         .await
@@ -933,6 +947,7 @@ sha256 = "{expected}"
             copy_to_cache: false,
             expected_sha256: None,
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 0,
         })
         .unwrap();
@@ -948,6 +963,7 @@ sha256 = "{expected}"
             copy_to_cache: false,
             expected_sha256: Some("0".repeat(64)),
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 0,
         })
         .unwrap();

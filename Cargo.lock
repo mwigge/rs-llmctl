@@ -3027,6 +3027,8 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "hyper",
+ "hyper-util",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -3040,10 +3042,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "subtle",
  "sysinfo",
  "tempfile",
  "tokenizers",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tower",
@@ -3051,6 +3055,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "rs-llmctl-client"
+version = "1.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

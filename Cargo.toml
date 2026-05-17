@@ -4,12 +4,15 @@ version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[workspace]
+members = ["rs-llmctl-client"]
+
 [[bin]]
 name = "llmctl"
 path = "src/bin/llmctl.rs"
 
 [features]
-default = []
+default = ["native"]
 native = ["native-candle", "native-tokenizers"]
 candle-core = ["dep:candle-core"]
 candle-nn = ["dep:candle-nn"]
@@ -33,6 +36,8 @@ ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
+hyper = "1.9"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "http-proto", "trace", "metrics", "logs"] }
@@ -46,11 +51,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "any", "chrono"] }
+subtle = "2.6"
 sysinfo = "0.33"
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "process", "signal", "fs", "io-util", "time", "net"] }
+tokio-rustls = "0.26"
 tokio-stream = "0.1"
 toml = "0.8"
 tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["onig"] }
+tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -58,4 +66,3 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.14"
-tower = "0.5"

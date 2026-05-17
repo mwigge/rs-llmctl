@@ -22,9 +22,14 @@ with node ID, runtime backend, placement health, assigned model counts,
 unassigned aliases, and the 80% budget fraction.
 
 The model matrix is deliberately small. Qwen3 is the primary target. Gemma is a
-compact recommendation option. Mistral is the EU-friendly fallback. Kimi remains
-on the contract because it is a product target, but it fails closed until
-Candle exposes a reviewed Kimi architecture module or rs-llmctl vendors one.
+compact recommendation option. Mistral is the EU-friendly fallback. DeepSeek is
+wired for Candle safetensors through DeepSeekV2, while DeepSeek GGUF stays
+closed because Candle does not expose quantized DeepSeek2 weights. Kimi and
+MiniMax remain on the contract because they are product targets, but they fail
+closed until Candle exposes reviewed architecture modules or rs-llmctl vendors
+maintained decoders. That caveat is intentional: operators should not plan
+native capacity for blocked families until the runtime reports an implemented
+engine.
 
 ![Native model matrix](images/rust-native-model-matrix.svg)
 
@@ -42,6 +47,13 @@ half-open probes, auth throttling is keyed by caller source, and graceful
 shutdown flips readiness to draining before the process exits. Data exports no
 longer include local model paths, and Arrow IPC/Parquet writers work in bounded
 batches.
+
+The native scheduler now applies FIFO queueing with bounded per-engine
+concurrency and wait-time metadata. It emits prefill/decode phase scheduling
+metadata for admitted requests, while continuous batching, cross-request
+KV-cache reuse controls, and token-level cancellation token metadata remain
+contract fields with `implemented=false` until those runtime behaviors are
+wired.
 
 The result is a cleaner first-time path: install one binary, let systemd keep
 host headroom, import verified model artifacts, route by model or role, and

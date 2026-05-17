@@ -5,9 +5,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures_util::future::{BoxFuture, FutureExt};
-use rs_llmctl::config::{ApiKeyConfig, Config, Mode, ModelConfig, QuotaConfig};
+use rs_llmctl::config::{
+    ApiKeyConfig, Config, ExternalProviderConfig, ExternalProviderKind,
+    ExternalProviderRouteConfig, Mode, ModelConfig, NativeEmbeddingMode, QuotaConfig,
+};
 use rs_llmctl::native;
-use rs_llmctl::runtime::RuntimeBackend;
 use rs_llmctl::server;
 use rs_llmctl::storage::Storage;
 use serde_json::{json, Value};
@@ -22,7 +24,7 @@ use uuid::Uuid;
 
 const TOKEN: &str = "test-token";
 type SharedRelease = std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>;
-type BlockingUpstreamState = (mpsc::Sender<Value>, SharedRelease);
+type ProviderUpstreamRequest = (axum::http::HeaderMap, Value);
 
 struct StaticNativeEngine;
 
@@ -41,6 +43,7 @@ impl native::NativeEngine for StaticNativeEngine {
             Ok(native::NativeChatResponse {
                 model: request.model,
                 content: "native pong".to_string(),
+                tool_calls: None,
                 finish_reason: "stop".to_string(),
                 usage: native::NativeTokenUsage::new(2, 3),
             })
@@ -71,8 +74,105 @@ impl native::NativeEngine for CapturingNativeEngine {
             Ok(native::NativeChatResponse {
                 model: request.model,
                 content: "native pong".to_string(),
+                tool_calls: None,
                 finish_reason: "stop".to_string(),
                 usage: native::NativeTokenUsage::new(11, 13),
+            })
+        }
+        .boxed()
+    }
+}
+
+struct EchoNativeEngine {
+    alias: &'static str,
+}
+
+impl native::NativeEngine for EchoNativeEngine {
+    fn model_alias(&self) -> &str {
+        self.alias
+    }
+
+    fn chat(
+        &self,
+        request: native::NativeChatRequest,
+    ) -> BoxFuture<'_, anyhow::Result<native::NativeChatResponse>> {
+        async move {
+            Ok(native::NativeChatResponse {
+                model: request.model,
+                content: "native pong".to_string(),
+                tool_calls: None,
+                finish_reason: "stop".to_string(),
+                usage: native::NativeTokenUsage::new(3, 5),
+            })
+        }
+        .boxed()
+    }
+}
+
+struct BlockingNativeEngine {
+    started: mpsc::Sender<()>,
+    release: SharedRelease,
+}
+
+impl native::NativeEngine for BlockingNativeEngine {
+    fn model_alias(&self) -> &str {
+        "llama"
+    }
+
+    fn chat(
+        &self,
+        request: native::NativeChatRequest,
+    ) -> BoxFuture<'_, anyhow::Result<native::NativeChatResponse>> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        async move {
+            started.send(()).await.expect("signal native request");
+            if let Some(receiver) = release.lock().await.take() {
+                let _ = receiver.await;
+            }
+            Ok(native::NativeChatResponse {
+                model: request.model,
+                content: "native pong".to_string(),
+                tool_calls: None,
+                finish_reason: "stop".to_string(),
+                usage: native::NativeTokenUsage::new(3, 5),
+            })
+        }
+        .boxed()
+    }
+}
+
+struct StaticSemanticEmbeddingEngine;
+
+impl native::NativeEngine for StaticSemanticEmbeddingEngine {
+    fn model_alias(&self) -> &str {
+        "embed"
+    }
+
+    fn chat(
+        &self,
+        _request: native::NativeChatRequest,
+    ) -> BoxFuture<'_, anyhow::Result<native::NativeChatResponse>> {
+        async move { anyhow::bail!("test embedding engine does not serve chat") }.boxed()
+    }
+
+    fn embeddings(
+        &self,
+        request: native::NativeEmbeddingRequest,
+    ) -> BoxFuture<'_, anyhow::Result<native::NativeEmbeddingResponse>> {
+        async move {
+            assert_eq!(request.metadata["llmctl.embedding_mode"], json!("semantic"));
+            Ok(native::NativeEmbeddingResponse {
+                model: request.model,
+                embeddings: vec![vec![1.0, 2.0, 3.0]],
+                usage: native::NativeTokenUsage::with_mode(
+                    7,
+                    0,
+                    native::TokenAccountingMode::NativeExact,
+                ),
+                backend: "test-semantic-embeddings".to_string(),
+                status: "semantic-native".to_string(),
+                semantic: true,
             })
         }
         .boxed()
@@ -263,11 +363,14 @@ async fn readyz_reports_model_count_and_storage_without_leaking_config_details()
 }
 
 #[tokio::test]
-async fn chat_completions_non_streaming_passthrough_returns_upstream_response() {
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
-    let app = test_app(cfg).await;
+async fn chat_completions_non_streaming_native_engine_returns_response() {
+    let cfg = config_with_models(vec![model("llama")]);
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router_with_native_engine(
+        cfg,
+        storage,
+        Arc::new(EchoNativeEngine { alias: "llama" }),
+    );
     let request_body = json!({
         "model": "llama",
         "messages": [{"role": "user", "content": "hello"}],
@@ -327,22 +430,236 @@ async fn chat_completions_non_streaming_passthrough_returns_upstream_response() 
     let body = response_json(response).await;
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["model"], "llama");
-    assert_eq!(body["choices"][0]["message"]["content"], "pong");
+    assert_eq!(body["choices"][0]["message"]["content"], "native pong");
     assert_eq!(body["usage"]["prompt_tokens"], 3);
     assert_eq!(body["usage"]["completion_tokens"], 5);
-
-    let upstream_request = upstream_requests.recv().await.expect("upstream request");
-    assert_eq!(upstream_request["model"], "llama");
-    assert_eq!(upstream_request["messages"], request_body["messages"]);
-    assert_eq!(upstream_request["stream"], false);
 }
 
 #[tokio::test]
-async fn chat_completions_routes_by_runtime_backend() {
-    let (native_upstream, mut native_upstream_requests) = spawn_mock_upstream().await;
-    let mut native_cfg = config_with_models(vec![model("llama")]);
-    native_cfg.runtime.backend = RuntimeBackend::CandleNative;
-    native_cfg.server.llama_server = native_upstream;
+async fn external_provider_routing_is_disabled_by_default() {
+    let (upstream, mut upstream_requests) = spawn_provider_upstream().await;
+    let mut cfg = config_with_models(vec![model("gpt-proxy")]);
+    cfg.external_providers.providers = vec![ExternalProviderConfig {
+        id: "openai".to_string(),
+        kind: ExternalProviderKind::OpenAiCompatible,
+        base_url: upstream,
+        api_key_env: "RS_LLMCTL_DISABLED_PROVIDER_KEY".to_string(),
+    }];
+    cfg.external_providers.routes = vec![ExternalProviderRouteConfig {
+        model_alias: "gpt-proxy".to_string(),
+        provider: "openai".to_string(),
+        provider_model: Some("gpt-4o-mini".to_string()),
+    }];
+    let app = test_app(cfg).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "gpt-proxy", "messages": [], "stream": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("external provider routing is disabled"));
+    assert!(
+        upstream_requests.try_recv().is_err(),
+        "disabled provider route must not reach upstream"
+    );
+}
+
+#[tokio::test]
+async fn external_provider_route_fails_closed_without_bypassing_native_control_plane() {
+    let request_id = Uuid::from_u128(91);
+    let provider_secret = format!("provider-secret-{request_id}");
+    let provider_key_env = format!("RS_LLMCTL_PROVIDER_KEY_{}", request_id.simple());
+    std::env::set_var(&provider_key_env, &provider_secret);
+    let (upstream, mut upstream_requests) = spawn_provider_upstream().await;
+    let mut cfg = config_with_models(vec![model("gpt-proxy")]);
+    cfg.external_providers.enabled = true;
+    cfg.external_providers.providers = vec![ExternalProviderConfig {
+        id: "openai".to_string(),
+        kind: ExternalProviderKind::OpenAiCompatible,
+        base_url: format!("{upstream}/v1"),
+        api_key_env: provider_key_env.clone(),
+    }];
+    cfg.external_providers.routes = vec![ExternalProviderRouteConfig {
+        model_alias: "gpt-proxy".to_string(),
+        provider: "openai".to_string(),
+        provider_model: Some("gpt-4o-mini".to_string()),
+    }];
+    cfg.quotas = vec![QuotaConfig {
+        subject: "alice".to_string(),
+        team: "platform".to_string(),
+        requests_per_minute: 10,
+        tokens_per_day: 100,
+        max_concurrency: 2,
+        allowed_models: vec!["gpt-proxy".to_string()],
+    }];
+    let (app, storage) = test_app_with_storage(cfg).await;
+    let request_body = json!({
+        "model": "gpt-proxy",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_response_headers_do_not_leak(
+        response.headers(),
+        &[TOKEN, &provider_secret, &cfg_api_key_hash()],
+    );
+    let body = response_json(response).await;
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("external provider routing is disabled"));
+    assert!(
+        upstream_requests.try_recv().is_err(),
+        "native-only provider route must not reach upstream"
+    );
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    assert!(audit_events
+        .iter()
+        .any(|event| event.action == "chat.completions"
+            && event.outcome == "rejected"
+            && event.detail_json["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("external provider routing is disabled"))));
+    let audit_json = serde_json::to_string(&audit_events).expect("audit json");
+    assert!(!audit_json.contains(&provider_secret));
+    assert!(!audit_json.contains(TOKEN));
+    assert!(!audit_json.contains(&cfg_api_key_hash()));
+    std::env::remove_var(provider_key_env);
+}
+
+#[tokio::test]
+async fn chat_completions_native_engine_receives_openai_tool_fields_sanitized() {
+    let request_id = Uuid::from_u128(31);
+    let cfg = config_with_models(vec![model("llama")]);
+    let storage = Storage::in_memory().await.expect("storage");
+    let (tx, mut rx) = mpsc::channel(1);
+    let app = server::router_with_native_engine(
+        cfg,
+        storage.clone(),
+        Arc::new(CapturingNativeEngine { alias: "llama", tx }),
+    );
+    let request_body = json!({
+        "model": "llama",
+        "messages": [
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Stockholm\",\"secret\":\"do-not-audit\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"temperature\":17}"
+            }
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}}
+                }
+            }
+        }],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "get_weather"}
+        },
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "native pong");
+
+    let native_request = rx.recv().await.expect("native request");
+    assert_eq!(native_request.model, "llama");
+    assert_eq!(native_request.tools, Some(request_body["tools"].clone()));
+    assert_eq!(
+        native_request.tool_choice,
+        Some(request_body["tool_choice"].clone())
+    );
+    assert_eq!(native_request.messages.len(), 3);
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    let completion = audit_events
+        .iter()
+        .find(|event| event.outcome == "ok")
+        .expect("completion audit event");
+    assert_eq!(completion.detail_json["tool_schema_count"], json!(1));
+    assert_eq!(
+        completion.detail_json["tool_choice"],
+        json!({"type": "function", "function_name": "get_weather"})
+    );
+    assert_eq!(completion.detail_json["tool_call_count"], json!(1));
+    assert!(!completion.detail_json.to_string().contains("Stockholm"));
+    assert!(!completion.detail_json.to_string().contains("do-not-audit"));
+}
+
+#[tokio::test]
+async fn chat_completions_uses_candle_native_only_and_does_not_proxy() {
+    let (_native_upstream, mut native_upstream_requests) = spawn_mock_upstream().await;
+    let native_cfg = config_with_models(vec![model("llama")]);
     let native_app = test_app(native_cfg).await;
 
     let native_response = native_app.oneshot(chat_request()).await.expect("response");
@@ -367,33 +684,14 @@ async fn chat_completions_routes_by_runtime_backend() {
     );
     assert!(
         native_upstream_requests.try_recv().is_err(),
-        "candle-native requests must not proxy to llama-server"
+        "candle-native requests must not proxy to external runtime"
     );
-
-    let (llama_upstream, mut llama_upstream_requests) = spawn_mock_upstream().await;
-    let mut llama_cfg = config_with_models(vec![model("llama")]);
-    llama_cfg.runtime.backend = RuntimeBackend::LlamaServer;
-    llama_cfg.server.llama_server = llama_upstream;
-    let llama_app = test_app(llama_cfg).await;
-
-    let llama_response = llama_app.oneshot(chat_request()).await.expect("response");
-
-    assert_eq!(llama_response.status(), StatusCode::OK);
-    let llama_body = response_json(llama_response).await;
-    assert_eq!(llama_body["choices"][0]["message"]["content"], "pong");
-    let upstream_request = llama_upstream_requests
-        .recv()
-        .await
-        .expect("llama-server upstream request");
-    assert_eq!(upstream_request["model"], "llama");
 }
 
 #[tokio::test]
 async fn chat_completions_streaming_native_not_ready_fails_closed_without_upstream() {
-    let (native_upstream, mut native_upstream_requests) = spawn_mock_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.runtime.backend = RuntimeBackend::CandleNative;
-    cfg.server.llama_server = native_upstream;
+    let (_native_upstream, mut native_upstream_requests) = spawn_mock_upstream().await;
+    let cfg = config_with_models(vec![model("llama")]);
     let app = test_app(cfg).await;
 
     let response = app
@@ -432,14 +730,13 @@ async fn chat_completions_streaming_native_not_ready_fails_closed_without_upstre
     assert_eq!(body["error"]["code"], "native_runtime_not_ready");
     assert!(
         native_upstream_requests.try_recv().is_err(),
-        "streaming candle-native requests must not proxy to llama-server"
+        "streaming candle-native requests must not proxy to external runtime"
     );
 }
 
 #[tokio::test]
 async fn chat_completions_non_streaming_native_engine_returns_openai_response() {
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.runtime.backend = RuntimeBackend::CandleNative;
+    let cfg = config_with_models(vec![model("llama")]);
     let storage = Storage::in_memory().await.expect("storage");
     let app = server::router_with_native_engine(cfg, storage, Arc::new(StaticNativeEngine));
 
@@ -493,8 +790,7 @@ async fn chat_completions_non_streaming_native_engine_returns_openai_response() 
 #[tokio::test]
 async fn chat_completions_streaming_native_engine_returns_sse_and_records_usage() {
     let request_id = Uuid::from_u128(8);
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.runtime.backend = RuntimeBackend::CandleNative;
+    let cfg = config_with_models(vec![model("llama")]);
     let storage = Storage::in_memory().await.expect("storage");
     let app = server::router_with_native_engine(cfg, storage.clone(), Arc::new(StaticNativeEngine));
 
@@ -550,7 +846,6 @@ async fn chat_completions_streaming_native_engine_returns_sse_and_records_usage(
 async fn chat_completions_native_engine_receives_converted_request_and_records_usage() {
     let request_id = Uuid::from_u128(7);
     let mut cfg = config_with_models(vec![model("native"), model("public")]);
-    cfg.runtime.backend = RuntimeBackend::CandleNative;
     cfg.mode = Mode::Single;
     let storage = Storage::in_memory().await.expect("storage");
     let (tx, mut rx) = mpsc::channel(1);
@@ -623,11 +918,15 @@ async fn chat_completions_native_engine_receives_converted_request_and_records_u
         vec![
             native::NativeChatMessage {
                 role: "system".to_string(),
-                content: "be terse".to_string(),
+                content: Some(json!("be terse")),
+                tool_calls: None,
+                tool_call_id: None,
             },
             native::NativeChatMessage {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: Some(json!("hello")),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ]
     );
@@ -647,6 +946,19 @@ async fn chat_completions_native_engine_receives_converted_request_and_records_u
         json!("native")
     );
     assert_eq!(native_request.metadata["llmctl.stream"], json!(false));
+    assert_eq!(
+        native_request.metadata["llmctl.scheduler.discipline"],
+        json!("fifo")
+    );
+    assert_eq!(
+        native_request.metadata["llmctl.scheduler.queue.implemented"],
+        json!(true)
+    );
+    assert!(native_request
+        .metadata
+        .get("llmctl.scheduler.queue_wait_ms")
+        .and_then(Value::as_u64)
+        .is_some());
 
     let usage_events = storage
         .usage_events_for_request(request_id)
@@ -671,9 +983,110 @@ async fn chat_completions_native_engine_receives_converted_request_and_records_u
 }
 
 #[tokio::test]
+async fn chat_completions_native_tool_metadata_is_redacted_and_not_executed() {
+    let request_id = Uuid::from_u128(32);
+    let cfg = config_with_models(vec![model("llama")]);
+    let storage = Storage::in_memory().await.expect("storage");
+    let (tx, mut rx) = mpsc::channel(1);
+    let app = server::router_with_native_engine(
+        cfg,
+        storage.clone(),
+        Arc::new(CapturingNativeEngine { alias: "llama", tx }),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(
+                    json!({
+                        "model": "llama",
+                        "messages": [
+                            {"role": "user", "content": "weather"},
+                            {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": "{\"city\":\"Stockholm\",\"secret\":\"do-not-audit\"}"
+                                    }
+                                }]
+                            },
+                            {
+                                "role": "tool",
+                                "tool_call_id": "call_1",
+                                "content": "{\"temperature\":17}"
+                            }
+                        ],
+                        "tools": [{
+                            "type": "function",
+                            "function": {"name": "get_weather"}
+                        }],
+                        "tool_choice": "auto",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let native_request = rx.recv().await.expect("native request");
+    assert_eq!(
+        native_request.tools.as_ref().unwrap()[0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(native_request.tool_choice, Some(json!("auto")));
+    assert_eq!(
+        native_request.metadata["llmctl.tool_schema_count"],
+        json!(1)
+    );
+    assert_eq!(native_request.metadata["llmctl.tool_choice"], json!("auto"));
+    assert_eq!(native_request.metadata["llmctl.tool_call_count"], json!(1));
+    assert_eq!(native_request.messages[1].role, "assistant");
+    assert_eq!(native_request.messages[1].content, None);
+    assert_eq!(
+        native_request.messages[1].tool_calls,
+        Some(json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather"}
+        }]))
+    );
+    assert_eq!(native_request.messages[2].role, "tool");
+    assert_eq!(
+        native_request.messages[2].tool_call_id.as_deref(),
+        Some("call_1")
+    );
+    assert!(!serde_json::to_string(&native_request)
+        .unwrap()
+        .contains("do-not-audit"));
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    let audit_json = serde_json::to_string(&audit_events).expect("audit json");
+    assert!(!audit_json.contains("Stockholm"));
+    assert!(!audit_json.contains("do-not-audit"));
+    assert!(audit_events.iter().any(|event| event.outcome == "ok"
+        && event.detail_json["tool_schema_count"] == json!(1)
+        && event.detail_json["tool_choice"] == json!("auto")
+        && event.detail_json["tool_call_count"] == json!(1)));
+}
+
+#[tokio::test]
 async fn chat_completions_native_engine_registry_routes_by_alias() {
     let mut cfg = config_with_models(vec![model("thinking"), model("coding")]);
-    cfg.runtime.backend = RuntimeBackend::CandleNative;
     cfg.mode = Mode::HotSwap;
     let storage = Storage::in_memory().await.expect("storage");
     let (thinking_tx, mut thinking_rx) = mpsc::channel(1);
@@ -726,14 +1139,17 @@ async fn chat_completions_native_engine_registry_routes_by_alias() {
 
 #[tokio::test]
 async fn weighted_mode_routes_chat_completions_by_configured_weights() {
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
     let mut cfg = config_with_models(vec![model("light"), model("medium"), model("heavy")]);
     cfg.mode = Mode::Weighted;
     cfg.models[0].weight = 1;
     cfg.models[1].weight = 2;
     cfg.models[2].weight = 3;
-    cfg.server.llama_server = upstream;
-    let app = test_app(cfg).await;
+    let storage = Storage::in_memory().await.expect("storage");
+    let mut engines = server::NativeEngineRegistry::new();
+    for alias in ["light", "medium", "heavy"] {
+        engines.insert(alias.to_string(), Arc::new(EchoNativeEngine { alias }));
+    }
+    let app = server::router_with_native_engines(cfg, storage, engines);
 
     for (request_id, expected_upstream) in [
         (Uuid::from_u128(0), "light"),
@@ -776,22 +1192,22 @@ async fn weighted_mode_routes_chat_completions_by_configured_weights() {
         );
         let body = response_json(response).await;
         assert_eq!(body["model"], expected_upstream);
-
-        let upstream_request = upstream_requests.recv().await.expect("upstream request");
-        assert_eq!(upstream_request["model"], expected_upstream);
     }
 }
 
 #[tokio::test]
-async fn fallback_mode_retries_next_model_after_upstream_server_error() {
-    let (upstream, mut upstream_requests) = spawn_fallback_upstream().await;
+async fn fallback_mode_resolves_native_backup_without_external_retry() {
     let mut cfg = config_with_models(vec![model("primary"), model("secondary"), model("backup")]);
     cfg.mode = Mode::Fallback;
     cfg.models[0].weight = 100;
     cfg.models[1].weight = 10;
     cfg.models[2].weight = 0;
-    cfg.server.llama_server = upstream;
-    let app = test_app(cfg).await;
+    let storage = Storage::in_memory().await.expect("storage");
+    let mut engines = server::NativeEngineRegistry::new();
+    for alias in ["primary", "secondary", "backup"] {
+        engines.insert(alias.to_string(), Arc::new(EchoNativeEngine { alias }));
+    }
+    let app = server::router_with_native_engines(cfg, storage, engines);
 
     let response = app
         .oneshot(
@@ -815,22 +1231,10 @@ async fn fallback_mode_retries_next_model_after_upstream_server_error() {
             .headers()
             .get("x-llmctl-upstream-model")
             .and_then(|value| value.to_str().ok()),
-        Some("backup")
+        Some("primary")
     );
     let body = response_json(response).await;
-    assert_eq!(body["model"], "backup");
-    assert_eq!(
-        upstream_requests.recv().await.expect("primary request")["model"],
-        "primary"
-    );
-    assert_eq!(
-        upstream_requests.recv().await.expect("secondary request")["model"],
-        "secondary"
-    );
-    assert_eq!(
-        upstream_requests.recv().await.expect("backup request")["model"],
-        "backup"
-    );
+    assert_eq!(body["model"], "primary");
 }
 
 #[tokio::test]
@@ -1012,10 +1416,9 @@ async fn local_search_records_runtime_lineage_metadata() {
 }
 
 #[tokio::test]
-async fn embeddings_endpoint_proxies_openai_compatible_payloads() {
-    let (upstream, mut upstream_requests) = spawn_embeddings_upstream().await;
+async fn embeddings_endpoint_serves_native_payloads_without_external_proxy() {
     let mut cfg = config_with_models(vec![model("embed")]);
-    cfg.server.llama_server = upstream;
+    cfg.runtime.embeddings.mode = NativeEmbeddingMode::DevFallback;
     let app = test_app(cfg).await;
 
     let response = app
@@ -1036,19 +1439,218 @@ async fn embeddings_endpoint_proxies_openai_compatible_payloads() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
     assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "embed");
+    assert_eq!(body["llmctl"]["semantic"], json!(false));
+}
+
+#[tokio::test]
+async fn embeddings_endpoint_uses_native_deterministic_fallback_in_candle_mode() {
+    let request_id = Uuid::from_u128(41);
+    let mut cfg = config_with_models(vec![model("embed")]);
+    cfg.runtime.embeddings.mode = NativeEmbeddingMode::DevFallback;
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router(cfg, storage.clone());
+
+    let request_body = json!({"model": "embed", "input": ["hello", "world"]});
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let first_body = response_json(first).await;
+    let second_body = response_json(second).await;
+
+    assert_eq!(first_body["object"], "list");
+    assert_eq!(first_body["model"], "embed");
+    assert_eq!(first_body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(first_body["data"][0]["object"], "embedding");
+    assert_eq!(first_body["data"][0]["index"], json!(0));
     assert_eq!(
-        upstream_requests.recv().await.expect("embedding request")["model"],
-        "embed"
+        first_body["data"][0]["embedding"],
+        second_body["data"][0]["embedding"]
     );
+    assert_eq!(
+        first_body["data"][1]["embedding"],
+        second_body["data"][1]["embedding"]
+    );
+    assert_eq!(
+        first_body["data"][0]["embedding"].as_array().unwrap().len(),
+        64
+    );
+    assert_ne!(
+        first_body["data"][0]["embedding"],
+        first_body["data"][1]["embedding"]
+    );
+    assert_eq!(first_body["usage"]["prompt_tokens"], json!(4));
+    assert_eq!(first_body["usage"]["total_tokens"], json!(4));
+    assert_eq!(
+        first_body["llmctl"]["embedding_backend"],
+        json!("deterministic-local-fallback")
+    );
+    assert_eq!(
+        first_body["llmctl"]["embedding_status"],
+        json!("non-semantic-dev-fallback")
+    );
+    assert_eq!(first_body["llmctl"]["semantic"], json!(false));
+    assert_eq!(
+        first_body["llmctl"]["embedding_mode"],
+        json!("dev-fallback")
+    );
+    assert_eq!(
+        first_body["llmctl"]["embedding_model_alias"],
+        json!("embed")
+    );
+    assert_eq!(first_body["llmctl"]["embedding_dimensions"], json!(64));
+
+    let usage_events = storage
+        .usage_events_for_request(request_id)
+        .await
+        .expect("usage events");
+    assert_eq!(usage_events.len(), 1);
+    assert_eq!(usage_events[0].model, "embed");
+    assert_eq!(usage_events[0].input_tokens, 4);
+    assert_eq!(usage_events[0].output_tokens, 0);
+    assert_eq!(usage_events[0].status, "native_embedding_dev_fallback");
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    assert!(audit_events.iter().any(|event| event.action == "embeddings"
+        && event.outcome == "ok"
+        && event.detail_json["runtime_backend"] == json!("candle-native")
+        && event.detail_json["embedding_backend"] == json!("deterministic-local-fallback")
+        && event.detail_json["embedding_mode"] == json!("dev-fallback")
+        && event.detail_json["embedding_count"] == json!(2)));
+}
+
+#[tokio::test]
+async fn embeddings_endpoint_requires_semantic_native_engine_by_default() {
+    let cfg = config_with_models(vec![model("embed")]);
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router(cfg, storage);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "embed", "input": "hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["code"], "native_embedding_model_unavailable");
+}
+
+#[tokio::test]
+async fn embeddings_endpoint_uses_semantic_engine_and_reports_metadata() {
+    let request_id = Uuid::from_u128(42);
+    let mut cfg = config_with_models(vec![model("embed")]);
+    cfg.runtime.embeddings.mode = NativeEmbeddingMode::Semantic;
+    cfg.runtime.embeddings.model_alias = Some("embed".to_string());
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router_with_native_engine(
+        cfg,
+        storage.clone(),
+        Arc::new(StaticSemanticEmbeddingEngine),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("authorization", bearer())
+                .header("content-type", "application/json")
+                .header("x-request-id", request_id.to_string())
+                .body(Body::from(
+                    json!({"model": "embed", "input": "semantic search"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "embed");
+    assert_eq!(body["data"][0]["object"], "embedding");
+    assert_eq!(body["data"][0]["embedding"], json!([1.0, 2.0, 3.0]));
+    assert_eq!(body["usage"]["prompt_tokens"], json!(7));
+    assert_eq!(
+        body["llmctl"]["embedding_backend"],
+        json!("test-semantic-embeddings")
+    );
+    assert_eq!(body["llmctl"]["embedding_status"], json!("semantic-native"));
+    assert_eq!(body["llmctl"]["embedding_mode"], json!("semantic"));
+    assert_eq!(body["llmctl"]["semantic"], json!(true));
+    assert_eq!(body["llmctl"]["embedding_model_alias"], json!("embed"));
+    assert_eq!(body["llmctl"]["embedding_dimensions"], json!(3));
+    assert_eq!(body["llmctl"]["token_accounting"], json!("native-exact"));
+
+    let usage_events = storage
+        .usage_events_for_request(request_id)
+        .await
+        .expect("usage events");
+    assert_eq!(usage_events.len(), 1);
+    assert_eq!(usage_events[0].status, "native_embedding_semantic");
+
+    let audit_events = storage
+        .audit_events_for_request(request_id)
+        .await
+        .expect("audit events");
+    assert!(audit_events.iter().any(|event| event.action == "embeddings"
+        && event.outcome == "ok"
+        && event.detail_json["embedding_backend"] == json!("test-semantic-embeddings")
+        && event.detail_json["embedding_status"] == json!("semantic-native")
+        && event.detail_json["embedding_mode"] == json!("semantic")
+        && event.detail_json["semantic"] == json!(true)
+        && event.detail_json["embedding_dimensions"] == json!(3)));
 }
 
 #[tokio::test]
 async fn chat_completions_records_runtime_lineage_headers() {
     let request_id = Uuid::new_v4();
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
-    let (app, storage) = test_app_with_storage(cfg).await;
+    let cfg = config_with_models(vec![model("llama")]);
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router_with_native_engine(
+        cfg,
+        storage.clone(),
+        Arc::new(EchoNativeEngine { alias: "llama" }),
+    );
 
     let response = app
         .oneshot(
@@ -1069,7 +1671,6 @@ async fn chat_completions_records_runtime_lineage_headers() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    upstream_requests.recv().await.expect("upstream request");
     let joins = storage
         .request_lineage_joins_for_request(request_id)
         .await
@@ -1085,9 +1686,7 @@ async fn chat_completions_records_runtime_lineage_headers() {
 #[tokio::test]
 async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage() {
     let request_id = Uuid::new_v4();
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
     let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
     cfg.quotas = vec![QuotaConfig {
         subject: "alice".to_string(),
         team: "".to_string(),
@@ -1096,7 +1695,12 @@ async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage(
         max_concurrency: 0,
         allowed_models: vec!["llama".to_string()],
     }];
-    let (app, storage) = test_app_with_storage(cfg).await;
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router_with_native_engine(
+        cfg,
+        storage.clone(),
+        Arc::new(EchoNativeEngine { alias: "llama" }),
+    );
 
     let response = app
         .oneshot(
@@ -1121,7 +1725,6 @@ async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage(
     );
     let body = response_json(response).await;
     assert_eq!(body["object"], "chat.completion");
-    upstream_requests.recv().await.expect("upstream request");
 
     let audit_events = storage
         .audit_events_for_request(request_id)
@@ -1139,18 +1742,39 @@ async fn chat_completions_propagates_request_id_to_header_audit_quota_and_usage(
         audit_events.len() >= 2,
         "expected allowed and completion audit events"
     );
+    for event in &audit_events {
+        assert_eq!(event.detail_json["api_key_id"], json!("test"));
+        assert_eq!(event.detail_json["api_key_subject"], json!("alice"));
+        assert_eq!(event.detail_json["api_key_team"], json!("platform"));
+        assert!(!event.detail_json.to_string().contains(TOKEN));
+        assert!(!event.detail_json.to_string().contains(&cfg_api_key_hash()));
+    }
     assert_eq!(usage_events.len(), 1);
     assert_eq!(usage_events[0].request_id, request_id);
+    let key_usage = storage
+        .api_key_usage_for_request(request_id)
+        .await
+        .expect("api key usage");
+    assert_eq!(key_usage.len(), 1);
+    assert_eq!(key_usage[0].api_key_id, "test");
+    assert_eq!(key_usage[0].request_id, request_id);
+    assert_eq!(key_usage[0].actor, "alice");
+    assert_eq!(key_usage[0].team, "platform");
+    assert_eq!(key_usage[0].model, "llama");
+    assert_eq!(key_usage[0].input_tokens, 3);
+    assert_eq!(key_usage[0].output_tokens, 5);
+    assert_eq!(key_usage[0].total_tokens, 8);
+    assert_eq!(key_usage[0].status, "ok");
+    assert_eq!(key_usage[0].audit_outcome, "ok");
     assert_eq!(quota_decisions.len(), 1);
     assert_eq!(quota_decisions[0].request_id, Some(request_id));
 }
 
 #[tokio::test]
-async fn chat_completions_streaming_passthrough_returns_sse_and_marks_unmetered_zero_token_usage() {
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
-    let (app, storage) = test_app_with_storage(cfg).await;
+async fn chat_completions_streaming_native_engine_returns_sse_and_records_exact_usage() {
+    let cfg = config_with_models(vec![model("llama")]);
+    let storage = Storage::in_memory().await.expect("storage");
+    let app = server::router_with_native_engine(cfg, storage.clone(), Arc::new(StaticNativeEngine));
 
     let response = app
         .oneshot(
@@ -1221,27 +1845,17 @@ async fn chat_completions_streaming_passthrough_returns_sse_and_marks_unmetered_
         .await
         .expect("stream body");
     let body = String::from_utf8(bytes.to_vec()).expect("utf8 stream");
-    assert_eq!(
-        body,
-        concat!(
-            "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"llama\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"po\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"llama\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ng\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        )
-    );
-
-    let upstream_request = upstream_requests.recv().await.expect("upstream request");
-    assert_eq!(upstream_request["model"], "llama");
-    assert_eq!(upstream_request["stream"], true);
+    assert!(body.contains("native pong"));
+    assert!(body.contains("data: [DONE]"));
 
     let usage_events = storage
         .usage_events_for_request(request_id)
         .await
         .expect("usage events");
     assert_eq!(usage_events.len(), 1);
-    assert_eq!(usage_events[0].input_tokens, 0);
-    assert_eq!(usage_events[0].output_tokens, 0);
-    assert_eq!(usage_events[0].status, "stream_unmetered");
+    assert_eq!(usage_events[0].input_tokens, 2);
+    assert_eq!(usage_events[0].output_tokens, 3);
+    assert_eq!(usage_events[0].status, "ok");
 }
 
 #[tokio::test]
@@ -1270,9 +1884,7 @@ async fn chat_completions_rejects_missing_auth() {
 
 #[tokio::test]
 async fn chat_completions_rejects_unknown_model_before_upstream() {
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
+    let cfg = config_with_models(vec![model("llama")]);
     let app = test_app(cfg).await;
 
     let response = app
@@ -1294,17 +1906,11 @@ async fn chat_completions_rejects_unknown_model_before_upstream() {
     let body = response_json(response).await;
     assert_eq!(body["error"]["type"], "unknown_model");
     assert_eq!(body["error"]["code"], "unknown_model");
-    assert!(
-        upstream_requests.try_recv().is_err(),
-        "unknown model must not reach upstream"
-    );
 }
 
 #[tokio::test]
 async fn chat_completions_returns_429_when_quota_denies_model() {
-    let (upstream, mut upstream_requests) = spawn_mock_upstream().await;
     let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
     cfg.quotas = vec![QuotaConfig {
         subject: "alice".to_string(),
         team: "".to_string(),
@@ -1334,28 +1940,33 @@ async fn chat_completions_returns_429_when_quota_denies_model() {
     let body = response_json(response).await;
     assert_eq!(body["error"]["type"], "quota_exceeded");
     assert_eq!(body["error"]["code"], "quota_exceeded");
-    assert!(
-        upstream_requests.try_recv().is_err(),
-        "quota denial must not reach upstream"
-    );
 }
 
 #[tokio::test]
 async fn chat_completions_returns_429_when_admission_limit_is_full_without_leaking_details() {
-    let (upstream, mut upstream_requests, release_upstream) = spawn_blocking_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
-    let app =
-        test_app_with_limits(cfg, server::ServingLimits::new(1, Duration::from_secs(30))).await;
+    let cfg = config_with_models(vec![model("llama")]);
+    let (started_tx, mut started_rx) = mpsc::channel(1);
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut engines = server::NativeEngineRegistry::new();
+    engines.insert(
+        "llama".to_string(),
+        Arc::new(BlockingNativeEngine {
+            started: started_tx,
+            release: Arc::new(tokio::sync::Mutex::new(Some(release_rx))),
+        }),
+    );
+    let app = test_app_with_limits_and_native_engines(
+        cfg,
+        server::ServingLimits::new(1, Duration::from_secs(30)),
+        engines,
+    )
+    .await;
 
     let first = tokio::spawn({
         let app = app.clone();
         async move { app.oneshot(chat_request()).await.expect("first response") }
     });
-    upstream_requests
-        .recv()
-        .await
-        .expect("first upstream request");
+    started_rx.recv().await.expect("first native request");
 
     let response = app.oneshot(chat_request()).await.expect("second response");
 
@@ -1373,31 +1984,20 @@ async fn chat_completions_returns_429_when_admission_limit_is_full_without_leaki
     assert_eq!(body["error"]["type"], "rate_limit_exceeded");
     assert_eq!(body["error"]["code"], "rate_limit_exceeded");
     assert_eq!(body["error"]["message"], "server is busy; retry later");
-    assert!(
-        upstream_requests.try_recv().is_err(),
-        "admission denial must not reach upstream"
-    );
 
-    release_upstream.send(()).expect("release upstream");
+    release_tx.send(()).expect("release native engine");
     let first_response = first.await.expect("first task");
     assert_eq!(first_response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn chat_completions_returns_sanitized_504_when_upstream_times_out() {
-    let (upstream, mut upstream_requests, _release_upstream) = spawn_blocking_upstream().await;
-    let mut cfg = config_with_models(vec![model("llama")]);
-    cfg.server.llama_server = upstream;
-    let app = test_app_with_limits(
-        cfg,
-        server::ServingLimits::new(4, Duration::from_millis(25)),
-    )
-    .await;
+async fn chat_completions_returns_sanitized_503_when_native_engine_is_missing() {
+    let cfg = config_with_models(vec![model("llama")]);
+    let app = test_app(cfg).await;
 
     let response = app.oneshot(chat_request()).await.expect("response");
 
-    upstream_requests.recv().await.expect("upstream request");
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_response_headers_do_not_leak(
         response.headers(),
         &[
@@ -1409,9 +2009,12 @@ async fn chat_completions_returns_sanitized_504_when_upstream_times_out() {
         ],
     );
     let body = response_json(response).await;
-    assert_eq!(body["error"]["type"], "timeout");
-    assert_eq!(body["error"]["code"], "timeout");
-    assert_eq!(body["error"]["message"], "upstream request timed out");
+    assert_eq!(body["error"]["type"], "native_runtime_not_ready");
+    assert_eq!(body["error"]["code"], "native_runtime_not_ready");
+    assert_eq!(
+        body["error"]["message"],
+        "native runtime is not ready to serve chat completions"
+    );
 }
 
 #[tokio::test]
@@ -1462,9 +2065,13 @@ async fn test_app(cfg: Config) -> Router {
     server::router(cfg, storage)
 }
 
-async fn test_app_with_limits(cfg: Config, limits: server::ServingLimits) -> Router {
+async fn test_app_with_limits_and_native_engines(
+    cfg: Config,
+    limits: server::ServingLimits,
+    native_engines: server::NativeEngineRegistry,
+) -> Router {
     let storage = Storage::in_memory().await.expect("storage");
-    server::router_with_serving_limits(cfg, storage, limits)
+    server::router_with_serving_limits_and_native_engines(cfg, storage, limits, native_engines)
 }
 
 async fn test_app_with_storage(cfg: Config) -> (Router, Storage) {
@@ -1475,7 +2082,6 @@ async fn test_app_with_storage(cfg: Config) -> (Router, Storage) {
 
 fn config_with_models(models: Vec<ModelConfig>) -> Config {
     let mut cfg = Config::default();
-    cfg.runtime.backend = RuntimeBackend::LlamaServer;
     cfg.security.require_auth = true;
     cfg.security.api_keys = vec![ApiKeyConfig {
         id: "test".to_string(),
@@ -1483,6 +2089,14 @@ fn config_with_models(models: Vec<ModelConfig>) -> Config {
         subject: "alice".to_string(),
         team: "platform".to_string(),
         scopes: vec!["chat".to_string(), "models.read".to_string()],
+        created_at: None,
+        expires_at: None,
+        rotated_at: None,
+        owner: None,
+        purpose: None,
+        last_four: None,
+        fingerprint: None,
+        status: "active".to_string(),
     }];
     cfg.models = models;
     cfg
@@ -1499,6 +2113,7 @@ fn model(alias: &str) -> ModelConfig {
         alias: alias.to_string(),
         path: PathBuf::from(format!("/models/{alias}.gguf")),
         role: "chat".to_string(),
+        family: Some("qwen3".to_string()),
         weight: 1,
     }
 }
@@ -1560,123 +2175,54 @@ async fn spawn_mock_upstream() -> (String, mpsc::Receiver<Value>) {
     (format!("http://{addr}"), rx)
 }
 
-async fn spawn_fallback_upstream() -> (String, mpsc::Receiver<Value>) {
+async fn spawn_provider_upstream() -> (String, mpsc::Receiver<ProviderUpstreamRequest>) {
     let (tx, rx) = mpsc::channel(4);
     let app = Router::new()
         .route(
             "/v1/chat/completions",
             post(
-                |State(tx): State<mpsc::Sender<Value>>, Json(request): Json<Value>| async move {
-                    tx.send(request.clone()).await.expect("record request");
-                    if request["model"] != "backup" {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "upstream failed")
-                            .into_response();
-                    }
-                    Json(json!({
-                        "id": "chatcmpl-test",
-                        "object": "chat.completion",
-                        "created": 1_700_000_000,
-                        "model": request["model"],
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "pong"},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 3,
-                            "completion_tokens": 5,
-                            "total_tokens": 8
-                        }
-                    }))
-                    .into_response()
-                },
-            ),
-        )
-        .with_state(tx);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind upstream");
-    let addr = listener.local_addr().expect("upstream addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve upstream");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-async fn spawn_embeddings_upstream() -> (String, mpsc::Receiver<Value>) {
-    let (tx, rx) = mpsc::channel(4);
-    let app = Router::new()
-        .route(
-            "/v1/embeddings",
-            post(
-                |State(tx): State<mpsc::Sender<Value>>, Json(request): Json<Value>| async move {
-                    tx.send(request.clone()).await.expect("record request");
-                    Json(json!({
-                        "object": "list",
-                        "model": request["model"],
-                        "data": [{
-                            "object": "embedding",
-                            "index": 0,
-                            "embedding": [0.1, 0.2, 0.3]
-                        }],
-                        "usage": {
-                            "prompt_tokens": 1,
-                            "total_tokens": 1
-                        }
-                    }))
-                },
-            ),
-        )
-        .with_state(tx);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind upstream");
-    let addr = listener.local_addr().expect("upstream addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve upstream");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-async fn spawn_blocking_upstream() -> (String, mpsc::Receiver<Value>, oneshot::Sender<()>) {
-    let (request_tx, request_rx) = mpsc::channel(4);
-    let (release_tx, release_rx) = oneshot::channel::<()>();
-    let release_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
-    let app = Router::new()
-        .route(
-            "/v1/chat/completions",
-            post(
-                |State((request_tx, release_rx)): State<BlockingUpstreamState>,
+                |State(tx): State<mpsc::Sender<ProviderUpstreamRequest>>,
+                 headers: axum::http::HeaderMap,
                  Json(request): Json<Value>| async move {
-                    request_tx.send(request).await.expect("record request");
-                    let release = release_rx.lock().await.take();
-                    if let Some(release) = release {
-                        let _ = release.await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                    Json(json!({
-                        "id": "chatcmpl-test",
-                        "object": "chat.completion",
-                        "model": "llama",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "pong"},
-                            "finish_reason": "stop"
-                        }]
-                    }))
+                    tx.send((headers, request.clone()))
+                        .await
+                        .expect("record provider request");
+                    (
+                        [
+                            ("content-type", "application/json"),
+                            ("x-provider-secret", "blocked"),
+                        ],
+                        Json(json!({
+                            "id": "chatcmpl-provider-test",
+                            "object": "chat.completion",
+                            "created": 1_700_000_000,
+                            "model": request["model"],
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "provider pong"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "completion_tokens": 5,
+                                "total_tokens": 8
+                            }
+                        })),
+                    )
                 },
             ),
         )
-        .with_state((request_tx, release_rx));
+        .with_state(tx);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind upstream");
-    let addr = listener.local_addr().expect("upstream addr");
+        .expect("bind provider upstream");
+    let addr = listener.local_addr().expect("provider upstream addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve upstream");
+        axum::serve(listener, app)
+            .await
+            .expect("serve provider upstream");
     });
-    (format!("http://{addr}"), request_rx, release_tx)
+    (format!("http://{addr}"), rx)
 }
 
 async fn mock_chat_completion(

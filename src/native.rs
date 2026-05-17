@@ -1,21 +1,34 @@
 use crate::config::{ClusterNodeConfig, Config, ModelConfig, ResourceConfig};
 use crate::resources::GpuVendor;
 use crate::runtime::RuntimeBackend;
-use anyhow::{bail, Context, Result};
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+use anyhow::Context;
+use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 use std::sync::Mutex;
+use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 const STARTER_ROLES: &[&str] = &["query", "recommendation", "thinking", "coding"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,6 +37,8 @@ pub struct NativeChatRequest {
     pub messages: Vec<NativeChatMessage>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
     pub metadata: BTreeMap<String, Value>,
 }
 
@@ -73,8 +88,27 @@ impl NativeTokenUsage {
 pub struct NativeChatResponse {
     pub model: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
     pub finish_reason: String,
     pub usage: NativeTokenUsage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeEmbeddingRequest {
+    pub model: String,
+    pub input: Vec<String>,
+    pub metadata: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeEmbeddingResponse {
+    pub model: String,
+    pub embeddings: Vec<Vec<f32>>,
+    pub usage: NativeTokenUsage,
+    pub backend: String,
+    pub status: String,
+    pub semantic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,8 +129,10 @@ pub struct NativeQueueContract {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeBatchingContract {
     pub continuous_batching: bool,
+    pub prefill_decode_phase_scheduling: bool,
     pub max_batch_size_metadata_key: String,
     pub max_wait_ms_metadata_key: String,
+    pub unsupported_reason: String,
     pub implemented: bool,
 }
 
@@ -104,14 +140,21 @@ pub struct NativeBatchingContract {
 pub struct NativeKvCacheContract {
     pub cache_scope: String,
     pub cache_budget_metadata_key: String,
+    pub cache_key_metadata_key: String,
     pub eviction_policy: String,
+    pub reuse_implemented: bool,
+    pub unsupported_reason: String,
     pub implemented: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeCancellationContract {
     pub cancellation_token_metadata_key: String,
+    pub cancelled_metadata_key: String,
     pub drain_on_cancel: bool,
+    pub admission_check_implemented: bool,
+    pub decode_loop_check_implemented: bool,
+    pub unsupported_reason: String,
     pub implemented: bool,
 }
 
@@ -125,7 +168,7 @@ pub struct NativeSchedulerContract {
 }
 
 impl NativeSchedulerContract {
-    pub fn planned_metadata_only() -> Self {
+    pub fn fifo_runtime() -> Self {
         Self {
             queue: NativeQueueContract {
                 discipline: NativeQueueDiscipline::Fifo,
@@ -134,27 +177,46 @@ impl NativeSchedulerContract {
                     "llmctl.scheduler.priority".to_string(),
                     "llmctl.scheduler.tenant".to_string(),
                 ],
-                implemented: false,
+                implemented: true,
             },
             batching: NativeBatchingContract {
-                continuous_batching: true,
+                continuous_batching: false,
+                prefill_decode_phase_scheduling: true,
                 max_batch_size_metadata_key: "llmctl.scheduler.max_batch_size".to_string(),
                 max_wait_ms_metadata_key: "llmctl.scheduler.max_wait_ms".to_string(),
+                unsupported_reason:
+                    "continuous batching is not active until native decode can interleave batch members"
+                        .to_string(),
                 implemented: false,
             },
             kv_cache: NativeKvCacheContract {
                 cache_scope: "model-worker".to_string(),
                 cache_budget_metadata_key: "llmctl.scheduler.kv_cache_budget_bytes".to_string(),
-                eviction_policy: "metadata-only-lru-target".to_string(),
+                cache_key_metadata_key: "llmctl.scheduler.kv_cache_key".to_string(),
+                eviction_policy: "request-local-reset".to_string(),
+                reuse_implemented: false,
+                unsupported_reason:
+                    "cross-request KV-cache reuse is disabled until cache ownership and invalidation are verified"
+                        .to_string(),
                 implemented: false,
             },
             cancellation: NativeCancellationContract {
                 cancellation_token_metadata_key: "llmctl.scheduler.cancel_token".to_string(),
+                cancelled_metadata_key: "llmctl.scheduler.cancelled".to_string(),
                 drain_on_cancel: true,
+                admission_check_implemented: true,
+                decode_loop_check_implemented: false,
+                unsupported_reason:
+                    "HTTP disconnect and token-level decode cancellation are not yet wired through Candle generation"
+                        .to_string(),
                 implemented: false,
             },
-            contract_only: true,
+            contract_only: false,
         }
+    }
+
+    pub fn planned_metadata_only() -> Self {
+        Self::fifo_runtime()
     }
 }
 
@@ -165,6 +227,286 @@ pub trait NativeEngine: Send + Sync {
     fn chat_stream(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
         self.chat(request)
     }
+
+    fn embeddings(
+        &self,
+        request: NativeEmbeddingRequest,
+    ) -> BoxFuture<'_, Result<NativeEmbeddingResponse>> {
+        Box::pin(async move {
+            bail!(
+                "native engine for model '{}' does not implement semantic embeddings",
+                request.model
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeSchedulerConfig {
+    pub max_concurrent_requests: usize,
+    pub max_queued_requests: usize,
+    pub max_batch_size: usize,
+    pub max_batch_wait_ms: u64,
+    pub kv_cache_budget_bytes: u64,
+}
+
+impl Default for NativeSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 1,
+            max_queued_requests: 127,
+            max_batch_size: 1,
+            max_batch_wait_ms: 0,
+            kv_cache_budget_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeSchedulerEngine {
+    inner: Arc<dyn NativeEngine>,
+    config: NativeSchedulerConfig,
+    permits: Arc<Semaphore>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for NativeSchedulerEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeSchedulerEngine")
+            .field("model_alias", &self.model_alias())
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeSchedulerEngine {
+    pub fn new(inner: Arc<dyn NativeEngine>, config: NativeSchedulerConfig) -> Self {
+        let config = NativeSchedulerConfig {
+            max_concurrent_requests: config.max_concurrent_requests.max(1),
+            max_queued_requests: config.max_queued_requests,
+            max_batch_size: config.max_batch_size.max(1),
+            max_batch_wait_ms: config.max_batch_wait_ms,
+            kv_cache_budget_bytes: config.kv_cache_budget_bytes,
+        };
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            waiting: Arc::new(AtomicUsize::new(0)),
+            config,
+        }
+    }
+}
+
+impl NativeEngine for NativeSchedulerEngine {
+    fn model_alias(&self) -> &str {
+        self.inner.model_alias()
+    }
+
+    fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        scheduled_native_chat(
+            self.inner.clone(),
+            self.permits.clone(),
+            self.waiting.clone(),
+            self.config,
+            request,
+            NativeScheduledOperation::Chat,
+        )
+    }
+
+    fn chat_stream(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        scheduled_native_chat(
+            self.inner.clone(),
+            self.permits.clone(),
+            self.waiting.clone(),
+            self.config,
+            request,
+            NativeScheduledOperation::Stream,
+        )
+    }
+
+    fn embeddings(
+        &self,
+        request: NativeEmbeddingRequest,
+    ) -> BoxFuture<'_, Result<NativeEmbeddingResponse>> {
+        self.inner.embeddings(request)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeScheduledOperation {
+    Chat,
+    Stream,
+}
+
+struct NativeSchedulerWaitGuard {
+    waiting: Arc<AtomicUsize>,
+    queued_before: usize,
+}
+
+impl NativeSchedulerWaitGuard {
+    fn enter(waiting: Arc<AtomicUsize>, max_queued_requests: usize) -> Result<Self> {
+        let queued_before = waiting.fetch_add(1, Ordering::AcqRel);
+        if queued_before >= max_queued_requests {
+            waiting.fetch_sub(1, Ordering::AcqRel);
+            bail!("native scheduler queue is full");
+        }
+        Ok(Self {
+            waiting,
+            queued_before,
+        })
+    }
+}
+
+impl Drop for NativeSchedulerWaitGuard {
+    fn drop(&mut self) {
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn scheduled_native_chat(
+    inner: Arc<dyn NativeEngine>,
+    permits: Arc<Semaphore>,
+    waiting: Arc<AtomicUsize>,
+    config: NativeSchedulerConfig,
+    mut request: NativeChatRequest,
+    operation: NativeScheduledOperation,
+) -> BoxFuture<'static, Result<NativeChatResponse>> {
+    Box::pin(async move {
+        reject_cancelled_request(&request.metadata)?;
+        let queued_at = Instant::now();
+        let mut queued_before_admit = 0usize;
+        let permit = match permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                let wait_guard =
+                    NativeSchedulerWaitGuard::enter(waiting, config.max_queued_requests)?;
+                queued_before_admit = wait_guard.queued_before;
+                let permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("native scheduler is closed"))?;
+                drop(wait_guard);
+                permit
+            }
+            Err(TryAcquireError::Closed) => bail!("native scheduler is closed"),
+        };
+        reject_cancelled_request(&request.metadata)?;
+        stamp_scheduler_metadata(
+            &mut request.metadata,
+            queued_at,
+            queued_before_admit,
+            config,
+        );
+        run_scheduled_native_chat(inner, request, operation, permit).await
+    })
+}
+
+fn reject_cancelled_request(metadata: &BTreeMap<String, Value>) -> Result<()> {
+    if metadata
+        .get("llmctl.scheduler.cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("native scheduler request was cancelled before decode");
+    }
+    Ok(())
+}
+
+async fn run_scheduled_native_chat(
+    inner: Arc<dyn NativeEngine>,
+    request: NativeChatRequest,
+    operation: NativeScheduledOperation,
+    _permit: OwnedSemaphorePermit,
+) -> Result<NativeChatResponse> {
+    match operation {
+        NativeScheduledOperation::Chat => inner.chat(request).await,
+        NativeScheduledOperation::Stream => inner.chat_stream(request).await,
+    }
+}
+
+fn stamp_scheduler_metadata(
+    metadata: &mut BTreeMap<String, Value>,
+    queued_at: Instant,
+    queued_before_admit: usize,
+    config: NativeSchedulerConfig,
+) {
+    let wait_ms = queued_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    metadata.insert(
+        "llmctl.scheduler.discipline".to_string(),
+        Value::String("fifo".to_string()),
+    );
+    metadata.insert(
+        "llmctl.scheduler.queue.implemented".to_string(),
+        Value::Bool(true),
+    );
+    metadata.insert(
+        "llmctl.scheduler.queue_wait_ms".to_string(),
+        Value::from(wait_ms),
+    );
+    metadata.insert(
+        "llmctl.scheduler.admission_wait_ms".to_string(),
+        Value::from(wait_ms),
+    );
+    metadata.insert(
+        "llmctl.scheduler.queued_requests_before_admit".to_string(),
+        Value::from(queued_before_admit as u64),
+    );
+    metadata.insert(
+        "llmctl.scheduler.max_concurrent_requests".to_string(),
+        Value::from(config.max_concurrent_requests as u64),
+    );
+    metadata.insert(
+        "llmctl.scheduler.max_queued_requests".to_string(),
+        Value::from(config.max_queued_requests as u64),
+    );
+    metadata.insert(
+        "llmctl.scheduler.batching.continuous.implemented".to_string(),
+        Value::Bool(false),
+    );
+    metadata.insert(
+        "llmctl.scheduler.batching.phase_scheduling.implemented".to_string(),
+        Value::Bool(true),
+    );
+    metadata.insert(
+        "llmctl.scheduler.phase".to_string(),
+        Value::String("prefill-then-decode".to_string()),
+    );
+    metadata.insert(
+        "llmctl.scheduler.prefill.phase".to_string(),
+        Value::String("scheduled".to_string()),
+    );
+    metadata.insert(
+        "llmctl.scheduler.decode.phase".to_string(),
+        Value::String("scheduled".to_string()),
+    );
+    metadata.insert(
+        "llmctl.scheduler.max_batch_size".to_string(),
+        Value::from(config.max_batch_size as u64),
+    );
+    metadata.insert(
+        "llmctl.scheduler.max_wait_ms".to_string(),
+        Value::from(config.max_batch_wait_ms),
+    );
+    metadata.insert(
+        "llmctl.scheduler.kv_cache_budget_bytes".to_string(),
+        Value::from(config.kv_cache_budget_bytes),
+    );
+    metadata.insert(
+        "llmctl.scheduler.kv_cache.reuse_implemented".to_string(),
+        Value::Bool(false),
+    );
+    metadata.insert(
+        "llmctl.scheduler.kv_cache.policy".to_string(),
+        Value::String("request-local-reset".to_string()),
+    );
+    metadata.insert(
+        "llmctl.scheduler.cancellation.admission_check_implemented".to_string(),
+        Value::Bool(true),
+    );
+    metadata.insert(
+        "llmctl.scheduler.cancellation.decode_loop_check_implemented".to_string(),
+        Value::Bool(false),
+    );
 }
 
 pub trait NativeTokenCounter: Send + Sync {
@@ -186,10 +528,34 @@ pub fn canonical_native_chat_input(messages: &[NativeChatMessage]) -> String {
         input.push_str("<|");
         input.push_str(&message.role);
         input.push_str("|>\n");
-        input.push_str(&message.content);
+        input.push_str(&message_content_text(message));
+        if message.tool_calls.is_some() {
+            input.push_str("\n<|assistant_tool_calls|>");
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            input.push_str("\n<|tool_call_id|>");
+            input.push_str(tool_call_id);
+        }
         input.push('\n');
     }
     input
+}
+
+fn message_content_text(message: &NativeChatMessage) -> String {
+    match &message.content {
+        Some(Value::String(content)) => content.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -222,7 +588,15 @@ impl NativeTokenCounter for EstimatedNativeTokenCounter {
             .map(|message| {
                 Self::MESSAGE_OVERHEAD_TOKENS
                     .saturating_add(Self::estimate_text_tokens(&message.role))
-                    .saturating_add(Self::estimate_text_tokens(&message.content))
+                    .saturating_add(Self::estimate_text_tokens(&message_content_text(message)))
+                    .saturating_add(if message.tool_calls.is_some() { 1 } else { 0 })
+                    .saturating_add(
+                        message
+                            .tool_call_id
+                            .as_deref()
+                            .map(Self::estimate_text_tokens)
+                            .unwrap_or(0),
+                    )
             })
             .sum())
     }
@@ -290,6 +664,309 @@ pub fn usage_from_native_tokens(
     ))
 }
 
+pub const DETERMINISTIC_EMBEDDING_DIMENSIONS: usize = 64;
+
+#[derive(Debug)]
+pub struct NativeBertEmbeddingEngine {
+    alias: String,
+    encoder: NativeBertEmbeddingEncoder,
+}
+
+impl NativeBertEmbeddingEngine {
+    pub fn load(alias: impl Into<String>, model_path: impl AsRef<Path>) -> Result<Self> {
+        let alias = alias.into();
+        let encoder = NativeBertEmbeddingEncoder::load(model_path.as_ref())?;
+        Ok(Self { alias, encoder })
+    }
+}
+
+impl NativeEngine for NativeBertEmbeddingEngine {
+    fn model_alias(&self) -> &str {
+        &self.alias
+    }
+
+    fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        Box::pin(async move {
+            bail!(
+                "native BERT embedding model '{}' does not serve chat completions",
+                request.model
+            )
+        })
+    }
+
+    fn embeddings(
+        &self,
+        request: NativeEmbeddingRequest,
+    ) -> BoxFuture<'_, Result<NativeEmbeddingResponse>> {
+        Box::pin(async move {
+            let (embeddings, input_tokens) = self.encoder.embed(&request.input)?;
+            Ok(NativeEmbeddingResponse {
+                model: request.model,
+                embeddings,
+                usage: NativeTokenUsage::with_mode(
+                    input_tokens,
+                    0,
+                    TokenAccountingMode::NativeExact,
+                ),
+                backend: "candle-bert-embeddings".to_string(),
+                status: "semantic-native".to_string(),
+                semantic: true,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+enum NativeBertEmbeddingEncoder {
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+    Real(RealBertEmbeddingEncoder),
+    #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+    Unavailable,
+}
+
+impl NativeBertEmbeddingEncoder {
+    fn load(model_path: &Path) -> Result<Self> {
+        load_real_bert_embedding_encoder(model_path)
+    }
+
+    fn embed(&self, input: &[String]) -> Result<(Vec<Vec<f32>>, u64)> {
+        match self {
+            #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+            Self::Real(encoder) => encoder.embed(input),
+            #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+            Self::Unavailable => {
+                let _ = input;
+                bail!(
+                    "semantic native embeddings require the native-candle and native-tokenizers features"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+fn load_real_bert_embedding_encoder(_model_path: &Path) -> Result<NativeBertEmbeddingEncoder> {
+    Ok(NativeBertEmbeddingEncoder::Unavailable)
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+struct RealBertEmbeddingEncoder {
+    tokenizer: tokenizers::tokenizer::Tokenizer,
+    model: Mutex<candle_transformers::models::bert::BertModel>,
+    pad_token_id: u32,
+    max_position_embeddings: usize,
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+impl std::fmt::Debug for RealBertEmbeddingEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealBertEmbeddingEncoder")
+            .field("pad_token_id", &self.pad_token_id)
+            .field("max_position_embeddings", &self.max_position_embeddings)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn load_real_bert_embedding_encoder(model_path: &Path) -> Result<NativeBertEmbeddingEncoder> {
+    let artifact_dir = safetensors_artifact_dir(model_path);
+    let model = ModelConfig {
+        alias: "semantic-embedding".to_string(),
+        path: model_path.to_path_buf(),
+        role: "embedding".to_string(),
+        family: Some("qwen3".to_string()),
+        weight: 1,
+    };
+    let artifacts = validate_semantic_embedding_artifacts(&model)?;
+    let paths = artifacts
+        .weight_files
+        .iter()
+        .map(|name| artifact_dir.join(name))
+        .collect::<Vec<_>>();
+    let config_path = artifact_dir.join("config.json");
+    let tokenizer_path = artifact_dir.join("tokenizer.json");
+    let config: candle_transformers::models::bert::Config = read_json_config(&config_path)?;
+    let tokenizer = tokenizers::tokenizer::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|err| anyhow::anyhow!("failed to load tokenizer.json: {err}"))?;
+    let device = candle_core::Device::Cpu;
+    let vb = unsafe {
+        candle_nn::VarBuilder::from_mmaped_safetensors(&paths, candle_core::DType::F32, &device)
+    }
+    .with_context(|| "failed to mmap BERT embedding safetensors with Candle")?;
+    let bert = candle_transformers::models::bert::BertModel::load(vb, &config)
+        .with_context(|| "failed to construct BERT embedding model")?;
+    Ok(NativeBertEmbeddingEncoder::Real(RealBertEmbeddingEncoder {
+        tokenizer,
+        model: Mutex::new(bert),
+        pad_token_id: config.pad_token_id as u32,
+        max_position_embeddings: config.max_position_embeddings,
+    }))
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+impl RealBertEmbeddingEncoder {
+    fn embed(&self, input: &[String]) -> Result<(Vec<Vec<f32>>, u64)> {
+        if input.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut encoded = Vec::with_capacity(input.len());
+        let mut max_len = 0usize;
+        let mut input_tokens = 0u64;
+        for text in input {
+            let encoding = self
+                .tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|err| anyhow::anyhow!("failed to tokenize embedding input: {err}"))?;
+            let mut ids = encoding.get_ids().to_vec();
+            if ids.is_empty() {
+                ids.push(self.pad_token_id);
+            }
+            ids.truncate(self.max_position_embeddings.max(1));
+            input_tokens = input_tokens.saturating_add(ids.len() as u64);
+            max_len = max_len.max(ids.len());
+            encoded.push(ids);
+        }
+
+        let mut input_ids = Vec::with_capacity(encoded.len());
+        let mut token_type_ids = Vec::with_capacity(encoded.len());
+        let mut attention_mask = Vec::with_capacity(encoded.len());
+        for ids in &encoded {
+            let mut padded = ids.clone();
+            let mut mask = vec![1u32; ids.len()];
+            padded.resize(max_len, self.pad_token_id);
+            mask.resize(max_len, 0);
+            input_ids.push(padded);
+            token_type_ids.push(vec![0u32; max_len]);
+            attention_mask.push(mask);
+        }
+
+        let device = candle_core::Device::Cpu;
+        let input_ids = candle_core::Tensor::new(input_ids, &device)
+            .with_context(|| "failed to build BERT input_ids tensor")?;
+        let token_type_ids = candle_core::Tensor::new(token_type_ids, &device)
+            .with_context(|| "failed to build BERT token_type_ids tensor")?;
+        let attention = candle_core::Tensor::new(attention_mask.clone(), &device)
+            .with_context(|| "failed to build BERT attention_mask tensor")?;
+        let model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native BERT embedding model lock is poisoned"))?;
+        let sequence = model
+            .forward(&input_ids, &token_type_ids, Some(&attention))
+            .with_context(|| "native BERT embedding forward pass failed")?;
+        let hidden = sequence
+            .to_vec3::<f32>()
+            .with_context(|| "failed to read BERT embedding tensor")?;
+        let embeddings = mean_pool_hidden(hidden, &attention_mask);
+        Ok((embeddings, input_tokens))
+    }
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn mean_pool_hidden(hidden: Vec<Vec<Vec<f32>>>, masks: &[Vec<u32>]) -> Vec<Vec<f32>> {
+    hidden
+        .into_iter()
+        .zip(masks.iter())
+        .map(|(tokens, mask)| {
+            let dimensions = tokens.first().map(Vec::len).unwrap_or(0);
+            let mut pooled = vec![0.0f32; dimensions];
+            let mut count = 0f32;
+            for (token, active) in tokens.into_iter().zip(mask.iter()) {
+                if *active == 0 {
+                    continue;
+                }
+                for (slot, value) in pooled.iter_mut().zip(token) {
+                    *slot += value;
+                }
+                count += 1.0;
+            }
+            if count > 0.0 {
+                for value in &mut pooled {
+                    *value /= count;
+                }
+            }
+            normalize_vector(pooled)
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn validate_semantic_embedding_artifacts(model: &ModelConfig) -> Result<CandleArtifactValidation> {
+    let format = infer_native_artifact_format(&model.path);
+    if format != NativeModelFormat::Safetensors {
+        bail!(
+            "candle-bert-embeddings cannot load model alias '{}' because semantic embeddings require safetensors weights with tokenizer.json and config.json",
+            model.alias
+        );
+    }
+    let layout = CandleArtifactLayout::for_format(NativeModelFormat::Safetensors);
+    validate_safetensors_artifacts(CandleModelFamily::Qwen3, model, layout).map_err(|err| {
+        anyhow::anyhow!(
+            "{}",
+            err.to_string()
+                .replace("candle-native-qwen3", "candle-bert-embeddings")
+        )
+    })
+}
+
+pub fn deterministic_native_embeddings(
+    request: NativeEmbeddingRequest,
+) -> Result<NativeEmbeddingResponse> {
+    let input_tokens = request
+        .input
+        .iter()
+        .map(|input| EstimatedNativeTokenCounter::estimate_text_tokens(input))
+        .sum();
+    let embeddings = request
+        .input
+        .iter()
+        .map(|input| deterministic_embedding_vector(&request.model, input))
+        .collect();
+    Ok(NativeEmbeddingResponse {
+        model: request.model,
+        embeddings,
+        usage: NativeTokenUsage::with_mode(input_tokens, 0, TokenAccountingMode::Estimated),
+        backend: "deterministic-local-fallback".to_string(),
+        status: "non-semantic-dev-fallback".to_string(),
+        semantic: false,
+    })
+}
+
+fn deterministic_embedding_vector(model: &str, input: &str) -> Vec<f32> {
+    let mut vector = Vec::with_capacity(DETERMINISTIC_EMBEDDING_DIMENSIONS);
+    let mut counter = 0u64;
+    while vector.len() < DETERMINISTIC_EMBEDDING_DIMENSIONS {
+        let mut hasher = Sha256::new();
+        hasher.update(model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(input.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(counter.to_le_bytes());
+        let digest = hasher.finalize();
+        for chunk in digest.chunks_exact(4) {
+            let raw = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let unit = (raw as f32) / (u32::MAX as f32);
+            vector.push(unit.mul_add(2.0, -1.0));
+            if vector.len() == DETERMINISTIC_EMBEDDING_DIMENSIONS {
+                break;
+            }
+        }
+        counter = counter.saturating_add(1);
+    }
+    normalize_vector(vector)
+}
+
+fn normalize_vector(mut vector: Vec<f32>) -> Vec<f32> {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NativeModelFormat {
@@ -349,6 +1026,16 @@ impl NativeAcceleration {
             Self::Cpu | Self::Auto => None,
         }
     }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::NvidiaCuda => "nvidia-cuda",
+            Self::AmdRocm => "amd-rocm",
+            Self::AppleMetal => "apple-metal",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -356,8 +1043,10 @@ impl NativeAcceleration {
 pub enum CandleModelFamily {
     Qwen3,
     Gemma4,
+    DeepSeek,
     Kimi,
     Mistral,
+    MiniMax,
 }
 
 impl CandleModelFamily {
@@ -365,8 +1054,10 @@ impl CandleModelFamily {
         match self {
             Self::Qwen3 => "qwen3",
             Self::Gemma4 => "gemma4",
+            Self::DeepSeek => "deepseek",
             Self::Kimi => "kimi",
             Self::Mistral => "mistral",
+            Self::MiniMax => "minimax",
         }
     }
 
@@ -374,8 +1065,10 @@ impl CandleModelFamily {
         match self {
             Self::Qwen3 => "candle-native-qwen3",
             Self::Gemma4 => "candle-native-gemma4",
+            Self::DeepSeek => "candle-native-deepseek",
             Self::Kimi => "candle-native-kimi",
             Self::Mistral => "candle-native-mistral",
+            Self::MiniMax => "candle-native-minimax",
         }
     }
 
@@ -383,13 +1076,29 @@ impl CandleModelFamily {
         match self {
             Self::Qwen3 => "Qwen3",
             Self::Gemma4 => "Gemma 4",
+            Self::DeepSeek => "DeepSeek",
             Self::Kimi => "Kimi",
             Self::Mistral => "Mistral",
+            Self::MiniMax => "MiniMax",
         }
     }
 
     pub const fn all() -> &'static [Self] {
-        &[Self::Qwen3, Self::Gemma4, Self::Kimi, Self::Mistral]
+        &[
+            Self::Qwen3,
+            Self::Gemma4,
+            Self::DeepSeek,
+            Self::Kimi,
+            Self::Mistral,
+            Self::MiniMax,
+        ]
+    }
+
+    pub const fn has_native_decoder(&self) -> bool {
+        matches!(
+            self,
+            Self::Qwen3 | Self::Gemma4 | Self::DeepSeek | Self::Mistral
+        )
     }
 }
 
@@ -508,11 +1217,30 @@ pub struct CandleArtifactValidation {
 
 impl CandleFamilySupportMetadata {
     pub fn for_family(family: CandleModelFamily) -> Self {
+        let supported_formats = supported_candle_formats_for_family(family);
+        let supported_operations = if family.has_native_decoder() {
+            vec![
+                CandleSupportedOperation::ChatCompletion,
+                CandleSupportedOperation::ChatTokenCounting,
+                CandleSupportedOperation::CompletionTokenCounting,
+            ]
+        } else {
+            Vec::new()
+        };
+        let tokenizer_contracts = supported_formats
+            .iter()
+            .copied()
+            .map(|model_format| CandleTokenizerContract {
+                model_format,
+                requirement: tokenizer_requirement_for_supported_format(model_format),
+            })
+            .collect();
+
         Self {
             model_family: family,
             display_name: family.display_name().to_string(),
             engine: family.engine_name().to_string(),
-            supported_formats: vec![NativeModelFormat::Gguf, NativeModelFormat::Safetensors],
+            supported_formats,
             supported_accelerators: vec![
                 NativeAcceleration::Cpu,
                 NativeAcceleration::NvidiaCuda,
@@ -520,31 +1248,15 @@ impl CandleFamilySupportMetadata {
                 NativeAcceleration::AppleMetal,
                 NativeAcceleration::Auto,
             ],
-            supported_operations: vec![
-                CandleSupportedOperation::ChatCompletion,
-                CandleSupportedOperation::ChatTokenCounting,
-                CandleSupportedOperation::CompletionTokenCounting,
-            ],
+            supported_operations,
             candle_crates_required: vec![
                 "candle-core".to_string(),
                 "candle-nn".to_string(),
                 "candle-transformers".to_string(),
                 "tokenizers".to_string(),
             ],
-            tokenizer_contracts: vec![
-                CandleTokenizerContract {
-                    model_format: NativeModelFormat::Gguf,
-                    requirement: CandleTokenizerRequirement::GgufMetadata,
-                },
-                CandleTokenizerContract {
-                    model_format: NativeModelFormat::Safetensors,
-                    requirement: CandleTokenizerRequirement::TokenizerJson,
-                },
-            ],
-            generation_status: format!(
-                "Candle {} artifact loading and streaming response surface are wired; family-specific autoregressive decoding remains behind the native engine boundary",
-                family.as_str()
-            ),
+            tokenizer_contracts,
+            generation_status: candle_family_generation_status(family),
         }
     }
 
@@ -554,6 +1266,76 @@ impl CandleFamilySupportMetadata {
             .find(|contract| contract.model_format == format)
             .map(|contract| contract.requirement.clone())
             .unwrap_or(CandleTokenizerRequirement::UnsupportedFormat)
+    }
+}
+
+fn supported_candle_formats_for_family(family: CandleModelFamily) -> Vec<NativeModelFormat> {
+    match family {
+        CandleModelFamily::Qwen3 | CandleModelFamily::Gemma4 => {
+            vec![NativeModelFormat::Gguf, NativeModelFormat::Safetensors]
+        }
+        CandleModelFamily::DeepSeek | CandleModelFamily::Mistral => {
+            vec![NativeModelFormat::Safetensors]
+        }
+        CandleModelFamily::Kimi | CandleModelFamily::MiniMax => Vec::new(),
+    }
+}
+
+fn tokenizer_requirement_for_supported_format(
+    format: NativeModelFormat,
+) -> CandleTokenizerRequirement {
+    match format {
+        NativeModelFormat::Gguf => CandleTokenizerRequirement::GgufMetadata,
+        NativeModelFormat::Safetensors => CandleTokenizerRequirement::TokenizerJson,
+        NativeModelFormat::Unknown => CandleTokenizerRequirement::UnsupportedFormat,
+    }
+}
+
+fn candle_family_generation_status(family: CandleModelFamily) -> String {
+    match family {
+        CandleModelFamily::Qwen3 | CandleModelFamily::Gemma4 | CandleModelFamily::Mistral => {
+            format!(
+                "Candle {} artifact loading and greedy autoregressive decoding are wired where Candle exposes the required architecture and artifact format",
+                family.as_str()
+            )
+        }
+        CandleModelFamily::DeepSeek => {
+            "Candle deepseek2 safetensors artifact loading and greedy autoregressive decoding are wired through DeepSeekV2; GGUF/quantized DeepSeek remains fail-closed because Candle 0.10.2 does not expose quantized DeepSeek2 model weights".to_string()
+        }
+        CandleModelFamily::Kimi => {
+            "Kimi remains fail-closed for all native formats because Candle 0.10.2 does not expose candle_transformers::models::kimi or quantized Kimi GGUF model weights".to_string()
+        }
+        CandleModelFamily::MiniMax => {
+            "MiniMax remains fail-closed for all native formats because Candle 0.10.2 does not expose candle_transformers::models::minimax or quantized MiniMax GGUF model weights".to_string()
+        }
+    }
+}
+
+fn candle_format_generation_status(family: CandleModelFamily, format: NativeModelFormat) -> String {
+    match (family, format) {
+        (CandleModelFamily::DeepSeek, NativeModelFormat::Safetensors) => {
+            "candle-native-deepseek safetensors decoding is wired through candle_transformers::models::deepseek2::DeepSeekV2".to_string()
+        }
+        (CandleModelFamily::DeepSeek, NativeModelFormat::Gguf) => {
+            "candle-native-deepseek GGUF/quantized DeepSeek fails closed because Candle 0.10.2 does not expose quantized DeepSeek2 model weights".to_string()
+        }
+        (CandleModelFamily::Kimi, NativeModelFormat::Safetensors) => {
+            "candle-native-kimi safetensors decoding fails closed because Candle 0.10.2 does not expose candle_transformers::models::kimi".to_string()
+        }
+        (CandleModelFamily::Kimi, NativeModelFormat::Gguf) => {
+            "candle-native-kimi GGUF/quantized Kimi fails closed because Candle 0.10.2 does not expose quantized Kimi GGUF model weights".to_string()
+        }
+        (CandleModelFamily::MiniMax, NativeModelFormat::Safetensors) => {
+            "candle-native-minimax safetensors decoding fails closed because Candle 0.10.2 does not expose candle_transformers::models::minimax".to_string()
+        }
+        (CandleModelFamily::MiniMax, NativeModelFormat::Gguf) => {
+            "candle-native-minimax GGUF/quantized MiniMax fails closed because Candle 0.10.2 does not expose quantized MiniMax GGUF model weights".to_string()
+        }
+        (_, NativeModelFormat::Unknown) => format!(
+            "{} does not support unknown native artifact formats",
+            family.engine_name()
+        ),
+        _ => candle_family_generation_status(family),
     }
 }
 
@@ -633,6 +1415,14 @@ impl CandleEngineConfig {
         Self::for_family(CandleModelFamily::Mistral, format, accelerator)
     }
 
+    pub fn deepseek(format: NativeModelFormat, accelerator: NativeAcceleration) -> Self {
+        Self::for_family(CandleModelFamily::DeepSeek, format, accelerator)
+    }
+
+    pub fn minimax(format: NativeModelFormat, accelerator: NativeAcceleration) -> Self {
+        Self::for_family(CandleModelFamily::MiniMax, format, accelerator)
+    }
+
     pub fn for_family(
         family: CandleModelFamily,
         format: NativeModelFormat,
@@ -646,6 +1436,7 @@ impl CandleEngineConfig {
         };
         let fail_closed = supported_operations.is_empty();
         let tokenizer = support.tokenizer_requirement(format);
+        let fail_closed_reason = candle_format_generation_status(family, format);
 
         Self {
             engine: support.engine.clone(),
@@ -660,7 +1451,7 @@ impl CandleEngineConfig {
                 candle_crates_required: support.candle_crates_required.clone(),
                 device_selection: CandleDeviceSelectionContract::from_acceleration(accelerator),
                 fail_closed,
-                fail_closed_reason: support.generation_status.clone(),
+                fail_closed_reason,
             },
         }
     }
@@ -733,7 +1524,7 @@ impl NativeCandleEngineFactory {
             candle,
             support,
             device_selection,
-            scheduler: NativeSchedulerContract::planned_metadata_only(),
+            scheduler: NativeSchedulerContract::fifo_runtime(),
             model_path: model.path.clone(),
             budget_fraction: resources.budget,
             implemented: true,
@@ -753,10 +1544,21 @@ impl NativeCandleEngineFactory {
 
     pub fn load(&self, plan: &NativeEngineLoadPlan) -> Result<Box<dyn NativeEngine>> {
         validate_native_engine_load_plan(plan)?;
+        if !matches!(
+            plan.acceleration,
+            NativeAcceleration::Cpu | NativeAcceleration::Auto
+        ) {
+            bail!(
+                "native Candle decoding currently supports CPU execution only; requested {} acceleration for model {}",
+                plan.acceleration.as_str(),
+                plan.alias
+            );
+        }
         let model = ModelConfig {
             alias: plan.alias.clone(),
             path: plan.model_path.clone(),
             role: plan.role.clone(),
+            family: Some(plan.family.clone()),
             weight: 1,
         };
         let artifacts =
@@ -825,6 +1627,7 @@ impl NativeEngine for ArtifactBackedCandleEngine {
             Ok(NativeChatResponse {
                 model: request.model,
                 content,
+                tool_calls: None,
                 finish_reason: "stop".to_string(),
                 usage,
             })
@@ -834,6 +1637,7 @@ impl NativeEngine for ArtifactBackedCandleEngine {
 
 #[derive(Debug)]
 enum NativeCandleDecoder {
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     Real(RealCandleDecoder),
     #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
     Unavailable,
@@ -845,11 +1649,15 @@ impl NativeCandleDecoder {
         model_path: &Path,
         artifacts: &CandleArtifactValidation,
     ) -> Result<Self> {
+        ensure_candle_family_format_supported(family, artifacts.model_format)?;
         load_real_candle_decoder(family, model_path, artifacts)
     }
 
     fn generate(&self, request: &NativeChatRequest) -> Result<String> {
+        #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+        let _ = request;
         match self {
+            #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
             Self::Real(decoder) => decoder.generate(request),
             #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
             Self::Unavailable => bail!(
@@ -860,6 +1668,7 @@ impl NativeCandleDecoder {
 
     fn usage(&self, request: &NativeChatRequest, content: &str) -> Result<NativeTokenUsage> {
         match self {
+            #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
             Self::Real(decoder) => decoder.usage(request, content),
             #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
             Self::Unavailable => {
@@ -867,6 +1676,17 @@ impl NativeCandleDecoder {
             }
         }
     }
+}
+
+fn ensure_candle_family_format_supported(
+    family: CandleModelFamily,
+    format: NativeModelFormat,
+) -> Result<()> {
+    let config = CandleEngineConfig::for_family(family, format, NativeAcceleration::Cpu);
+    if !config.is_supported() {
+        bail!("{}", config.load_contract.fail_closed_reason);
+    }
+    Ok(())
 }
 
 #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
@@ -885,18 +1705,29 @@ struct RealCandleDecoder {
     model: Mutex<RealCandleModel>,
 }
 
-#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
-#[derive(Debug)]
-struct RealCandleDecoder;
-
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
-#[derive(Debug)]
 enum RealCandleModel {
     Qwen3(candle_transformers::models::qwen3::ModelForCausalLM),
     Qwen3Gguf(candle_transformers::models::quantized_qwen3::ModelWeights),
+    DeepSeek2(candle_transformers::models::deepseek2::DeepSeekV2),
     Gemma3(candle_transformers::models::gemma3::Model),
     Gemma3Gguf(candle_transformers::models::quantized_gemma3::ModelWeights),
     Mistral(candle_transformers::models::mistral::Model),
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+impl std::fmt::Debug for RealCandleModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::Qwen3(_) => "Qwen3",
+            Self::Qwen3Gguf(_) => "Qwen3Gguf",
+            Self::DeepSeek2(_) => "DeepSeek2",
+            Self::Gemma3(_) => "Gemma3",
+            Self::Gemma3Gguf(_) => "Gemma3Gguf",
+            Self::Mistral(_) => "Mistral",
+        };
+        f.debug_tuple("RealCandleModel").field(&variant).finish()
+    }
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -905,9 +1736,10 @@ fn load_real_candle_decoder(
     model_path: &Path,
     artifacts: &CandleArtifactValidation,
 ) -> Result<NativeCandleDecoder> {
-    if family == CandleModelFamily::Kimi {
+    if !family.has_native_decoder() {
         bail!(
-            "candle-native-kimi cannot be loaded: Candle 0.10.2 does not expose a Kimi architecture module"
+            "{}",
+            CandleFamilySupportMetadata::for_family(family).generation_status
         );
     }
 
@@ -950,6 +1782,14 @@ fn load_real_candle_decoder(
                             .with_context(|| "failed to construct Gemma Candle model")?,
                     )
                 }
+                CandleModelFamily::DeepSeek => {
+                    let cfg: candle_transformers::models::deepseek2::DeepSeekV2Config =
+                        read_json_config(&config_path)?;
+                    RealCandleModel::DeepSeek2(
+                        candle_transformers::models::deepseek2::DeepSeekV2::new(&cfg, vb)
+                            .with_context(|| "failed to construct DeepSeek2 Candle model")?,
+                    )
+                }
                 CandleModelFamily::Mistral => {
                     let cfg: candle_transformers::models::mistral::Config =
                         read_json_config(&config_path)?;
@@ -958,7 +1798,9 @@ fn load_real_candle_decoder(
                             .with_context(|| "failed to construct Mistral Candle model")?,
                     )
                 }
-                CandleModelFamily::Kimi => unreachable!("Kimi is rejected before loading"),
+                CandleModelFamily::Kimi | CandleModelFamily::MiniMax => {
+                    unreachable!("blocked families are rejected before loading")
+                }
             }
         }
         NativeModelFormat::Gguf => {
@@ -982,7 +1824,12 @@ fn load_real_candle_decoder(
                 CandleModelFamily::Mistral => bail!(
                     "candle-native-mistral GGUF decoding is not wired in Candle 0.10.2; use safetensors with tokenizer.json and config.json"
                 ),
-                CandleModelFamily::Kimi => unreachable!("Kimi is rejected before loading"),
+                CandleModelFamily::DeepSeek => bail!(
+                    "candle-native-deepseek GGUF decoding is not wired because Candle 0.10.2 does not expose quantized DeepSeek2 model weights; use safetensors with tokenizer.json and config.json"
+                ),
+                CandleModelFamily::Kimi | CandleModelFamily::MiniMax => {
+                    unreachable!("blocked families are rejected before loading")
+                }
             }
         }
         NativeModelFormat::Unknown => bail!("native artifact format is unsupported"),
@@ -1052,6 +1899,7 @@ impl RealCandleModel {
         match self {
             Self::Qwen3(model) => model.clear_kv_cache(),
             Self::Qwen3Gguf(model) => model.clear_kv_cache(),
+            Self::DeepSeek2(model) => model.clear_kv_cache(),
             Self::Gemma3(model) => model.clear_kv_cache(),
             Self::Gemma3Gguf(_) => {}
             Self::Mistral(model) => model.clear_kv_cache(),
@@ -1066,6 +1914,7 @@ impl RealCandleModel {
         let logits = match self {
             Self::Qwen3(model) => model.forward(&input, offset),
             Self::Qwen3Gguf(model) => model.forward(&input, offset),
+            Self::DeepSeek2(model) => model.forward(&input, offset),
             Self::Gemma3(model) => model.forward(&input, offset),
             Self::Gemma3Gguf(model) => model.forward(&input, offset),
             Self::Mistral(model) => model.forward(&input, offset),
@@ -1174,16 +2023,21 @@ pub fn validate_native_engine_load_plan(plan: &NativeEngineLoadPlan) -> Result<(
     if !plan.implemented && !plan.candle.load_contract.fail_closed {
         bail!("unimplemented native load plan must fail closed");
     }
-    if !plan.scheduler.contract_only {
-        bail!("native scheduler contract must remain metadata-only until execution is wired");
+    if plan.scheduler.contract_only {
+        bail!("native scheduler contract must report implemented FIFO queue runtime");
     }
-    if plan.scheduler.queue.implemented
+    if plan.scheduler.queue.discipline != NativeQueueDiscipline::Fifo
+        || !plan.scheduler.queue.implemented
+        || !plan.scheduler.batching.prefill_decode_phase_scheduling
         || plan.scheduler.batching.implemented
+        || plan.scheduler.kv_cache.reuse_implemented
         || plan.scheduler.kv_cache.implemented
+        || !plan.scheduler.cancellation.admission_check_implemented
+        || plan.scheduler.cancellation.decode_loop_check_implemented
         || plan.scheduler.cancellation.implemented
     {
         bail!(
-            "native scheduler queue, batching, KV cache, and cancellation are not implemented yet"
+            "native scheduler must implement FIFO queue and phase metadata while continuous batching, KV-cache reuse, and decode cancellation remain explicit unsupported runtime boundaries"
         );
     }
 
@@ -1713,8 +2567,12 @@ fn normalize_role(role: &str) -> &str {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
+    use futures_util::FutureExt;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+    use tokio::time::{sleep, Duration};
 
     #[derive(Debug)]
     struct CountingTokenizer;
@@ -1723,13 +2581,264 @@ mod tests {
         fn count_chat_input(&self, messages: &[NativeChatMessage]) -> Result<u64> {
             Ok(messages
                 .iter()
-                .map(|message| message.content.split_whitespace().count() as u64)
+                .map(|message| message_content_text(message).split_whitespace().count() as u64)
                 .sum())
         }
 
         fn count_text(&self, text: &str) -> Result<u64> {
             Ok(text.split_whitespace().count() as u64)
         }
+    }
+
+    struct BlockingSchedulerTestEngine {
+        tx: mpsc::Sender<BTreeMap<String, Value>>,
+        releases: AsyncMutex<Vec<oneshot::Receiver<()>>>,
+    }
+
+    impl BlockingSchedulerTestEngine {
+        fn new(
+            tx: mpsc::Sender<BTreeMap<String, Value>>,
+            releases: Vec<oneshot::Receiver<()>>,
+        ) -> Self {
+            Self {
+                tx,
+                releases: AsyncMutex::new(releases),
+            }
+        }
+    }
+
+    impl NativeEngine for BlockingSchedulerTestEngine {
+        fn model_alias(&self) -> &str {
+            "qwen"
+        }
+
+        fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
+            async move {
+                self.tx
+                    .send(request.metadata.clone())
+                    .await
+                    .expect("scheduler metadata captured");
+                let release = self.releases.lock().await.pop().expect("release receiver");
+                let _ = release.await;
+                Ok(NativeChatResponse {
+                    model: request.model,
+                    content: "ok".to_string(),
+                    tool_calls: None,
+                    finish_reason: "stop".to_string(),
+                    usage: NativeTokenUsage::new(1, 1),
+                })
+            }
+            .boxed()
+        }
+    }
+
+    fn scheduler_test_request(id: &str) -> NativeChatRequest {
+        NativeChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String(id.to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            metadata: BTreeMap::from([("test.id".to_string(), Value::String(id.to_string()))]),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_scheduler_runs_fifo_and_records_wait_metadata() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let (first_release_tx, first_release_rx) = oneshot::channel();
+        let (second_release_tx, second_release_rx) = oneshot::channel();
+        let (third_release_tx, third_release_rx) = oneshot::channel();
+        let engine = Arc::new(BlockingSchedulerTestEngine::new(
+            tx,
+            vec![third_release_rx, second_release_rx, first_release_rx],
+        ));
+        let scheduler = NativeSchedulerEngine::new(
+            engine,
+            NativeSchedulerConfig {
+                max_concurrent_requests: 1,
+                max_queued_requests: 2,
+                max_batch_size: 1,
+                max_batch_wait_ms: 0,
+                kv_cache_budget_bytes: 0,
+            },
+        );
+
+        let first = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move { scheduler.chat(scheduler_test_request("first")).await }
+        });
+        assert_eq!(
+            rx.recv().await.expect("first request")["test.id"],
+            Value::String("first".to_string())
+        );
+
+        let second = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move { scheduler.chat(scheduler_test_request("second")).await }
+        });
+        sleep(Duration::from_millis(5)).await;
+        let third = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move { scheduler.chat(scheduler_test_request("third")).await }
+        });
+        sleep(Duration::from_millis(20)).await;
+        first_release_tx.send(()).expect("release first");
+
+        let second_metadata = rx.recv().await.expect("second request");
+        assert_eq!(
+            second_metadata["test.id"],
+            Value::String("second".to_string())
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.discipline"],
+            Value::String("fifo".to_string())
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.queue.implemented"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.batching.continuous.implemented"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.batching.phase_scheduling.implemented"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.phase"],
+            Value::String("prefill-then-decode".to_string())
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.kv_cache.reuse_implemented"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.kv_cache.policy"],
+            Value::String("request-local-reset".to_string())
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.cancellation.admission_check_implemented"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            second_metadata["llmctl.scheduler.cancellation.decode_loop_check_implemented"],
+            Value::Bool(false)
+        );
+        assert!(
+            second_metadata["llmctl.scheduler.queue_wait_ms"]
+                .as_u64()
+                .expect("wait ms")
+                > 0
+        );
+        second_release_tx.send(()).expect("release second");
+
+        let third_metadata = rx.recv().await.expect("third request");
+        assert_eq!(
+            third_metadata["test.id"],
+            Value::String("third".to_string())
+        );
+        third_release_tx.send(()).expect("release third");
+
+        first.await.expect("first join").expect("first response");
+        second.await.expect("second join").expect("second response");
+        third.await.expect("third join").expect("third response");
+    }
+
+    #[tokio::test]
+    async fn native_scheduler_rejects_when_wait_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_release_tx, release_rx) = oneshot::channel();
+        let scheduler = NativeSchedulerEngine::new(
+            Arc::new(BlockingSchedulerTestEngine::new(tx, vec![release_rx])),
+            NativeSchedulerConfig {
+                max_concurrent_requests: 1,
+                max_queued_requests: 0,
+                max_batch_size: 1,
+                max_batch_wait_ms: 0,
+                kv_cache_budget_bytes: 0,
+            },
+        );
+
+        let first = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move { scheduler.chat(scheduler_test_request("first")).await }
+        });
+        assert_eq!(
+            rx.recv().await.expect("first request")["test.id"],
+            Value::String("first".to_string())
+        );
+
+        let err = scheduler
+            .chat(scheduler_test_request("second"))
+            .await
+            .expect_err("full scheduler queue rejects");
+        assert!(err.to_string().contains("native scheduler queue is full"));
+
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn native_scheduler_rejects_cancelled_requests_before_admission() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let scheduler = NativeSchedulerEngine::new(
+            Arc::new(BlockingSchedulerTestEngine::new(tx, Vec::new())),
+            NativeSchedulerConfig::default(),
+        );
+        let mut request = scheduler_test_request("cancelled");
+        request
+            .metadata
+            .insert("llmctl.scheduler.cancelled".to_string(), Value::Bool(true));
+
+        let err = scheduler
+            .chat(request)
+            .await
+            .expect_err("cancelled scheduler request rejects");
+        assert!(err
+            .to_string()
+            .contains("native scheduler request was cancelled before decode"));
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled request must not reach engine"
+        );
+    }
+
+    #[test]
+    fn native_scheduler_contract_exposes_runtime_and_unsupported_boundaries() {
+        let contract = NativeSchedulerContract::fifo_runtime();
+
+        assert!(contract.queue.implemented);
+        assert!(!contract.batching.implemented);
+        assert!(!contract.batching.continuous_batching);
+        assert!(contract.batching.prefill_decode_phase_scheduling);
+        assert!(contract
+            .batching
+            .unsupported_reason
+            .contains("continuous batching is not active"));
+        assert!(!contract.kv_cache.implemented);
+        assert!(!contract.kv_cache.reuse_implemented);
+        assert_eq!(
+            contract.kv_cache.cache_key_metadata_key,
+            "llmctl.scheduler.kv_cache_key"
+        );
+        assert!(contract
+            .kv_cache
+            .unsupported_reason
+            .contains("cross-request KV-cache reuse is disabled"));
+        assert!(!contract.cancellation.implemented);
+        assert!(contract.cancellation.admission_check_implemented);
+        assert!(!contract.cancellation.decode_loop_check_implemented);
+        assert_eq!(
+            contract.cancellation.cancelled_metadata_key,
+            "llmctl.scheduler.cancelled"
+        );
     }
 
     #[test]
@@ -1739,15 +2848,21 @@ mod tests {
             messages: vec![
                 NativeChatMessage {
                     role: "system".to_string(),
-                    content: "answer briefly".to_string(),
+                    content: Some(Value::String("answer briefly".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 NativeChatMessage {
                     role: "user".to_string(),
-                    content: "hello native runtime".to_string(),
+                    content: Some(Value::String("hello native runtime".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
             temperature: Some(0.2),
             max_tokens: Some(128),
+            tools: None,
+            tool_choice: None,
             metadata: BTreeMap::new(),
         };
 
@@ -1767,15 +2882,23 @@ mod tests {
             messages: vec![
                 NativeChatMessage {
                     role: "system".to_string(),
-                    content: "answer with operational detail".to_string(),
+                    content: Some(Value::String("answer with operational detail".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 NativeChatMessage {
                     role: "user".to_string(),
-                    content: "summarize native tokenizer accounting status".to_string(),
+                    content: Some(Value::String(
+                        "summarize native tokenizer accounting status".to_string(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
             temperature: None,
             max_tokens: Some(64),
+            tools: None,
+            tool_choice: None,
             metadata: BTreeMap::new(),
         };
 
@@ -1796,10 +2919,38 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_native_embeddings_are_stable_and_marked_non_semantic() {
+        let request = NativeEmbeddingRequest {
+            model: "embed".to_string(),
+            input: vec!["hello".to_string(), "world".to_string()],
+            metadata: BTreeMap::new(),
+        };
+
+        let first = deterministic_native_embeddings(request.clone()).expect("first embeddings");
+        let second = deterministic_native_embeddings(request).expect("second embeddings");
+
+        assert_eq!(first.embeddings, second.embeddings);
+        assert_eq!(first.embeddings.len(), 2);
+        assert_eq!(
+            first.embeddings[0].len(),
+            DETERMINISTIC_EMBEDDING_DIMENSIONS
+        );
+        assert_ne!(first.embeddings[0], first.embeddings[1]);
+        assert_eq!(first.backend, "deterministic-local-fallback");
+        assert_eq!(first.status, "non-semantic-dev-fallback");
+        assert!(!first.semantic);
+        assert_eq!(first.usage.accounting_mode, TokenAccountingMode::Estimated);
+        assert!(first.usage.input_tokens > 0);
+        assert_eq!(first.usage.output_tokens, 0);
+    }
+
+    #[test]
     fn estimated_counter_is_deterministic_and_does_not_claim_exact_tokenization() {
         let messages = vec![NativeChatMessage {
             role: "user".to_string(),
-            content: "repeatable fallback accounting".to_string(),
+            content: Some(Value::String("repeatable fallback accounting".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let first = EstimatedNativeTokenCounter
@@ -1822,11 +2973,15 @@ mod tests {
         let messages = vec![
             NativeChatMessage {
                 role: "system".to_string(),
-                content: "answer briefly".to_string(),
+                content: Some(Value::String("answer briefly".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
             },
             NativeChatMessage {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: Some(Value::String("hello".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -1855,6 +3010,7 @@ mod tests {
             alias: "qwen-coder".to_string(),
             path: PathBuf::from("/home/alice/models/qwen3-coder.safetensors"),
             role: "coding".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
         let resources = ResourceConfig {
@@ -1926,22 +3082,32 @@ mod tests {
         assert_eq!(plan.support.model_family, CandleModelFamily::Qwen3);
         assert_eq!(plan.support.engine, "candle-native-qwen3");
         validate_native_engine_load_plan(&plan).expect("plan contract validates");
-        assert!(plan.scheduler.contract_only);
+        assert!(!plan.scheduler.contract_only);
         assert_eq!(plan.scheduler.queue.discipline, NativeQueueDiscipline::Fifo);
         assert!(plan.scheduler.queue.admission_backpressure);
-        assert!(!plan.scheduler.queue.implemented);
-        assert!(plan.scheduler.batching.continuous_batching);
+        assert!(plan.scheduler.queue.implemented);
+        assert!(!plan.scheduler.batching.continuous_batching);
+        assert!(plan.scheduler.batching.prefill_decode_phase_scheduling);
         assert!(!plan.scheduler.batching.implemented);
         assert_eq!(plan.scheduler.kv_cache.cache_scope, "model-worker");
+        assert_eq!(
+            plan.scheduler.kv_cache.cache_key_metadata_key,
+            "llmctl.scheduler.kv_cache_key"
+        );
+        assert!(!plan.scheduler.kv_cache.reuse_implemented);
         assert!(!plan.scheduler.kv_cache.implemented);
         assert!(plan.scheduler.cancellation.drain_on_cancel);
+        assert!(plan.scheduler.cancellation.admission_check_implemented);
+        assert!(!plan.scheduler.cancellation.decode_loop_check_implemented);
         assert!(!plan.scheduler.cancellation.implemented);
         assert_eq!(plan.budget_fraction, 0.8);
         assert!(plan.implemented);
 
         let rendered = serde_json::to_string(&plan).expect("plan serializes");
         assert!(rendered.contains("llmctl.scheduler.kv_cache_budget_bytes"));
-        assert!(rendered.contains("\"contract_only\":true"));
+        assert!(rendered.contains("llmctl.scheduler.kv_cache_key"));
+        assert!(rendered.contains("request-local-reset"));
+        assert!(rendered.contains("\"contract_only\":false"));
         assert!(!rendered.contains("/home/alice"));
         assert!(!rendered.contains("qwen3-coder.safetensors"));
         assert!(plan
@@ -1987,7 +3153,7 @@ mod tests {
     }
 
     #[test]
-    fn candle_contract_includes_gemma4_kimi_and_eu_friendly_mistral_families() {
+    fn candle_contract_includes_gemma_mistral_and_tracked_target_families() {
         let gemma4 =
             CandleEngineConfig::gemma4(NativeModelFormat::Safetensors, NativeAcceleration::Auto);
         assert_eq!(gemma4.engine, "candle-native-gemma4");
@@ -1999,18 +3165,69 @@ mod tests {
         assert!(gemma4.is_supported());
         assert!(!gemma4.load_contract.fail_closed);
 
+        let deepseek =
+            CandleEngineConfig::deepseek(NativeModelFormat::Safetensors, NativeAcceleration::Auto);
+        assert_eq!(deepseek.engine, "candle-native-deepseek");
+        assert_eq!(
+            deepseek.load_contract.model_family,
+            CandleModelFamily::DeepSeek
+        );
+        assert!(deepseek.is_supported());
+        assert!(!deepseek.load_contract.fail_closed);
+        assert!(deepseek
+            .load_contract
+            .fail_closed_reason
+            .contains("deepseek2::DeepSeekV2"));
+
+        let deepseek_gguf =
+            CandleEngineConfig::deepseek(NativeModelFormat::Gguf, NativeAcceleration::Auto);
+        assert!(!deepseek_gguf.is_supported());
+        assert!(deepseek_gguf.load_contract.fail_closed);
+        assert!(deepseek_gguf.load_contract.supported_operations.is_empty());
+        assert_eq!(
+            deepseek_gguf.load_contract.tokenizer,
+            CandleTokenizerRequirement::UnsupportedFormat
+        );
+        assert!(deepseek_gguf
+            .load_contract
+            .fail_closed_reason
+            .contains("GGUF/quantized DeepSeek"));
+
         let kimi =
             CandleEngineConfig::kimi(NativeModelFormat::Safetensors, NativeAcceleration::Auto);
         assert_eq!(kimi.engine, "candle-native-kimi");
         assert_eq!(kimi.load_contract.model_family, CandleModelFamily::Kimi);
         assert_eq!(
             kimi.load_contract.tokenizer,
-            CandleTokenizerRequirement::TokenizerJson
+            CandleTokenizerRequirement::UnsupportedFormat
         );
-        assert!(kimi.is_supported());
-        assert!(!kimi.load_contract.fail_closed);
+        assert!(!kimi.is_supported());
+        assert!(kimi.load_contract.fail_closed);
+        assert!(kimi
+            .load_contract
+            .fail_closed_reason
+            .contains("models::kimi"));
 
-        let mistral = CandleEngineConfig::mistral(NativeModelFormat::Gguf, NativeAcceleration::Cpu);
+        let minimax =
+            CandleEngineConfig::minimax(NativeModelFormat::Safetensors, NativeAcceleration::Auto);
+        assert_eq!(minimax.engine, "candle-native-minimax");
+        assert_eq!(
+            minimax.load_contract.model_family,
+            CandleModelFamily::MiniMax
+        );
+        assert!(!minimax.is_supported());
+        assert!(minimax.load_contract.fail_closed);
+        assert_eq!(
+            minimax.load_contract.tokenizer,
+            CandleTokenizerRequirement::UnsupportedFormat
+        );
+        assert!(minimax
+            .load_contract
+            .fail_closed_reason
+            .contains("models::minimax"));
+
+        let mistral =
+            CandleEngineConfig::mistral(NativeModelFormat::Safetensors, NativeAcceleration::Cpu);
         assert_eq!(mistral.engine, "candle-native-mistral");
         assert_eq!(
             mistral.load_contract.model_family,
@@ -2018,7 +3235,7 @@ mod tests {
         );
         assert_eq!(
             mistral.load_contract.tokenizer,
-            CandleTokenizerRequirement::GgufMetadata
+            CandleTokenizerRequirement::TokenizerJson
         );
         assert!(mistral.is_supported());
         assert!(mistral.load_contract.fail_closed_reason.contains("mistral"));
@@ -2052,27 +3269,141 @@ mod tests {
     }
 
     #[test]
-    fn candle_artifact_validation_accepts_real_gguf_weight_file_for_all_families() {
+    fn candle_artifact_validation_accepts_real_gguf_weight_file_for_gguf_contracts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let weights = dir.path().join("chat.gguf");
         fs::write(&weights, b"GGUF").expect("write gguf placeholder");
 
-        for family in CandleModelFamily::all() {
+        for family in [CandleModelFamily::Qwen3, CandleModelFamily::Gemma4] {
             let model = ModelConfig {
                 alias: format!("{}-chat", family.as_str()),
                 path: weights.clone(),
                 role: "query".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
             };
 
-            let validation = validate_candle_model_artifacts(*family, &model)
+            let validation = validate_candle_model_artifacts(family, &model)
                 .expect("gguf weight file validates");
 
-            assert_eq!(validation.model_family, *family);
+            assert_eq!(validation.model_family, family);
             assert_eq!(validation.model_format, NativeModelFormat::Gguf);
             assert_eq!(validation.weight_files, vec!["chat.gguf".to_string()]);
             assert_eq!(validation.tokenizer_file, None);
             assert_eq!(validation.config_file, None);
+        }
+    }
+
+    #[test]
+    fn deepseek_gguf_fails_closed_without_claiming_quantized_support() {
+        let factory = NativeCandleEngineFactory::default();
+        let model = ModelConfig {
+            alias: "deepseek-chat".to_string(),
+            path: PathBuf::from("/private/deepseek-v2.gguf"),
+            role: "thinking".to_string(),
+            family: Some("qwen3".to_string()),
+            weight: 1,
+        };
+
+        let err = factory
+            .plan(
+                CandleModelFamily::DeepSeek,
+                &model,
+                &ResourceConfig::default(),
+            )
+            .expect_err("DeepSeek GGUF must not be planned as supported");
+        assert!(err.to_string().contains("does not support model format"));
+
+        let config = CandleEngineConfig::deepseek(NativeModelFormat::Gguf, NativeAcceleration::Cpu);
+        assert_eq!(config.support.model_family, CandleModelFamily::DeepSeek);
+        assert_eq!(
+            config.support.supported_formats,
+            vec![NativeModelFormat::Safetensors]
+        );
+        assert!(config.load_contract.fail_closed);
+        assert!(config.load_contract.supported_operations.is_empty());
+        assert_eq!(
+            config.load_contract.tokenizer,
+            CandleTokenizerRequirement::UnsupportedFormat
+        );
+        assert!(config
+            .load_contract
+            .fail_closed_reason
+            .contains("GGUF/quantized DeepSeek"));
+    }
+
+    #[test]
+    fn native_candle_decoder_rejects_unwired_family_formats_before_loading_artifacts() {
+        for (family, format, reason) in [
+            (
+                CandleModelFamily::DeepSeek,
+                NativeModelFormat::Gguf,
+                "quantized DeepSeek2 model weights",
+            ),
+            (
+                CandleModelFamily::Kimi,
+                NativeModelFormat::Safetensors,
+                "models::kimi",
+            ),
+            (
+                CandleModelFamily::Kimi,
+                NativeModelFormat::Gguf,
+                "quantized Kimi GGUF model weights",
+            ),
+            (
+                CandleModelFamily::MiniMax,
+                NativeModelFormat::Safetensors,
+                "models::minimax",
+            ),
+            (
+                CandleModelFamily::MiniMax,
+                NativeModelFormat::Gguf,
+                "quantized MiniMax GGUF model weights",
+            ),
+        ] {
+            let artifacts = CandleArtifactValidation {
+                model_family: family,
+                model_format: format,
+                layout: CandleArtifactLayout::for_format(format),
+                weight_files: vec![format!("{}.{}", family.as_str(), format.as_str())],
+                tokenizer_file: None,
+                config_file: None,
+            };
+
+            let err = NativeCandleDecoder::load(
+                family,
+                Path::new("/private/placeholder-model-file"),
+                &artifacts,
+            )
+            .expect_err("unwired family/format must fail before artifact loading");
+            assert!(err.to_string().contains(reason), "{err}");
+        }
+    }
+
+    #[test]
+    fn tracked_unwired_family_artifacts_do_not_validate_as_supported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gguf = dir.path().join("model.gguf");
+        fs::write(&gguf, b"GGUF").expect("write gguf placeholder");
+        let safetensors = dir.path().join("model.safetensors");
+        fs::write(&safetensors, b"weights").expect("write safetensors placeholder");
+        fs::write(dir.path().join("tokenizer.json"), b"{}").expect("write tokenizer");
+        fs::write(dir.path().join("config.json"), b"{}").expect("write config");
+
+        for family in [CandleModelFamily::Kimi, CandleModelFamily::MiniMax] {
+            for path in [&gguf, &safetensors] {
+                let model = ModelConfig {
+                    alias: format!("{}-chat", family.as_str()),
+                    path: path.clone(),
+                    role: "thinking".to_string(),
+                    family: Some("qwen3".to_string()),
+                    weight: 1,
+                };
+
+                let err = validate_candle_model_artifacts(family, &model)
+                    .expect_err("tracked family without decoder must not validate artifacts");
+                assert!(err.to_string().contains("artifact format is unsupported"));
+            }
         }
     }
 
@@ -2093,16 +3424,17 @@ mod tests {
         fs::write(dir.path().join("config.json"), b"{}").expect("write config");
 
         let model = ModelConfig {
-            alias: "kimi-chat".to_string(),
+            alias: "deepseek-chat".to_string(),
             path: dir.path().to_path_buf(),
             role: "thinking".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
 
-        let validation = validate_candle_model_artifacts(CandleModelFamily::Kimi, &model)
+        let validation = validate_candle_model_artifacts(CandleModelFamily::DeepSeek, &model)
             .expect("safetensors directory validates");
 
-        assert_eq!(validation.model_family, CandleModelFamily::Kimi);
+        assert_eq!(validation.model_family, CandleModelFamily::DeepSeek);
         assert_eq!(validation.model_format, NativeModelFormat::Safetensors);
         assert_eq!(
             validation.weight_files,
@@ -2126,6 +3458,7 @@ mod tests {
             alias: "gemma-chat".to_string(),
             path: dir.path().join("model.safetensors"),
             role: "query".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
 
@@ -2150,6 +3483,7 @@ mod tests {
             alias: "mistral-chat".to_string(),
             path: dir.path().join("model.safetensors"),
             role: "query".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
 
@@ -2177,6 +3511,7 @@ mod tests {
             alias: "mistral-chat".to_string(),
             path: weights,
             role: "query".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
 
@@ -2210,8 +3545,10 @@ mod tests {
             vec![
                 CandleModelFamily::Qwen3,
                 CandleModelFamily::Gemma4,
+                CandleModelFamily::DeepSeek,
                 CandleModelFamily::Kimi,
                 CandleModelFamily::Mistral,
+                CandleModelFamily::MiniMax,
             ]
         );
 
@@ -2221,32 +3558,41 @@ mod tests {
                 .expect("family is registered");
             assert_eq!(metadata.model_family, *family);
             assert_eq!(metadata.engine, family.engine_name());
-            assert!(metadata
-                .supported_formats
-                .contains(&NativeModelFormat::Safetensors));
-            assert!(metadata
-                .supported_formats
-                .contains(&NativeModelFormat::Gguf));
+            if matches!(family, CandleModelFamily::Kimi | CandleModelFamily::MiniMax) {
+                assert!(metadata.supported_formats.is_empty());
+                assert!(metadata.tokenizer_contracts.is_empty());
+            } else {
+                assert!(metadata
+                    .supported_formats
+                    .contains(&NativeModelFormat::Safetensors));
+            }
             assert!(metadata
                 .supported_accelerators
                 .contains(&NativeAcceleration::Cpu));
-            assert!(metadata
-                .supported_operations
-                .contains(&CandleSupportedOperation::ChatCompletion));
-            assert_eq!(
-                metadata.tokenizer_requirement(NativeModelFormat::Gguf),
-                CandleTokenizerRequirement::GgufMetadata
-            );
+            if family.has_native_decoder() {
+                assert!(metadata
+                    .supported_operations
+                    .contains(&CandleSupportedOperation::ChatCompletion));
+            } else {
+                assert!(metadata.supported_operations.is_empty());
+            }
             assert_eq!(
                 metadata.tokenizer_requirement(NativeModelFormat::Safetensors),
-                CandleTokenizerRequirement::TokenizerJson
+                if matches!(family, CandleModelFamily::Kimi | CandleModelFamily::MiniMax) {
+                    CandleTokenizerRequirement::UnsupportedFormat
+                } else {
+                    CandleTokenizerRequirement::TokenizerJson
+                }
             );
-            assert!(metadata.generation_status.contains(family.as_str()));
+            assert!(metadata
+                .generation_status
+                .to_ascii_lowercase()
+                .contains(family.as_str()));
         }
     }
 
     #[test]
-    fn native_candle_factory_builds_valid_load_plans_for_all_registered_families() {
+    fn native_candle_factory_builds_valid_load_plans_for_runnable_families() {
         let factory = NativeCandleEngineFactory::default();
         let resources = ResourceConfig {
             budget: 0.7,
@@ -2254,23 +3600,29 @@ mod tests {
             gpu_vendor: "nvidia".to_string(),
         };
 
-        for family in CandleModelFamily::all() {
+        for family in [
+            CandleModelFamily::Qwen3,
+            CandleModelFamily::Gemma4,
+            CandleModelFamily::DeepSeek,
+            CandleModelFamily::Mistral,
+        ] {
             let model = ModelConfig {
                 alias: format!("{}-chat", family.as_str()),
-                path: PathBuf::from(format!("/private/{}-model.gguf", family.as_str())),
+                path: PathBuf::from(format!("/private/{}-model.safetensors", family.as_str())),
                 role: "thinking".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
             };
 
             let plan = factory
-                .plan(*family, &model, &resources)
+                .plan(family, &model, &resources)
                 .expect("registered family plans");
 
             assert_eq!(plan.runtime, RuntimeBackend::CandleNative);
             assert_eq!(plan.engine, family.engine_name());
             assert_eq!(plan.family, family.as_str());
-            assert_eq!(plan.support.model_family, *family);
-            assert_eq!(plan.format, NativeModelFormat::Gguf);
+            assert_eq!(plan.support.model_family, family);
+            assert_eq!(plan.format, NativeModelFormat::Safetensors);
             assert_eq!(plan.acceleration, NativeAcceleration::Cpu);
             assert_eq!(plan.device_selection.selected, NativeAcceleration::Cpu);
             assert!(plan.device_selection.fail_closed_if_unavailable);
@@ -2285,12 +3637,57 @@ mod tests {
     }
 
     #[test]
+    fn native_candle_factory_fails_closed_for_tracked_unwired_families() {
+        let factory = NativeCandleEngineFactory::default();
+
+        for family in [CandleModelFamily::Kimi, CandleModelFamily::MiniMax] {
+            for (format, path) in [
+                (
+                    NativeModelFormat::Safetensors,
+                    PathBuf::from(format!("/private/{}-model.safetensors", family.as_str())),
+                ),
+                (
+                    NativeModelFormat::Gguf,
+                    PathBuf::from(format!("/private/{}-model.gguf", family.as_str())),
+                ),
+            ] {
+                let model = ModelConfig {
+                    alias: format!("{}-chat", family.as_str()),
+                    path,
+                    role: "thinking".to_string(),
+                    family: Some("qwen3".to_string()),
+                    weight: 1,
+                };
+
+                let err = factory
+                    .plan(family, &model, &ResourceConfig::default())
+                    .expect_err("unwired family fails closed");
+                assert!(err.to_string().contains("does not support model format"));
+
+                let config =
+                    CandleEngineConfig::for_family(family, format, NativeAcceleration::Auto);
+                assert!(config.load_contract.fail_closed);
+                assert!(config.load_contract.supported_operations.is_empty());
+                assert_eq!(
+                    config.load_contract.tokenizer,
+                    CandleTokenizerRequirement::UnsupportedFormat
+                );
+                assert!(config
+                    .load_contract
+                    .fail_closed_reason
+                    .contains("Candle 0.10.2"));
+            }
+        }
+    }
+
+    #[test]
     fn native_candle_factory_rejects_unactionable_load_plans() {
         let factory = NativeCandleEngineFactory::default();
         let model = ModelConfig {
             alias: "qwen-unknown".to_string(),
             path: PathBuf::from("/private/qwen3.bin"),
             role: "thinking".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
 
@@ -2303,6 +3700,7 @@ mod tests {
             alias: "qwen-ok".to_string(),
             path: PathBuf::from("/private/qwen3.gguf"),
             role: "coding".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
         let mut plan = factory
@@ -2324,6 +3722,7 @@ mod tests {
             alias: "qwen-thinking".to_string(),
             path: PathBuf::from("/secret/qwen3-thinking.gguf"),
             role: "thinking".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         };
         let plan = Qwen3CandleEngineLoader::plan(&model, &ResourceConfig::default())
@@ -2369,18 +3768,21 @@ mod tests {
                 alias: "qwen-think".to_string(),
                 path: PathBuf::from("/models/qwen-thinking.gguf"),
                 role: "thinking".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
             },
             ModelConfig {
                 alias: "qwen-reco".to_string(),
                 path: PathBuf::from("/models/qwen-reco.gguf"),
                 role: "recommendation".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
             },
             ModelConfig {
                 alias: "qwen-code".to_string(),
                 path: PathBuf::from("/models/qwen-code.gguf"),
                 role: "coding".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
             },
         ];
@@ -2480,6 +3882,7 @@ mod tests {
             alias: "qwen-code".to_string(),
             path: PathBuf::from("/private/qwen-code.gguf"),
             role: "coding".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         }];
 

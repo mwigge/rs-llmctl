@@ -1,37 +1,23 @@
 use crate::config::{ApiKeyConfig, Config};
 use anyhow::Result;
+use chrono::Utc;
 use std::collections::BTreeSet;
 
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
     validate_api_keys_are_hashes(&cfg.security.api_keys)?;
     validate_api_key_scopes(&cfg.security.api_keys)?;
+    validate_api_key_metadata(&cfg.security.api_keys)?;
     validate_no_plaintext_observability_secrets(cfg)?;
+    validate_native_tls_config(cfg)?;
+    validate_external_provider_security(cfg)?;
 
     if cfg.security.production || cfg.security.bind_external || cfg.server.host == "0.0.0.0" {
         anyhow::ensure!(
             cfg.security.require_auth && !cfg.security.api_keys.is_empty(),
             "external/production serving requires authentication"
         );
-        anyhow::ensure!(
-            cfg.security.tls_termination.enabled,
-            "external/production serving requires documented TLS termination or mTLS"
-        );
-        anyhow::ensure!(
-            cfg.security
-                .tls_termination
-                .provider
-                .as_deref()
-                .is_some_and(|provider| !provider.trim().is_empty()),
-            "TLS termination must declare a provider"
-        );
-        anyhow::ensure!(
-            cfg.security
-                .tls_termination
-                .evidence
-                .as_deref()
-                .is_some_and(|evidence| !evidence.trim().is_empty()),
-            "TLS termination must declare evidence"
-        );
+        validate_api_keys_for_active_serving(&cfg.security.api_keys)?;
+        validate_external_tls_posture(cfg)?;
         anyhow::ensure!(
             cfg.audit.retention_days > 0,
             "CRA Article 14 active control requires audit retention"
@@ -57,6 +43,129 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_external_provider_security(cfg: &Config) -> Result<()> {
+    if !cfg.external_providers.enabled {
+        return Ok(());
+    }
+
+    for provider in &cfg.external_providers.providers {
+        let url = reqwest::Url::parse(provider.base_url.trim()).map_err(|err| {
+            anyhow::anyhow!(
+                "external provider {} base-url is invalid: {err}",
+                provider.id
+            )
+        })?;
+        if cfg.security.production || cfg.security.bind_external || cfg.server.host == "0.0.0.0" {
+            anyhow::ensure!(
+                url.scheme() == "https",
+                "production external provider {} must use https base-url",
+                provider.id
+            );
+        }
+        anyhow::ensure!(
+            provider
+                .api_key_env
+                .trim()
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'),
+            "external provider {} api-key-env must be an environment variable name",
+            provider.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_external_tls_posture(cfg: &Config) -> Result<()> {
+    if native_tls_has_cert_and_key(cfg) {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        cfg.security.tls_termination.enabled,
+        "external/production serving requires native TLS with cert/key or documented TLS termination or mTLS"
+    );
+    anyhow::ensure!(
+        cfg.security
+            .tls_termination
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().is_empty()),
+        "TLS termination must declare a provider"
+    );
+    anyhow::ensure!(
+        cfg.security
+            .tls_termination
+            .evidence
+            .as_deref()
+            .is_some_and(|evidence| !evidence.trim().is_empty()),
+        "TLS termination must declare evidence"
+    );
+    Ok(())
+}
+
+fn validate_native_tls_config(cfg: &Config) -> Result<()> {
+    if !cfg.server.tls.enabled {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        cfg.server
+            .tls
+            .cert_path
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty()),
+        "server.tls.cert-path is required when server TLS is enabled"
+    );
+    anyhow::ensure!(
+        cfg.server
+            .tls
+            .key_path
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty()),
+        "server.tls.key-path is required when server TLS is enabled"
+    );
+    anyhow::ensure!(
+        !cfg.server.tls.require_client_cert,
+        "server.tls.require-client-cert is not supported without client CA configuration"
+    );
+    Ok(())
+}
+
+fn native_tls_has_cert_and_key(cfg: &Config) -> bool {
+    cfg.server.tls.enabled
+        && cfg
+            .server
+            .tls
+            .cert_path
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty())
+        && cfg
+            .server
+            .tls
+            .key_path
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty())
+        && !cfg.server.tls.require_client_cert
+}
+
+pub fn validate_api_keys_for_active_serving(keys: &[ApiKeyConfig]) -> Result<()> {
+    for key in keys {
+        anyhow::ensure!(
+            key.status != "revoked",
+            "api key `{}` is revoked and must not be present in active serving config",
+            key.id
+        );
+        if let Some(expires_at) = key.expires_at.as_ref() {
+            anyhow::ensure!(
+                *expires_at > Utc::now(),
+                "api key `{}` is expired and must be rotated or removed",
+                key.id
+            );
+        }
+    }
     Ok(())
 }
 
@@ -113,6 +222,35 @@ fn validate_api_keys_are_hashes(keys: &[ApiKeyConfig]) -> Result<()> {
     Ok(())
 }
 
+fn validate_api_key_metadata(keys: &[ApiKeyConfig]) -> Result<()> {
+    for key in keys {
+        anyhow::ensure!(
+            matches!(key.status.as_str(), "active" | "retiring" | "revoked"),
+            "api key `{}` has invalid status `{}`",
+            key.id,
+            key.status
+        );
+        if let Some(last_four) = key.last_four.as_ref() {
+            anyhow::ensure!(
+                last_four.len() == 4
+                    && last_four
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')),
+                "api key `{}` last_four must contain four safe characters",
+                key.id
+            );
+        }
+        if let Some(fingerprint) = key.fingerprint.as_ref() {
+            anyhow::ensure!(
+                !fingerprint.trim().is_empty(),
+                "api key `{}` fingerprint must not be empty",
+                key.id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_api_key_scopes(keys: &[ApiKeyConfig]) -> Result<()> {
     for key in keys {
         anyhow::ensure!(
@@ -155,7 +293,12 @@ fn is_sensitive_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_api_key_scope, is_sensitive_name, is_sha256_hex};
+    use super::{
+        is_allowed_api_key_scope, is_sensitive_name, is_sha256_hex,
+        validate_api_keys_for_active_serving, validate_production_security,
+    };
+    use crate::config::{ApiKeyConfig, Config};
+    use chrono::{Duration, Utc};
 
     #[test]
     fn recognizes_sha256_hex_digests() {
@@ -184,5 +327,55 @@ mod tests {
         assert!(is_allowed_api_key_scope("admin"));
         assert!(!is_allowed_api_key_scope(""));
         assert!(!is_allowed_api_key_scope("models:read"));
+    }
+
+    fn hashed_key() -> ApiKeyConfig {
+        ApiKeyConfig {
+            id: "platform-chat".to_string(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            subject: "platform".to_string(),
+            team: "infra".to_string(),
+            scopes: vec!["chat".to_string()],
+            created_at: None,
+            expires_at: None,
+            rotated_at: None,
+            owner: None,
+            purpose: None,
+            last_four: None,
+            fingerprint: None,
+            status: "active".to_string(),
+        }
+    }
+
+    #[test]
+    fn active_serving_rejects_revoked_key() {
+        let mut key = hashed_key();
+        key.status = "revoked".to_string();
+
+        let err = validate_api_keys_for_active_serving(&[key]).expect_err("revoked key rejected");
+
+        assert!(err.to_string().contains("revoked"));
+    }
+
+    #[test]
+    fn active_serving_rejects_expired_key() {
+        let mut key = hashed_key();
+        key.expires_at = Some(Utc::now() - Duration::minutes(1));
+
+        let err = validate_api_keys_for_active_serving(&[key]).expect_err("expired key rejected");
+
+        assert!(err.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn production_validation_rejects_invalid_key_metadata() {
+        let mut cfg = Config::default();
+        let mut key = hashed_key();
+        key.status = "disabled".to_string();
+        cfg.security.api_keys = vec![key];
+
+        let err = validate_production_security(&cfg).expect_err("invalid status rejected");
+
+        assert!(err.to_string().contains("invalid status"));
     }
 }

@@ -68,15 +68,6 @@ impl WorkerBackend {
             | Self::Metal { gpu_layers } => *gpu_layers,
         }
     }
-
-    fn env(&self) -> Vec<(String, String)> {
-        match self {
-            Self::Cpu => Vec::new(),
-            Self::Nvidia { .. } => vec![("GGML_CUDA_VISIBLE_DEVICES".into(), "0".into())],
-            Self::AmdVulkan { .. } => vec![("GGML_VK_VISIBLE_DEVICES".into(), "0".into())],
-            Self::Metal { .. } => vec![("GGML_METAL".into(), "1".into())],
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,15 +165,12 @@ pub enum WorkerLaunchPlan {
         engine: String,
         implemented: bool,
     },
-    ExternalProcess {
-        backend: RuntimeBackend,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedWorker {
     pub worker: WorkerSpec,
-    #[serde(default = "WorkerLaunchPlan::llama_server")]
+    #[serde(default = "WorkerLaunchPlan::candle_native")]
     pub launch: WorkerLaunchPlan,
     #[serde(default = "WorkerExecutionPlan::cpu")]
     pub execution: WorkerExecutionPlan,
@@ -218,6 +206,7 @@ impl StartupPlan {
         let workers = cfg
             .models
             .iter()
+            .filter(|model| model.weight > 0)
             .cloned()
             .enumerate()
             .map(|(index, model)| {
@@ -229,17 +218,7 @@ impl StartupPlan {
                     &cfg.resources,
                     port_offset,
                 );
-                match cfg.runtime.backend {
-                    RuntimeBackend::CandleNative => PlannedWorker::in_process_candle_native(worker),
-                    RuntimeBackend::LlamaServer => {
-                        let command = LlamaServerCommand::new(
-                            cfg.server.llama_server.clone(),
-                            worker.clone(),
-                        )
-                        .build();
-                        PlannedWorker::external_llama_server(worker, command)
-                    }
-                }
+                PlannedWorker::in_process_candle_native(worker)
             })
             .collect();
 
@@ -302,12 +281,6 @@ impl WorkerLaunchPlan {
         }
     }
 
-    pub fn llama_server() -> Self {
-        Self::ExternalProcess {
-            backend: RuntimeBackend::LlamaServer,
-        }
-    }
-
     pub fn is_in_process(&self) -> bool {
         matches!(self, Self::InProcess { .. })
     }
@@ -320,16 +293,6 @@ impl PlannedWorker {
         Self {
             worker,
             launch: WorkerLaunchPlan::candle_native(),
-            execution,
-            command,
-        }
-    }
-
-    pub fn external_llama_server(worker: WorkerSpec, command: CommandSpec) -> Self {
-        let execution = WorkerExecutionPlan::from_backend(&worker.backend);
-        Self {
-            worker,
-            launch: WorkerLaunchPlan::llama_server(),
             execution,
             command,
         }
@@ -365,40 +328,6 @@ impl CommandSpec {
         }
         command.kill_on_drop(true);
         command
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LlamaServerCommand {
-    program: PathBuf,
-    spec: WorkerSpec,
-}
-
-impl LlamaServerCommand {
-    pub fn new(program: impl Into<PathBuf>, spec: WorkerSpec) -> Self {
-        Self {
-            program: program.into(),
-            spec,
-        }
-    }
-
-    pub fn build(&self) -> CommandSpec {
-        CommandSpec {
-            program: self.program.clone(),
-            args: vec![
-                "--host".to_string(),
-                self.spec.bind_host.clone(),
-                "--port".to_string(),
-                self.spec.port.to_string(),
-                "--model".to_string(),
-                self.spec.model.path.display().to_string(),
-                "--ctx-size".to_string(),
-                self.spec.context_size.to_string(),
-                "--n-gpu-layers".to_string(),
-                self.spec.backend.gpu_layers().to_string(),
-            ],
-            env: self.spec.backend.env(),
-        }
     }
 }
 
@@ -894,7 +823,8 @@ mod tests {
             alias: alias.to_string(),
             path: PathBuf::from(path),
             role: "chat".to_string(),
-            weight: 0,
+            family: Some("qwen3".to_string()),
+            weight: 1,
         }
     }
 
@@ -907,13 +837,7 @@ mod tests {
             context_size: 4096,
             backend: WorkerBackend::Cpu,
         };
-        let command = CommandSpec {
-            program: PathBuf::from("llama-server"),
-            args: vec!["--model".to_string(), format!("/models/{alias}.gguf")],
-            env: vec![("API_TOKEN".to_string(), "super-secret".to_string())],
-        };
-
-        PlannedWorker::external_llama_server(worker, command)
+        PlannedWorker::in_process_candle_native(worker)
     }
 
     fn startup_plan(workers: Vec<PlannedWorker>) -> StartupPlan {
@@ -970,108 +894,6 @@ mod tests {
 
             ready(Ok(())).boxed()
         }
-    }
-
-    #[test]
-    fn builds_cpu_only_llama_server_command_without_spawning() {
-        let spec = WorkerSpec {
-            id: WorkerId::new("tiny"),
-            model: model("tiny", "/models/tiny.gguf"),
-            bind_host: "127.0.0.1".to_string(),
-            port: 18765,
-            context_size: 4096,
-            backend: WorkerBackend::Cpu,
-        };
-
-        let command = LlamaServerCommand::new("llama-server", spec).build();
-
-        assert_eq!(command.program, PathBuf::from("llama-server"));
-        assert_eq!(
-            command.args,
-            vec![
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "18765",
-                "--model",
-                "/models/tiny.gguf",
-                "--ctx-size",
-                "4096",
-                "--n-gpu-layers",
-                "0",
-            ]
-        );
-        assert!(command.env.is_empty());
-    }
-
-    #[test]
-    fn builds_gpu_backend_specific_llama_server_commands() {
-        let model = model("chat", "/models/chat.gguf");
-
-        let nvidia = LlamaServerCommand::new(
-            "/opt/llama-server",
-            WorkerSpec {
-                id: WorkerId::new("chat-cuda"),
-                model: model.clone(),
-                bind_host: "127.0.0.1".to_string(),
-                port: 18766,
-                context_size: 8192,
-                backend: WorkerBackend::Nvidia { gpu_layers: 35 },
-            },
-        )
-        .build();
-        assert_eq!(
-            nvidia.args,
-            vec![
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "18766",
-                "--model",
-                "/models/chat.gguf",
-                "--ctx-size",
-                "8192",
-                "--n-gpu-layers",
-                "35",
-            ]
-        );
-        assert_eq!(
-            nvidia.env,
-            vec![("GGML_CUDA_VISIBLE_DEVICES".into(), "0".into())]
-        );
-
-        let vulkan = LlamaServerCommand::new(
-            "llama-server",
-            WorkerSpec {
-                id: WorkerId::new("chat-vulkan"),
-                model: model.clone(),
-                bind_host: "127.0.0.1".to_string(),
-                port: 18767,
-                context_size: 8192,
-                backend: WorkerBackend::AmdVulkan { gpu_layers: 99 },
-            },
-        )
-        .build();
-        assert_eq!(vulkan.args.last().map(String::as_str), Some("99"));
-        assert_eq!(
-            vulkan.env,
-            vec![("GGML_VK_VISIBLE_DEVICES".into(), "0".into())]
-        );
-
-        let metal = LlamaServerCommand::new(
-            "llama-server",
-            WorkerSpec {
-                id: WorkerId::new("chat-metal"),
-                model,
-                bind_host: "127.0.0.1".to_string(),
-                port: 18768,
-                context_size: 8192,
-                backend: WorkerBackend::Metal { gpu_layers: 48 },
-            },
-        )
-        .build();
-        assert_eq!(metal.args.last().map(String::as_str), Some("48"));
-        assert_eq!(metal.env, vec![("GGML_METAL".into(), "1".into())]);
     }
 
     #[tokio::test]
@@ -1364,16 +1186,11 @@ mod tests {
     }
 
     #[test]
-    fn startup_plan_builds_cpu_only_commands_for_configured_models() {
+    fn startup_plan_builds_cpu_only_in_process_workers_for_configured_models() {
         let cfg = crate::config::Config {
-            runtime: crate::config::RuntimeConfig {
-                backend: RuntimeBackend::LlamaServer,
-                ..crate::config::RuntimeConfig::default()
-            },
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 worker_base_port: 19000,
-                llama_server: "/usr/local/bin/llama-server".to_string(),
                 context_size: 4096,
                 ..ServerConfig::default()
             },
@@ -1417,27 +1234,16 @@ mod tests {
                 .expect("systemd-run arg")
                 .starts_with("--property=MemoryMax=")));
         assert_eq!(plan.workers[0].worker.id, WorkerId::new("chat"));
-        assert_eq!(plan.workers[0].launch, WorkerLaunchPlan::llama_server());
+        assert_eq!(plan.workers[0].launch, WorkerLaunchPlan::candle_native());
         assert_eq!(plan.workers[0].worker.port, 19000);
         assert_eq!(plan.workers[0].worker.backend, WorkerBackend::Cpu);
         assert_eq!(
             plan.workers[0].command.program,
-            PathBuf::from("/usr/local/bin/llama-server")
+            PathBuf::from("<in-process:candle-native>")
         );
         assert_eq!(
             plan.workers[0].command.args,
-            vec![
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "19000",
-                "--model",
-                "/models/chat.gguf",
-                "--ctx-size",
-                "4096",
-                "--n-gpu-layers",
-                "0",
-            ]
+            vec!["--model", "/models/chat.gguf", "--ctx-size", "4096"]
         );
         assert!(plan.workers[0].command.env.is_empty());
         assert_eq!(plan.workers[1].worker.id, WorkerId::new("coder"));
@@ -1445,15 +1251,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_plan_selects_gpu_backend_commands_from_resources() {
+    fn startup_plan_selects_gpu_execution_metadata_from_resources() {
         let cfg = crate::config::Config {
-            runtime: crate::config::RuntimeConfig {
-                backend: RuntimeBackend::LlamaServer,
-                ..crate::config::RuntimeConfig::default()
-            },
             server: ServerConfig {
                 worker_base_port: 19100,
-                llama_server: "llama-server".to_string(),
                 ..ServerConfig::default()
             },
             resources: ResourceConfig {
@@ -1468,7 +1269,7 @@ mod tests {
         let plan = StartupPlan::from_config(&cfg);
 
         assert_eq!(plan.workers.len(), 1);
-        assert_eq!(plan.workers[0].launch, WorkerLaunchPlan::llama_server());
+        assert_eq!(plan.workers[0].launch, WorkerLaunchPlan::candle_native());
         assert_eq!(
             plan.workers[0].worker.backend,
             WorkerBackend::Nvidia { gpu_layers: 99 }
@@ -1484,13 +1285,10 @@ mod tests {
                 gpu_layers: 99,
             }
         );
+        assert!(plan.workers[0].command.env.is_empty());
         assert_eq!(
-            plan.workers[0].command.env,
-            vec![("GGML_CUDA_VISIBLE_DEVICES".into(), "0".into())]
-        );
-        assert_eq!(
-            plan.workers[0].command.args.last().map(String::as_str),
-            Some("99")
+            plan.workers[0].command.program,
+            PathBuf::from("<in-process:candle-native>")
         );
     }
 
@@ -1553,10 +1351,10 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
-                    launch: WorkerLaunchPlan::llama_server(),
+                    launch: WorkerLaunchPlan::candle_native(),
                     execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
-                        program: PathBuf::from("llama-server"),
+                        program: PathBuf::from("<in-process:candle-native>"),
                         args: vec!["--model".to_string(), "/models/chat-v1.gguf".to_string()],
                         env: Vec::new(),
                     },
@@ -1570,10 +1368,10 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
-                    launch: WorkerLaunchPlan::llama_server(),
+                    launch: WorkerLaunchPlan::candle_native(),
                     execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
-                        program: PathBuf::from("llama-server"),
+                        program: PathBuf::from("<in-process:candle-native>"),
                         args: vec!["--model".to_string(), "/models/embed.gguf".to_string()],
                         env: Vec::new(),
                     },
@@ -1592,10 +1390,10 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
-                    launch: WorkerLaunchPlan::llama_server(),
+                    launch: WorkerLaunchPlan::candle_native(),
                     execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
-                        program: PathBuf::from("llama-server"),
+                        program: PathBuf::from("<in-process:candle-native>"),
                         args: vec!["--model".to_string(), "/models/chat-v2.gguf".to_string()],
                         env: Vec::new(),
                     },
@@ -1609,10 +1407,10 @@ mod tests {
                         context_size: 4096,
                         backend: WorkerBackend::Cpu,
                     },
-                    launch: WorkerLaunchPlan::llama_server(),
+                    launch: WorkerLaunchPlan::candle_native(),
                     execution: WorkerExecutionPlan::cpu(),
                     command: CommandSpec {
-                        program: PathBuf::from("llama-server"),
+                        program: PathBuf::from("<in-process:candle-native>"),
                         args: vec!["--model".to_string(), "/models/coder.gguf".to_string()],
                         env: Vec::new(),
                     },

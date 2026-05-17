@@ -1,38 +1,52 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
   <title id="title">rs-llmctl native model matrix</title>
-  <desc id="desc">Qwen3, Gemma, Mistral, and Kimi status in the rs-llmctl Candle-native plan.</desc>
+  <desc id="desc">Qwen3, Gemma, Mistral, DeepSeek, Kimi, and MiniMax status in the rs-llmctl Candle-native plan.</desc>
   <rect width="1280" height="720" fill="#f7f8fa"/>
   <text x="90" y="95" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="700" fill="#17202a">Native model matrix for the MVP</text>
   <text x="90" y="132" font-family="Inter, Arial, sans-serif" font-size="18" fill="#4d5968">Keep the first release small: query, recommendation, thinking, and coding models.</text>
 
   <g font-family="Inter, Arial, sans-serif">
-    <rect x="90" y="190" width="250" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
-    <text x="120" y="245" font-size="27" font-weight="700" fill="#213044">Qwen3</text>
-    <text x="120" y="290" font-size="17" fill="#425164">primary query/thinking/coding</text>
-    <text x="120" y="332" font-size="16" fill="#1f7a4d">native loader wired</text>
-    <text x="120" y="370" font-size="16" fill="#425164">GGUF or safetensors</text>
-    <text x="120" y="408" font-size="16" fill="#425164">exact tokenizer when present</text>
+    <rect x="70" y="190" width="175" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="95" y="245" font-size="25" font-weight="700" fill="#213044">Qwen3</text>
+    <text x="95" y="290" font-size="15" fill="#425164">primary target</text>
+    <text x="95" y="332" font-size="15" fill="#1f7a4d">native wired</text>
+    <text x="95" y="370" font-size="14" fill="#425164">GGUF/safetensors</text>
+    <text x="95" y="408" font-size="14" fill="#425164">exact tokenizer</text>
 
-    <rect x="375" y="190" width="250" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
-    <text x="405" y="245" font-size="27" font-weight="700" fill="#213044">Gemma</text>
-    <text x="405" y="290" font-size="17" fill="#425164">compact recommendation option</text>
-    <text x="405" y="332" font-size="16" fill="#1f7a4d">native loader wired</text>
-    <text x="405" y="370" font-size="16" fill="#425164">family contract tracked</text>
-    <text x="405" y="408" font-size="16" fill="#425164">Candle acceleration path</text>
+    <rect x="265" y="190" width="175" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="290" y="245" font-size="25" font-weight="700" fill="#213044">Gemma</text>
+    <text x="290" y="290" font-size="15" fill="#425164">recommendation</text>
+    <text x="290" y="332" font-size="15" fill="#1f7a4d">native wired</text>
+    <text x="290" y="370" font-size="14" fill="#425164">GGUF/safetensors</text>
+    <text x="290" y="408" font-size="14" fill="#425164">Candle path</text>
 
-    <rect x="660" y="190" width="250" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
-    <text x="690" y="245" font-size="27" font-weight="700" fill="#213044">Mistral</text>
-    <text x="690" y="290" font-size="17" fill="#425164">EU-friendly fallback</text>
-    <text x="690" y="332" font-size="16" fill="#1f7a4d">native loader wired where exposed</text>
-    <text x="690" y="370" font-size="16" fill="#425164">safetensors first</text>
-    <text x="690" y="408" font-size="16" fill="#425164">good small-node target</text>
+    <rect x="460" y="190" width="175" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="485" y="245" font-size="25" font-weight="700" fill="#213044">Mistral</text>
+    <text x="485" y="290" font-size="15" fill="#425164">EU fallback</text>
+    <text x="485" y="332" font-size="15" fill="#1f7a4d">native wired</text>
+    <text x="485" y="370" font-size="14" fill="#425164">safetensors</text>
+    <text x="485" y="408" font-size="14" fill="#425164">small-node target</text>
 
-    <rect x="945" y="190" width="250" height="330" rx="8" fill="#fffdf8" stroke="#d7b36c"/>
-    <text x="975" y="245" font-size="27" font-weight="700" fill="#213044">Kimi</text>
-    <text x="975" y="290" font-size="17" fill="#5f4b22">tracked coding target</text>
-    <text x="975" y="332" font-size="16" fill="#a15c00">blocked pending architecture</text>
-    <text x="975" y="370" font-size="16" fill="#5f4b22">fails closed with action</text>
-    <text x="975" y="408" font-size="16" fill="#5f4b22">ready for reviewed module</text>
+    <rect x="655" y="190" width="175" height="330" rx="8" fill="#ffffff" stroke="#c8ced8"/>
+    <text x="680" y="245" font-size="25" font-weight="700" fill="#213044">DeepSeek</text>
+    <text x="680" y="290" font-size="15" fill="#425164">reasoning target</text>
+    <text x="680" y="332" font-size="15" fill="#1f7a4d">native wired</text>
+    <text x="680" y="370" font-size="14" fill="#425164">safetensors only</text>
+    <text x="680" y="408" font-size="14" fill="#425164">GGUF closed</text>
+
+    <rect x="850" y="190" width="175" height="330" rx="8" fill="#fffdf8" stroke="#d7b36c"/>
+    <text x="875" y="245" font-size="25" font-weight="700" fill="#213044">Kimi</text>
+    <text x="875" y="290" font-size="15" fill="#5f4b22">coding target</text>
+    <text x="875" y="332" font-size="15" fill="#a15c00">blocked</text>
+    <text x="875" y="370" font-size="14" fill="#5f4b22">fails closed</text>
+    <text x="875" y="408" font-size="14" fill="#5f4b22">needs module</text>
+
+    <rect x="1045" y="190" width="175" height="330" rx="8" fill="#fffdf8" stroke="#d7b36c"/>
+    <text x="1070" y="245" font-size="25" font-weight="700" fill="#213044">MiniMax</text>
+    <text x="1070" y="290" font-size="15" fill="#5f4b22">tracked target</text>
+    <text x="1070" y="332" font-size="15" fill="#a15c00">blocked</text>
+    <text x="1070" y="370" font-size="14" fill="#5f4b22">fails closed</text>
+    <text x="1070" y="408" font-size="14" fill="#5f4b22">needs decoder</text>
   </g>
 
   <rect x="250" y="575" width="780" height="68" rx="8" fill="#eaf1fb" stroke="#7a9bd2"/>

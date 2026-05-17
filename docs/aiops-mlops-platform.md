@@ -50,10 +50,12 @@ deployment:
 - Deployment sync for SLO artifacts; today `aiops slo-plan --format
   prometheus` and `--format grafana` render files for operator-managed
   Prometheus and Grafana provisioning.
-- Native Kimi inference. Qwen3, Gemma-family, and Mistral use Candle model
-  constructors where Candle exposes them. Kimi is blocked until Candle exposes a
-  Kimi architecture module or rs-llmctl vendors a reviewed native
-  implementation.
+- Native target-family depth. Qwen3, Gemma-family, Mistral safetensors, and
+  DeepSeek safetensors use Candle model constructors where Candle exposes them.
+  DeepSeek GGUF remains blocked because Candle 0.10.2 does not expose
+  quantized DeepSeek2 weights. Kimi and MiniMax remain blocked until Candle
+  exposes reviewed architecture modules or rs-llmctl vendors maintained
+  implementations.
 - External Sigstore/Rekor publication. Ed25519 signatures and local
   transparency logs are available now; public transparency-log publication is
   optional organization-level integration.
@@ -64,8 +66,8 @@ For a small internal platform, the next high-value path is:
 
 1. Add optional LLM-as-judge and rubric evaluators for eval suites.
 2. Infer lineage IDs from managed model manifests and RAG indexes.
-3. Add native Kimi support once there is a reviewed Candle-compatible
-   architecture implementation.
+3. Add native DeepSeek GGUF, Kimi, and MiniMax support as reviewed
+   Candle-compatible architecture implementations become available.
 4. Add optional apply/push helpers for Prometheus rule files and Grafana
    dashboard provisioning.
 5. Add optional managed transparency-log publication for policy-bundle and

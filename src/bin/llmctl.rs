@@ -9,7 +9,7 @@ use regex::Regex;
 use rs_llmctl::audit::{AuditEvent, ObservationEvent};
 use rs_llmctl::config::{
     self, ApiKeyConfig, Config, DataFabricFormat, EventFormat, LogFormat, Mode, ModelConfig,
-    QuotaConfig, StorageConfig,
+    NativeEmbeddingMode, QuotaConfig, StorageConfig,
 };
 use rs_llmctl::contracts::{self, DatasetKind};
 use rs_llmctl::integrations;
@@ -34,6 +34,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
@@ -53,6 +54,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Init(InitArgs),
+    FirstRun(FirstRunArgs),
     Server {
         #[command(subcommand)]
         command: ServerCommand,
@@ -149,6 +151,46 @@ struct InitArgs {
     tls_evidence: Option<String>,
     #[arg(long)]
     mtls: bool,
+}
+
+#[derive(Debug, Args)]
+struct FirstRunArgs {
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    secret_output: Option<PathBuf>,
+    #[arg(long, default_value = "llmctl")]
+    key_prefix: String,
+    #[arg(long, default_value = "operator-first-run")]
+    api_key_id: String,
+    #[arg(long, default_value = "operator")]
+    subject: String,
+    #[arg(long, default_value = "platform")]
+    team: String,
+    #[arg(long = "scope")]
+    scopes: Vec<String>,
+    #[arg(long)]
+    owner: Option<String>,
+    #[arg(long)]
+    purpose: Option<String>,
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long)]
+    starter_model_path: Option<PathBuf>,
+    #[arg(long, default_value = "qwen")]
+    starter_model_alias: String,
+    #[arg(long, default_value = "chat")]
+    starter_model_role: String,
+    #[arg(long, default_value = "qwen3")]
+    starter_model_family: String,
+    #[arg(long, default_value_t = 1)]
+    starter_model_weight: u32,
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long, default_value = "LLMCTL_API_KEY")]
+    api_key_env: String,
+    #[arg(long)]
+    smoke_question: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -259,6 +301,8 @@ enum RuntimeCommand {
     Heartbeat,
     Placement,
     Route(RuntimeRouteArgs),
+    ValidationPlan(RuntimeValidationPlanArgs),
+    ValidationRun(RuntimeValidationRunArgs),
     Validate,
 }
 
@@ -268,6 +312,24 @@ struct RuntimeRouteArgs {
     model: Option<String>,
     #[arg(long, conflicts_with = "model")]
     role: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeValidationPlanArgs {
+    #[arg(long, default_value_t = 240)]
+    soak_minutes: u64,
+    #[arg(long, default_value_t = 8)]
+    streaming_concurrency: u32,
+    #[arg(long, default_value_t = 3)]
+    rotation_keys: u32,
+    #[arg(long, default_value_t = 16)]
+    quota_concurrency: u32,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeValidationRunArgs {
+    #[arg(long)]
+    evidence_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -289,6 +351,8 @@ struct ModelInstallArgs {
     alias: String,
     #[arg(long, default_value = "chat")]
     role: String,
+    #[arg(long, default_value = "qwen3")]
+    family: String,
     #[arg(long, default_value_t = 1)]
     weight: u32,
     #[arg(long)]
@@ -327,6 +391,8 @@ struct ModelReplaceArgs {
     new_alias: Option<String>,
     #[arg(long)]
     role: Option<String>,
+    #[arg(long)]
+    family: Option<String>,
     #[arg(long)]
     weight: Option<u32>,
     #[arg(long)]
@@ -400,6 +466,8 @@ enum SecurityCommand {
 struct SecurityGenerateKeyArgs {
     #[arg(long, default_value = "llmctl")]
     prefix: String,
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -422,6 +490,14 @@ struct SecurityAddKeyArgs {
     team: String,
     #[arg(long = "scope")]
     scopes: Vec<String>,
+    #[arg(long)]
+    owner: Option<String>,
+    #[arg(long)]
+    purpose: Option<String>,
+    #[arg(long)]
+    expires_at: Option<chrono::DateTime<Utc>>,
+    #[arg(long)]
+    last_four: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -429,13 +505,27 @@ struct SecurityRotateKeyArgs {
     #[arg(long)]
     id: String,
     #[arg(long)]
+    new_id: Option<String>,
+    #[arg(long)]
     sha256: String,
+    #[arg(long)]
+    expires_at: Option<chrono::DateTime<Utc>>,
+    #[arg(long)]
+    last_four: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Debug, Args)]
 struct SecurityRevokeKeyArgs {
     #[arg(long)]
     id: String,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    remove: bool,
 }
 
 #[derive(Debug, Args)]
@@ -873,6 +963,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Init(args) => init(&config_path, args, cli.json).await,
+        Command::FirstRun(args) => first_run(&config_path, args, cli.json).await,
         Command::Server { command } => server_command(&config_path, command, cli.json).await,
         Command::Model { command } => model_command(&config_path, command, cli.json).await,
         Command::Service { command } => service_command(command, cli.json).await,
@@ -947,6 +1038,390 @@ async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
     )
 }
 
+async fn first_run(path: &Path, args: FirstRunArgs, as_json: bool) -> Result<()> {
+    validate_api_key_id(&args.api_key_id)?;
+    validate_first_run_identity(&args)?;
+    let scopes = first_run_scopes(&args);
+    let config_exists = path.exists();
+    let mut cfg = if config_exists {
+        load_config(path).await?
+    } else {
+        first_run_default_config(path, args.data_dir.as_deref())
+    };
+    if let Some(data_dir) = args.data_dir.as_deref() {
+        cfg.storage.db_path = data_dir.join("llmctl.db");
+        cfg.storage.model_dir = data_dir.join("models");
+    }
+
+    let base_url = args
+        .base_url
+        .clone()
+        .unwrap_or_else(|| first_run_base_url(&cfg));
+    let smoke_model = first_run_smoke_model(&cfg, &args);
+    let smoke_question = args
+        .smoke_question
+        .as_deref()
+        .unwrap_or("Reply with only: llmctl smoke ok");
+    let plan = first_run_plan_json(&FirstRunRenderContext {
+        path,
+        cfg: &cfg,
+        args: &args,
+        scopes: &scopes,
+        config_existed: config_exists,
+        base_url: &base_url,
+        smoke_model: &smoke_model,
+        smoke_question,
+    });
+
+    if !args.apply {
+        return emit(as_json, &plan);
+    }
+
+    let secret_output = args
+        .secret_output
+        .as_deref()
+        .context("first-run --apply requires --secret-output so the raw API key is written once outside config")?;
+    if cfg
+        .security
+        .api_keys
+        .iter()
+        .any(|key| key.id == args.api_key_id)
+    {
+        bail!("api key id `{}` already exists", args.api_key_id);
+    }
+
+    let secret = generate_api_key_secret(&args.key_prefix);
+    let sha256 = hex::encode(Sha256::digest(secret.as_bytes()));
+    let last_four = last_four(&secret);
+    let key = ApiKeyConfig {
+        id: args.api_key_id.clone(),
+        sha256,
+        subject: args.subject.clone(),
+        team: args.team.clone(),
+        scopes: scopes.clone(),
+        created_at: Some(Utc::now()),
+        expires_at: None,
+        rotated_at: None,
+        owner: args.owner.clone(),
+        purpose: args
+            .purpose
+            .clone()
+            .or_else(|| Some("first-run operator access".to_string())),
+        last_four: Some(last_four.clone()),
+        fingerprint: None,
+        status: "active".to_string(),
+    };
+    cfg.security.require_auth = true;
+    cfg.security.api_keys.push(key);
+
+    let installed_model = if let Some(model_path) = args.starter_model_path.as_ref() {
+        create_storage_dirs(&cfg.storage).await?;
+        let installed = model::install_model(&ModelInstallRequest {
+            alias: args.starter_model_alias.clone(),
+            source: ModelSource::LocalPath {
+                path: model_path.clone(),
+            },
+            cache_dir: cfg.storage.model_dir.clone(),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: args.starter_model_role.clone(),
+            family: Some(args.starter_model_family.clone()),
+            weight: args.starter_model_weight,
+        })
+        .await?;
+        upsert_model(&mut cfg.models, installed.config.clone());
+        Some(installed)
+    } else {
+        None
+    };
+
+    create_storage_dirs(&cfg.storage).await?;
+    write_secret_file(secret_output, &secret).await?;
+    config::save(path, &cfg).await?;
+    let storage = init_storage(&cfg.storage).await?;
+    for model in &cfg.models {
+        storage.upsert_model(model).await?;
+    }
+
+    emit(
+        as_json,
+        &first_run_applied_json(
+            &FirstRunRenderContext {
+                path,
+                cfg: &cfg,
+                args: &args,
+                scopes: &scopes,
+                config_existed: config_exists,
+                base_url: &base_url,
+                smoke_model: &smoke_model,
+                smoke_question,
+            },
+            secret_output,
+            &last_four,
+            installed_model.as_ref(),
+        ),
+    )
+}
+
+struct FirstRunRenderContext<'a> {
+    path: &'a Path,
+    cfg: &'a Config,
+    args: &'a FirstRunArgs,
+    scopes: &'a [String],
+    config_existed: bool,
+    base_url: &'a str,
+    smoke_model: &'a str,
+    smoke_question: &'a str,
+}
+
+fn first_run_default_config(path: &Path, data_dir: Option<&Path>) -> Config {
+    let mut cfg = Config::default();
+    let state_dir = data_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("rs-llmctl-state")
+    });
+    cfg.storage.db_path = state_dir.join("llmctl.db");
+    cfg.storage.model_dir = state_dir.join("models");
+    cfg.resources.cpu_only = true;
+    cfg
+}
+
+fn validate_first_run_identity(args: &FirstRunArgs) -> Result<()> {
+    if args.subject.trim().is_empty() {
+        bail!("subject must not be empty");
+    }
+    if args.team.trim().is_empty() {
+        bail!("team must not be empty");
+    }
+    if args.key_prefix.trim().is_empty() {
+        bail!("key-prefix must not be empty");
+    }
+    if args.api_key_env.trim().is_empty() {
+        bail!("api-key-env must not be empty");
+    }
+    if args.starter_model_alias.trim().is_empty() {
+        bail!("starter-model-alias must not be empty");
+    }
+    if args.starter_model_role.trim().is_empty() {
+        bail!("starter-model-role must not be empty");
+    }
+    Ok(())
+}
+
+fn first_run_scopes(args: &FirstRunArgs) -> Vec<String> {
+    if args.scopes.is_empty() {
+        vec!["chat".to_string(), "models.read".to_string()]
+    } else {
+        args.scopes.clone()
+    }
+}
+
+fn first_run_base_url(cfg: &Config) -> String {
+    format!("http://{}:{}/v1", cfg.server.host, cfg.server.port)
+}
+
+fn first_run_smoke_model(cfg: &Config, args: &FirstRunArgs) -> String {
+    if args.starter_model_path.is_some() {
+        return args.starter_model_alias.clone();
+    }
+    cfg.models
+        .iter()
+        .find(|model| model.weight > 0)
+        .or_else(|| cfg.models.first())
+        .map(|model| model.alias.clone())
+        .unwrap_or_else(|| args.starter_model_alias.clone())
+}
+
+fn first_run_plan_json(context: &FirstRunRenderContext<'_>) -> Value {
+    json!({
+        "status": "planned",
+        "mode": "dry-run",
+        "side_effects": false,
+        "config": context.path,
+        "config_exists": context.config_existed,
+        "api_key": first_run_api_key_json(context.args, context.scopes, None, None),
+        "starter_model": first_run_starter_model_plan(context.args),
+        "config_changes": {
+            "write_config": true,
+            "require_auth": true,
+            "storage_db_path": context.cfg.storage.db_path,
+            "model_dir": context.cfg.storage.model_dir
+        },
+        "smoke": first_run_smoke_json(
+            context.base_url,
+            context.smoke_model,
+            context.smoke_question,
+            &context.args.api_key_env
+        ),
+        "next_command": format!(
+            "llmctl --config {} first-run --apply --secret-output <secret-file>",
+            context.path.display()
+        )
+    })
+}
+
+fn first_run_applied_json(
+    context: &FirstRunRenderContext<'_>,
+    secret_output: &Path,
+    last_four: &str,
+    installed_model: Option<&model::InstalledModel>,
+) -> Value {
+    json!({
+        "status": "applied",
+        "mode": "apply",
+        "side_effects": true,
+        "config": context.path,
+        "config_existed": context.config_existed,
+        "api_key": first_run_api_key_json(
+            context.args,
+            context.scopes,
+            Some(secret_output),
+            Some(last_four)
+        ),
+        "starter_model": first_run_starter_model_applied(context.args, installed_model),
+        "config_changes": {
+            "wrote_config": true,
+            "require_auth": context.cfg.security.require_auth,
+            "api_keys": context.cfg.security.api_keys.len(),
+            "models": context.cfg.models.len(),
+            "storage_db_path": context.cfg.storage.db_path,
+            "model_dir": context.cfg.storage.model_dir
+        },
+        "smoke": first_run_smoke_json(
+            context.base_url,
+            context.smoke_model,
+            context.smoke_question,
+            &context.args.api_key_env
+        )
+    })
+}
+
+fn first_run_api_key_json(
+    args: &FirstRunArgs,
+    scopes: &[String],
+    secret_output: Option<&Path>,
+    last_four: Option<&str>,
+) -> Value {
+    json!({
+        "action": "generate",
+        "id": args.api_key_id,
+        "subject": args.subject,
+        "team": args.team,
+        "scopes": scopes,
+        "owner": args.owner,
+        "purpose": args.purpose.as_deref().unwrap_or("first-run operator access"),
+        "secret_output": args.secret_output,
+        "secret_written": secret_output.map(|path| path.display().to_string()),
+        "last_four": last_four,
+        "sha256_present": secret_output.is_some(),
+        "config_storage": "sha256-only",
+        "plaintext_secret_storage": false,
+        "print_secret": false
+    })
+}
+
+fn first_run_starter_model_plan(args: &FirstRunArgs) -> Value {
+    match args.starter_model_path.as_ref() {
+        Some(path) => json!({
+            "action": "configure-local",
+            "alias": args.starter_model_alias,
+            "role": args.starter_model_role,
+            "family": args.starter_model_family,
+            "weight": args.starter_model_weight,
+            "path": path,
+            "source_kind": "local",
+            "network": false,
+            "exists": path.exists()
+        }),
+        None => json!({
+            "action": "recommend",
+            "alias": args.starter_model_alias,
+            "role": args.starter_model_role,
+            "family": args.starter_model_family,
+            "weight": args.starter_model_weight,
+            "source_kind": "none",
+            "network": false,
+            "recommendation": "provide --starter-model-path /path/to/model.gguf or run model import-manifest with a verified offline manifest"
+        }),
+    }
+}
+
+fn first_run_starter_model_applied(
+    args: &FirstRunArgs,
+    installed_model: Option<&model::InstalledModel>,
+) -> Value {
+    if let Some(installed) = installed_model {
+        json!({
+            "action": "configured",
+            "alias": installed.alias,
+            "role": installed.config.role,
+            "family": installed.config.family,
+            "weight": installed.config.weight,
+            "path": installed.path,
+            "source_kind": "local",
+            "network": false,
+            "sha256": installed.sha256,
+            "bytes": installed.bytes,
+            "verified": installed.verification.verified
+        })
+    } else {
+        first_run_starter_model_plan(args)
+    }
+}
+
+fn first_run_smoke_json(base_url: &str, model: &str, question: &str, api_key_env: &str) -> Value {
+    json!({
+        "action": "plan",
+        "base_url": base_url,
+        "model": model,
+        "question": question,
+        "api_key_env": api_key_env,
+        "ask_question": {
+            "helper": "ask_question",
+            "crate": "rs-llmctl-client",
+            "environment": {
+                "LLMCTL_BASE_URL": base_url,
+                "api_key_env": api_key_env
+            },
+            "metadata": {
+                "session_id": "first-run-smoke",
+                "purpose": "operator-smoke"
+            }
+        },
+        "openai_compatible": {
+            "method": "POST",
+            "endpoint": "/v1/chat/completions",
+            "url": format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            "headers": [
+                format!("Authorization: Bearer ${api_key_env}"),
+                "Content-Type: application/json"
+            ],
+            "body": {
+                "model": model,
+                "messages": [
+                    { "role": "user", "content": question }
+                ],
+                "metadata": {
+                    "session_id": "first-run-smoke",
+                    "purpose": "operator-smoke"
+                }
+            }
+        }
+    })
+}
+
+fn last_four(value: &str) -> String {
+    value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+}
+
 fn apply_init_profile(cfg: &mut Config, args: &InitArgs) {
     match args.profile {
         InitProfile::LocalDev => {
@@ -986,22 +1461,22 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
             config::validate_production_security(&cfg)?;
             let storage = init_storage(&cfg.storage).await?;
             let telemetry = TelemetryRuntime::install(&cfg, cfg.log.format == LogFormat::Json)?;
+            let engines = load_native_engines_from_config(&cfg)?;
             emit(
                 as_json,
-                &json!({ "status": "ready", "bind": format!("{}:{}", cfg.server.host, cfg.server.port) }),
+                &json!({
+                    "status": if engines.is_empty() { "no_models" } else { "ready" },
+                    "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
+                    "native_engines": engines.len()
+                }),
             )?;
-            let result = if cfg.runtime.backend == runtime::RuntimeBackend::CandleNative {
-                let engines = load_native_engines_from_config(&cfg)?;
-                rs_llmctl::server::serve_with_storage_and_native_engines(
-                    cfg,
-                    storage,
-                    engines,
-                    rs_llmctl::server::shutdown_signal(),
-                )
-                .await
-            } else {
-                rs_llmctl::server::serve_with_storage(cfg, storage).await
-            };
+            let result = rs_llmctl::server::serve_with_storage_and_native_engines(
+                cfg,
+                storage,
+                engines,
+                rs_llmctl::server::shutdown_signal(),
+            )
+            .await;
             let shutdown = telemetry.shutdown();
             result.and(shutdown)
         }
@@ -1044,32 +1519,56 @@ fn load_native_engines_from_config(
         .iter()
         .filter(|model| model.weight > 0)
         .collect::<Vec<_>>();
-    if models.is_empty() {
-        bail!("candle-native runtime requires at least one configured model with weight > 0");
-    }
 
     let factory = native::NativeCandleEngineFactory::default();
     let mut engines = rs_llmctl::server::NativeEngineRegistry::new();
     for model in models {
-        let family = infer_candle_family(model);
-        let plan = factory.plan(family, model, &cfg.resources)?;
-        let engine = factory.load(&plan)?;
+        let engine: Box<dyn native::NativeEngine> =
+            if should_load_native_embedding_engine(cfg, model) {
+                Box::new(native::NativeBertEmbeddingEngine::load(
+                    model.alias.clone(),
+                    &model.path,
+                )?)
+            } else {
+                let family = configured_candle_family(model)?;
+                let plan = factory.plan(family, model, &cfg.resources)?;
+                factory.load(&plan)?
+            };
         engines.insert(model.alias.clone(), std::sync::Arc::from(engine));
     }
     Ok(engines)
 }
 
-fn infer_candle_family(model: &ModelConfig) -> native::CandleModelFamily {
-    let haystack =
-        format!("{} {} {}", model.alias, model.role, model.path.display()).to_ascii_lowercase();
-    if haystack.contains("gemma") {
-        native::CandleModelFamily::Gemma4
-    } else if haystack.contains("kimi") {
-        native::CandleModelFamily::Kimi
-    } else if haystack.contains("mistral") {
-        native::CandleModelFamily::Mistral
-    } else {
-        native::CandleModelFamily::Qwen3
+fn should_load_native_embedding_engine(cfg: &Config, model: &ModelConfig) -> bool {
+    if cfg.runtime.embeddings.mode != NativeEmbeddingMode::Semantic {
+        return false;
+    }
+    cfg.runtime
+        .embeddings
+        .model_alias
+        .as_deref()
+        .map(|alias| alias == model.alias)
+        .unwrap_or_else(|| model.role.eq_ignore_ascii_case("embedding"))
+}
+
+fn configured_candle_family(model: &ModelConfig) -> Result<native::CandleModelFamily> {
+    let family = model.family.as_deref().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "model {} must set family for native Candle loading; supported families are qwen3, gemma4, deepseek, mistral, kimi, minimax",
+            model.alias
+        )
+    })?;
+    match family.to_ascii_lowercase().as_str() {
+        "qwen3" | "qwen" => Ok(native::CandleModelFamily::Qwen3),
+        "gemma4" | "gemma3" | "gemma" => Ok(native::CandleModelFamily::Gemma4),
+        "deepseek" | "deepseek2" => Ok(native::CandleModelFamily::DeepSeek),
+        "mistral" => Ok(native::CandleModelFamily::Mistral),
+        "kimi" => Ok(native::CandleModelFamily::Kimi),
+        "minimax" | "mini-max" => Ok(native::CandleModelFamily::MiniMax),
+        other => bail!(
+            "model {} has unsupported native Candle family {other}; supported families are qwen3, gemma4, deepseek, mistral, kimi, minimax",
+            model.alias
+        ),
     }
 }
 
@@ -1085,6 +1584,7 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
                 copy_to_cache: args.copy,
                 expected_sha256: args.sha256,
                 role: args.role.clone(),
+                family: Some(args.family.clone()),
                 weight: args.weight,
             })
             .await?;
@@ -1326,6 +1826,33 @@ async fn runtime_command(path: &Path, command: RuntimeCommand, as_json: bool) ->
             };
             emit(as_json, &selection)
         }
+        RuntimeCommand::ValidationPlan(args) => emit(
+            as_json,
+            &runtime::native_validation_plan(
+                &cfg,
+                runtime::NativeRuntimeValidationOptions {
+                    soak_minutes: args.soak_minutes,
+                    streaming_concurrency: args.streaming_concurrency,
+                    rotation_keys: args.rotation_keys,
+                    quota_concurrency: args.quota_concurrency,
+                },
+            ),
+        ),
+        RuntimeCommand::ValidationRun(args) => {
+            let evidence = runtime_validation_run(&cfg).await;
+            if let Some(path) = args.evidence_output.as_ref() {
+                write_json_file(path, &evidence).await?;
+            }
+            let failed = evidence["checks"]
+                .as_array()
+                .map(|checks| checks.iter().any(|check| check["status"] != "ok"))
+                .unwrap_or(true);
+            emit(as_json, &evidence)?;
+            if failed {
+                bail!("native runtime validation failed; inspect validation-run evidence");
+            }
+            Ok(())
+        }
         RuntimeCommand::Validate => {
             let placement = native::placement_plan_from_config(&cfg);
             native::validate_placement_plan(&placement)?;
@@ -1339,6 +1866,50 @@ async fn runtime_command(path: &Path, command: RuntimeCommand, as_json: bool) ->
                 }),
             )
         }
+    }
+}
+
+async fn runtime_validation_run(cfg: &Config) -> Value {
+    let mut checks = Vec::new();
+    let placement = native::placement_plan_from_config(cfg);
+    checks.push(validation_check(
+        "placement",
+        native::validate_placement_plan(&placement).map(|_| ()),
+    ));
+
+    let runnable_models = cfg.models.iter().filter(|model| model.weight > 0);
+    let mut runnable_count = 0usize;
+    for model in runnable_models {
+        runnable_count += 1;
+        let result = configured_candle_family(model)
+            .and_then(|family| native::validate_candle_model_artifacts(family, model).map(|_| ()));
+        checks.push(validation_check(
+            &format!("artifact:{}", model.alias),
+            result,
+        ));
+    }
+    if runnable_count == 0 {
+        checks.push(json!({
+            "name": "artifacts",
+            "status": "failed",
+            "error": "no positive-weight native models are configured",
+        }));
+    }
+
+    let failed = checks.iter().any(|check| check["status"] != "ok");
+    json!({
+        "status": if failed { "failed" } else { "ok" },
+        "runtime_backend": rs_llmctl::runtime::RuntimeBackend::CandleNative,
+        "executable": true,
+        "models_checked": runnable_count,
+        "checks": checks,
+    })
+}
+
+fn validation_check(name: &str, result: Result<()>) -> Value {
+    match result {
+        Ok(()) => json!({ "name": name, "status": "ok" }),
+        Err(err) => json!({ "name": name, "status": "failed", "error": err.to_string() }),
     }
 }
 
@@ -1500,12 +2071,25 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
         SecurityCommand::GenerateKey(args) => {
             let secret = generate_api_key_secret(&args.prefix);
             let sha256 = hex::encode(Sha256::digest(secret.as_bytes()));
+            let last_four = secret
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            if let Some(output) = args.output.as_ref() {
+                write_secret_file(output, &secret).await?;
+            }
             emit(
                 as_json,
                 &json!({
                     "status": "generated",
-                    "secret": secret,
+                    "secret": if args.output.is_none() { Some(secret.as_str()) } else { None },
+                    "secret_written": args.output.as_ref().map(|path| path.display().to_string()),
                     "sha256": sha256,
+                    "last_four": last_four,
                     "metadata": {
                         "purpose": "api-key",
                         "algorithm": "sha256",
@@ -1541,20 +2125,95 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
             let mut cfg = load_config(path).await?;
             let sha256 = args.sha256.to_ascii_lowercase();
             validate_sha256_digest(&sha256)?;
-            let Some(key) = cfg
+            let Some(position) = cfg
                 .security
                 .api_keys
-                .iter_mut()
-                .find(|key| key.id == args.id)
+                .iter()
+                .position(|key| key.id == args.id)
             else {
                 bail!("api key id `{}` was not found", args.id);
             };
+            if let Some(new_id) = args.new_id.as_ref() {
+                validate_api_key_id(new_id)?;
+                if cfg.security.api_keys.iter().any(|key| key.id == *new_id) {
+                    bail!("api key id `{new_id}` already exists");
+                }
+                let now = Utc::now();
+                let mut retiring = cfg.security.api_keys[position].clone();
+                retiring.status = "retiring".to_string();
+                retiring.rotated_at = Some(now);
+                cfg.security.api_keys[position] = retiring.clone();
+                let replacement = ApiKeyConfig {
+                    id: new_id.clone(),
+                    sha256,
+                    subject: retiring.subject,
+                    team: retiring.team,
+                    scopes: retiring.scopes,
+                    created_at: Some(now),
+                    expires_at: args.expires_at,
+                    rotated_at: None,
+                    owner: retiring.owner,
+                    purpose: retiring.purpose,
+                    last_four: args.last_four,
+                    fingerprint: None,
+                    status: "active".to_string(),
+                };
+                cfg.security.api_keys.push(replacement);
+                config::save(path, &cfg).await?;
+                record_security_key_event(
+                    &cfg,
+                    "security.api_key.rotate",
+                    new_id,
+                    "rotated",
+                    json!({
+                        "api_key_id": args.id,
+                        "new_api_key_id": new_id,
+                        "mode": "overlap",
+                        "reason": args.reason,
+                        "old_status": "retiring"
+                    }),
+                )
+                .await?;
+                emit(
+                    as_json,
+                    &json!({
+                        "status": "rotated",
+                        "mode": "overlap",
+                        "retiring_id": args.id,
+                        "active_id": new_id,
+                        "restart_required": true,
+                        "restart_hint": default_restart_hint()
+                    }),
+                )?;
+                return Ok(());
+            }
+            if !args.replace {
+                bail!("rotate-key requires --new-id for overlap rotation or --replace for in-place replacement");
+            }
+            let key = &mut cfg.security.api_keys[position];
             key.sha256 = sha256;
+            key.rotated_at = Some(Utc::now());
+            key.expires_at = args.expires_at.or(key.expires_at);
+            key.last_four = args.last_four.or_else(|| key.last_four.clone());
+            key.status = "active".to_string();
             config::save(path, &cfg).await?;
+            record_security_key_event(
+                &cfg,
+                "security.api_key.rotate",
+                &args.id,
+                "rotated",
+                json!({
+                    "api_key_id": args.id,
+                    "mode": "replace",
+                    "reason": args.reason
+                }),
+            )
+            .await?;
             emit(
                 as_json,
                 &json!({
                     "status": "rotated",
+                    "mode": "replace",
                     "id": args.id,
                     "sha256_present": true,
                     "restart_required": true,
@@ -1564,12 +2223,34 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
         }
         SecurityCommand::RevokeKey(args) => {
             let mut cfg = load_config(path).await?;
-            let before = cfg.security.api_keys.len();
-            cfg.security.api_keys.retain(|key| key.id != args.id);
-            if cfg.security.api_keys.len() == before {
+            let Some(position) = cfg
+                .security
+                .api_keys
+                .iter()
+                .position(|key| key.id == args.id)
+            else {
                 bail!("api key id `{}` was not found", args.id);
-            }
+            };
+            let removed = cfg.security.api_keys.remove(position);
             config::save(path, &cfg).await?;
+            record_security_key_event(
+                &cfg,
+                "security.api_key.revoke",
+                &args.id,
+                "revoked",
+                json!({
+                    "api_key_id": args.id,
+                    "reason": args.reason,
+                    "removed": true,
+                    "remove_requested": args.remove,
+                    "subject": removed.subject,
+                    "team": removed.team,
+                    "owner": removed.owner,
+                    "purpose": removed.purpose,
+                    "previous_status": removed.status
+                }),
+            )
+            .await?;
             emit(
                 as_json,
                 &json!({
@@ -1597,6 +2278,14 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                 subject: args.subject,
                 team: args.team,
                 scopes: args.scopes,
+                created_at: Some(Utc::now()),
+                expires_at: args.expires_at,
+                rotated_at: None,
+                owner: args.owner,
+                purpose: args.purpose,
+                last_four: args.last_four,
+                fingerprint: None,
+                status: "active".to_string(),
             };
             let action = upsert_api_key(&mut cfg.security.api_keys, key.clone());
             config::save(path, &cfg).await?;
@@ -1611,6 +2300,12 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                         "subject": key.subject,
                         "team": key.team,
                         "scopes": key.scopes,
+                        "owner": key.owner,
+                        "purpose": key.purpose,
+                        "created_at": key.created_at,
+                        "expires_at": key.expires_at,
+                        "last_four": key.last_four,
+                        "status": key.status,
                         "sha256_present": true
                     }
                 }),
@@ -1639,6 +2334,31 @@ fn generate_api_key_secret(prefix: &str) -> String {
     format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+async fn write_secret_file(path: &Path, secret: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create secret directory {}", parent.display()))?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .with_context(|| format!("create api key secret file {}", path.display()))?;
+    file.write_all(secret.as_bytes())
+        .await
+        .with_context(|| format!("write api key secret file {}", path.display()))?;
+    file.write_all(b"\n")
+        .await
+        .with_context(|| format!("write api key secret file {}", path.display()))?;
+    Ok(())
+}
+
 fn api_key_inventory_report(cfg: &Config) -> Value {
     json!({
         "status": "ok",
@@ -1649,6 +2369,14 @@ fn api_key_inventory_report(cfg: &Config) -> Value {
                 "subject": key.subject,
                 "team": key.team,
                 "scopes": key.scopes,
+                "owner": key.owner,
+                "purpose": key.purpose,
+                "created_at": key.created_at,
+                "expires_at": key.expires_at,
+                "rotated_at": key.rotated_at,
+                "last_four": key.last_four,
+                "fingerprint": key.fingerprint,
+                "status": key.status,
                 "sha256_present": !key.sha256.trim().is_empty()
             })
         }).collect::<Vec<_>>()
@@ -1658,8 +2386,33 @@ fn api_key_inventory_report(cfg: &Config) -> Value {
 async fn api_key_usage_report(storage: &Storage, id: Option<&str>, hours: i64) -> Result<Value> {
     let now = Utc::now();
     let from = now - Duration::hours(hours.max(1));
-    let audit_events = storage.audit_events_between(from, now).await?;
+    let key_usage = storage.api_key_usage_between(from, now).await?;
     let mut by_key: BTreeMap<String, ApiKeyUsageSummary> = BTreeMap::new();
+    for record in key_usage {
+        if id.is_some_and(|expected| expected != record.api_key_id) {
+            continue;
+        }
+        let summary = by_key.entry(record.api_key_id.clone()).or_default();
+        summary.request_count = summary.request_count.saturating_add(1);
+        if record.audit_outcome != "ok" && record.audit_outcome != "allowed" {
+            summary.error_count = summary.error_count.saturating_add(1);
+        }
+        summary.last_seen = Some(
+            summary
+                .last_seen
+                .map_or(record.usage_at, |last| last.max(record.usage_at)),
+        );
+        summary.input_tokens = summary.input_tokens.saturating_add(record.input_tokens);
+        summary.output_tokens = summary.output_tokens.saturating_add(record.output_tokens);
+        summary.total_tokens = summary.total_tokens.saturating_add(record.total_tokens);
+        summary.latency_ms = summary.latency_ms.saturating_add(record.latency_ms);
+        summary.actors.insert(record.actor);
+        summary.teams.insert(record.team);
+        summary.models.insert(record.model);
+        summary.statuses.insert(record.status);
+    }
+
+    let audit_events = storage.audit_events_between(from, now).await?;
     for event in audit_events {
         let Some(key_id) = event.detail_json.get("api_key_id").and_then(Value::as_str) else {
             continue;
@@ -1668,19 +2421,16 @@ async fn api_key_usage_report(storage: &Storage, id: Option<&str>, hours: i64) -
             continue;
         }
         let summary = by_key.entry(key_id.to_string()).or_default();
-        summary.request_count = summary.request_count.saturating_add(1);
-        if event.outcome != "ok" && event.outcome != "allowed" {
-            summary.error_count = summary.error_count.saturating_add(1);
-        }
+        summary.audit_event_count = summary.audit_event_count.saturating_add(1);
+        summary.actions.insert(event.action);
+        summary.resources.insert(event.resource);
+        summary.actors.insert(event.actor);
+        summary.teams.insert(event.team);
         summary.last_seen = Some(
             summary
                 .last_seen
                 .map_or(event.at, |last| last.max(event.at)),
         );
-        summary.actors.insert(event.actor);
-        summary.teams.insert(event.team);
-        summary.actions.insert(event.action);
-        summary.resources.insert(event.resource);
     }
 
     Ok(json!({
@@ -1692,10 +2442,17 @@ async fn api_key_usage_report(storage: &Storage, id: Option<&str>, hours: i64) -
             json!({
                 "id": key_id,
                 "request_count": summary.request_count,
+                "audit_event_count": summary.audit_event_count,
                 "error_count": summary.error_count,
+                "input_tokens": summary.input_tokens,
+                "output_tokens": summary.output_tokens,
+                "total_tokens": summary.total_tokens,
+                "latency_ms": summary.latency_ms,
                 "last_seen": summary.last_seen,
                 "actors": summary.actors.into_iter().collect::<Vec<_>>(),
                 "teams": summary.teams.into_iter().collect::<Vec<_>>(),
+                "models": summary.models.into_iter().collect::<Vec<_>>(),
+                "statuses": summary.statuses.into_iter().collect::<Vec<_>>(),
                 "actions": summary.actions.into_iter().collect::<Vec<_>>(),
                 "resources": summary.resources.into_iter().collect::<Vec<_>>()
             })
@@ -1706,10 +2463,17 @@ async fn api_key_usage_report(storage: &Storage, id: Option<&str>, hours: i64) -
 #[derive(Debug, Default)]
 struct ApiKeyUsageSummary {
     request_count: u64,
+    audit_event_count: u64,
     error_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    latency_ms: u64,
     last_seen: Option<chrono::DateTime<Utc>>,
     actors: std::collections::BTreeSet<String>,
     teams: std::collections::BTreeSet<String>,
+    models: std::collections::BTreeSet<String>,
+    statuses: std::collections::BTreeSet<String>,
     actions: std::collections::BTreeSet<String>,
     resources: std::collections::BTreeSet<String>,
 }
@@ -2283,13 +3047,13 @@ fn aiops_gaps_report() -> serde_json::Value {
             "runtime request-to-lineage joins for chat, local search, and recommendations",
             "Prometheus/Alertmanager rules and Grafana dashboard renderers for SLOs",
             "HMAC policy bundles plus Ed25519 policy signatures and hash-chained transparency logs",
-            "Candle-native greedy autoregressive decoding for Qwen3, Gemma-family, and Mistral safetensors/GGUF paths where Candle exposes model support"
+            "Candle-native greedy autoregressive decoding for Qwen3, Gemma-family, and Mistral safetensors paths where Candle exposes model support"
         ],
         "gaps": [
             {
                 "area": "native-inference",
-                "gap": "Kimi remains a tracked native backend gap because Candle 0.10.2 does not expose a Kimi architecture module to instantiate",
-                "next_control": "upgrade Candle when Kimi lands upstream or vendor a reviewed Kimi model implementation behind the NativeCandleDecoder"
+                "gap": "DeepSeek, Kimi, and MiniMax remain tracked native backend targets; DeepSeek metadata exists in Candle but is not wired and verified, while Kimi and MiniMax do not expose reviewed Candle architecture modules to instantiate",
+                "next_control": "wire DeepSeek first if Candle deepseek2 maps cleanly to the target artifacts, then upgrade Candle or vendor reviewed Kimi and MiniMax model implementations behind the NativeCandleDecoder"
             },
             {
                 "area": "observability",
@@ -3424,6 +4188,26 @@ async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
     Storage::connect_config(storage).await
 }
 
+async fn record_security_key_event(
+    cfg: &Config,
+    action: &str,
+    resource: &str,
+    outcome: &str,
+    detail_json: Value,
+) -> Result<()> {
+    let storage = init_storage(&cfg.storage).await?;
+    let event = AuditEvent::new(
+        None,
+        "llmctl-cli",
+        "security",
+        action,
+        resource,
+        outcome,
+        detail_json,
+    );
+    storage.insert_audit_event(&event).await
+}
+
 async fn persist_models(path: &Path, cfg: &Config) -> Result<()> {
     config::save(path, cfg).await?;
 
@@ -3511,9 +4295,9 @@ fn plan_service_lifecycle(
     action: ServiceLifecycleAction,
     args: &ServiceLifecycleArgs,
 ) -> ServiceLifecyclePlan {
-    let scope = if args.system { "system" } else { "user" };
+    let scope = if args.user { "user" } else { "system" };
     let service_name = normalize_service_name(&args.service_name);
-    let systemctl_scope = if args.system { None } else { Some("--user") };
+    let systemctl_scope = if args.user { Some("--user") } else { None };
     let commands = service_systemctl_verbs(action)
         .into_iter()
         .map(|verb| {
@@ -3559,6 +4343,7 @@ fn service_systemctl_verbs(action: ServiceLifecycleAction) -> Vec<&'static str> 
 }
 
 async fn execute_service_lifecycle(plan: ServiceLifecyclePlan) -> Result<ServiceLifecycleResult> {
+    ensure_service_lifecycle_allowed(&plan)?;
     let mut results = Vec::new();
     for command in &plan.commands {
         let output = TokioCommand::new(&command.program)
@@ -3591,6 +4376,24 @@ async fn execute_service_lifecycle(plan: ServiceLifecyclePlan) -> Result<Service
     })
 }
 
+fn ensure_service_lifecycle_allowed(plan: &ServiceLifecyclePlan) -> Result<()> {
+    if plan.dry_run || plan.scope != "system" || current_uid().unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    bail!(
+        "system service scope requires root or polkit authorization; rerun with sudo or pass --user for a user-scoped service"
+    )
+}
+
+fn current_uid() -> Option<u32> {
+    let status = stdfs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|uid| uid.parse::<u32>().ok())
+    })
+}
+
 fn normalize_service_name(service_name: &str) -> String {
     let trimmed = service_name.trim();
     if trimmed.ends_with(".service") {
@@ -3601,7 +4404,7 @@ fn normalize_service_name(service_name: &str) -> String {
 }
 
 fn default_restart_hint() -> String {
-    restart_hint("user", DEFAULT_SERVICE_NAME)
+    restart_hint("system", DEFAULT_SERVICE_NAME)
 }
 
 fn one_binary_entrypoint() -> OneBinaryEntrypoint {
@@ -3641,6 +4444,7 @@ async fn replace_model(
         .with_context(|| format!("model alias '{}' is not configured", args.alias))?;
     let target_alias = args.new_alias.unwrap_or_else(|| previous.alias.clone());
     let role = args.role.unwrap_or_else(|| previous.role.clone());
+    let family = args.family.or_else(|| previous.family.clone());
     let weight = args.weight.unwrap_or(previous.weight);
 
     if args.dry_run {
@@ -3675,6 +4479,7 @@ async fn replace_model(
         copy_to_cache: args.copy,
         expected_sha256: args.sha256,
         role,
+        family,
         weight,
     })
     .await?;
@@ -3823,15 +4628,26 @@ fn upsert_api_key(keys: &mut Vec<ApiKeyConfig>, key: ApiKeyConfig) -> &'static s
 }
 
 fn validate_add_key_args(id: &str, sha256: &str, subject: &str, team: &str) -> Result<()> {
-    if id.trim().is_empty() {
-        bail!("id must not be empty");
-    }
+    validate_api_key_id(id)?;
     validate_sha256_digest(sha256)?;
     if subject.trim().is_empty() {
         bail!("subject must not be empty");
     }
     if team.trim().is_empty() {
         bail!("team must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_api_key_id(id: &str) -> Result<()> {
+    if id.trim().is_empty() {
+        bail!("api key id must not be empty");
+    }
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("api key id must contain only ASCII letters, digits, dash, underscore, or dot");
     }
     Ok(())
 }
@@ -3908,6 +4724,9 @@ fn quota_status_principal(quotas: &[QuotaConfig], args: &QuotaStatusArgs) -> Pri
         team,
         scopes: vec![],
         key_id: None,
+        key_owner: None,
+        key_purpose: None,
+        key_status: None,
     }
 }
 
@@ -4008,27 +4827,42 @@ async fn audit_config_report(
         findings.push("external/production serving requires authentication".to_string());
     }
     if cfg.security.production || external_bind {
-        if !cfg.security.tls_termination.enabled {
+        let native_tls = cfg.server.tls.enabled
+            && cfg
+                .server
+                .tls
+                .cert_path
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty())
+            && cfg
+                .server
+                .tls
+                .key_path
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty());
+        if !native_tls && !cfg.security.tls_termination.enabled {
             findings.push(
-                "external/production serving requires documented TLS termination or mTLS"
+                "external/production serving requires native TLS or documented TLS termination or mTLS"
                     .to_string(),
             );
         }
-        if cfg
-            .security
-            .tls_termination
-            .provider
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
+        if !native_tls
+            && cfg
+                .security
+                .tls_termination
+                .provider
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
         {
             findings.push("TLS termination must declare a provider".to_string());
         }
-        if cfg
-            .security
-            .tls_termination
-            .evidence
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
+        if !native_tls
+            && cfg
+                .security
+                .tls_termination
+                .evidence
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
         {
             findings.push("TLS termination must declare evidence".to_string());
         }

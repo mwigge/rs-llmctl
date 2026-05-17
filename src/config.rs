@@ -44,6 +44,8 @@ pub struct Config {
     pub data_fabric: DataFabricConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default, rename = "external-providers", alias = "external_providers")]
+    pub external_providers: ExternalProvidersConfig,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
     #[serde(default)]
@@ -66,6 +68,7 @@ impl Default for Config {
             events: EventConfig::default(),
             data_fabric: DataFabricConfig::default(),
             audit: AuditConfig::default(),
+            external_providers: ExternalProvidersConfig::default(),
             models: vec![],
             quotas: vec![],
         }
@@ -77,6 +80,8 @@ impl Default for Config {
 pub struct RuntimeConfig {
     pub backend: RuntimeBackend,
     pub heartbeat_interval_seconds: u64,
+    pub embeddings: NativeEmbeddingRuntimeConfig,
+    pub scheduler: NativeSchedulerRuntimeConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -84,6 +89,64 @@ impl Default for RuntimeConfig {
         Self {
             backend: RuntimeBackend::CandleNative,
             heartbeat_interval_seconds: 30,
+            embeddings: NativeEmbeddingRuntimeConfig::default(),
+            scheduler: NativeSchedulerRuntimeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct NativeSchedulerRuntimeConfig {
+    pub max_concurrent_requests: usize,
+    pub max_queued_requests: usize,
+    pub max_batch_size: usize,
+    pub max_batch_wait_ms: u64,
+    pub kv_cache_budget_bytes: u64,
+}
+
+impl Default for NativeSchedulerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 1,
+            max_queued_requests: 127,
+            max_batch_size: 1,
+            max_batch_wait_ms: 0,
+            kv_cache_budget_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct NativeEmbeddingRuntimeConfig {
+    pub mode: NativeEmbeddingMode,
+    #[serde(alias = "model_alias")]
+    pub model_alias: Option<String>,
+}
+
+impl Default for NativeEmbeddingRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            mode: NativeEmbeddingMode::Semantic,
+            model_alias: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeEmbeddingMode {
+    #[default]
+    Semantic,
+    DevFallback,
+}
+
+impl NativeEmbeddingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::DevFallback => "dev-fallback",
         }
     }
 }
@@ -125,11 +188,13 @@ impl Default for ClusterNodeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    #[serde(default)]
+    pub tls: ServerTlsConfig,
     pub worker_base_port: u16,
-    pub llama_server: String,
     pub context_size: u32,
     #[serde(default = "default_upstream_timeout_seconds")]
     pub upstream_timeout_seconds: u64,
@@ -150,8 +215,8 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8765,
+            tls: ServerTlsConfig::default(),
             worker_base_port: 18765,
-            llama_server: "llama-server".to_string(),
             context_size: 8192,
             upstream_timeout_seconds: default_upstream_timeout_seconds(),
             graceful_drain_seconds: default_graceful_drain_seconds(),
@@ -161,6 +226,18 @@ impl Default for ServerConfig {
             cors_allowed_origins: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ServerTlsConfig {
+    pub enabled: bool,
+    #[serde(alias = "cert_path")]
+    pub cert_path: Option<PathBuf>,
+    #[serde(alias = "key_path")]
+    pub key_path: Option<PathBuf>,
+    #[serde(alias = "require_client_cert")]
+    pub require_client_cert: bool,
 }
 
 fn default_upstream_timeout_seconds() -> u64 {
@@ -223,13 +300,50 @@ pub struct TlsTerminationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ApiKeyConfig {
     pub id: String,
     pub sha256: String,
     pub subject: String,
     pub team: String,
     pub scopes: Vec<String>,
+    #[serde(alias = "created_at")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(alias = "expires_at")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(alias = "rotated_at")]
+    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub owner: Option<String>,
+    pub purpose: Option<String>,
+    #[serde(alias = "last_four")]
+    pub last_four: Option<String>,
+    pub fingerprint: Option<String>,
+    #[serde(default = "default_api_key_status")]
+    pub status: String,
+}
+
+impl Default for ApiKeyConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            sha256: String::new(),
+            subject: String::new(),
+            team: String::new(),
+            scopes: Vec::new(),
+            created_at: None,
+            expires_at: None,
+            rotated_at: None,
+            owner: None,
+            purpose: None,
+            last_four: None,
+            fingerprint: None,
+            status: default_api_key_status(),
+        }
+    }
+}
+
+fn default_api_key_status() -> String {
+    "active".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +604,61 @@ impl Default for AuditConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ExternalProvidersConfig {
+    pub enabled: bool,
+    pub providers: Vec<ExternalProviderConfig>,
+    pub routes: Vec<ExternalProviderRouteConfig>,
+}
+
+impl ExternalProvidersConfig {
+    pub fn provider(&self, id: &str) -> Option<&ExternalProviderConfig> {
+        self.providers.iter().find(|provider| provider.id == id)
+    }
+
+    pub fn route_for_model(&self, alias: &str) -> Option<&ExternalProviderRouteConfig> {
+        self.routes.iter().find(|route| route.model_alias == alias)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ExternalProviderConfig {
+    pub id: String,
+    pub kind: ExternalProviderKind,
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+impl Default for ExternalProviderConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: ExternalProviderKind::OpenAiCompatible,
+            base_url: String::new(),
+            api_key_env: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalProviderKind {
+    #[default]
+    OpenAiCompatible,
+    VertexAi,
+    OpenRouter,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ExternalProviderRouteConfig {
+    pub model_alias: String,
+    pub provider: String,
+    pub provider_model: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelConfig {
     pub alias: String,
@@ -497,11 +666,25 @@ pub struct ModelConfig {
     #[serde(default = "default_role")]
     pub role: String,
     #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
     pub weight: u32,
 }
 
 fn default_role() -> String {
     "chat".to_string()
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            alias: String::new(),
+            path: PathBuf::new(),
+            role: default_role(),
+            family: None,
+            weight: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,29 +706,8 @@ pub async fn load(path: &Path) -> Result<Config> {
     let body = fs::read_to_string(path)
         .await
         .with_context(|| format!("read config {}", path.display()))?;
-    let mut cfg =
-        toml::from_str(&body).with_context(|| format!("parse config {}", path.display()))?;
-    apply_legacy_runtime_backend(&body, &mut cfg);
+    let cfg = toml::from_str(&body).with_context(|| format!("parse config {}", path.display()))?;
     Ok(cfg)
-}
-
-fn apply_legacy_runtime_backend(body: &str, cfg: &mut Config) {
-    let Ok(value) = toml::from_str::<toml::Value>(body) else {
-        return;
-    };
-    if value.get("runtime").is_some() {
-        return;
-    }
-
-    let has_legacy_llama_server = value
-        .get("server")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|server| {
-            server.contains_key("llama_server") || server.contains_key("llama-server")
-        });
-    if has_legacy_llama_server {
-        cfg.runtime.backend = RuntimeBackend::LlamaServer;
-    }
 }
 
 pub async fn save(path: &Path, cfg: &Config) -> Result<()> {
@@ -572,52 +734,176 @@ mod tests {
 
         assert_eq!(cfg.runtime.backend, RuntimeBackend::CandleNative);
         assert_eq!(cfg.runtime.heartbeat_interval_seconds, 30);
+        assert_eq!(cfg.runtime.embeddings.mode, NativeEmbeddingMode::Semantic);
+        assert_eq!(cfg.runtime.embeddings.model_alias, None);
         assert_eq!(cfg.storage.max_connections, 5);
         assert_eq!(cfg.server.upstream_timeout_seconds, 300);
         assert_eq!(cfg.server.graceful_drain_seconds, 5);
         assert_eq!(cfg.server.circuit_breaker_failures, 3);
         assert_eq!(cfg.server.circuit_breaker_reset_seconds, 30);
         assert_eq!(cfg.security.auth_failure_limit_per_minute, 60);
+        assert!(!cfg.external_providers.enabled);
+        assert!(cfg.external_providers.providers.is_empty());
     }
 
     #[test]
-    fn parses_compatibility_llama_server_runtime_backend() {
+    fn parses_external_provider_env_key_references_without_inline_secrets() {
+        let cfg: Config = toml::from_str(
+            r#"
+[external-providers]
+enabled = true
+
+[[external-providers.providers]]
+id = "openai"
+kind = "open-ai-compatible"
+base-url = "https://api.openai.example/v1"
+api-key-env = "OPENAI_API_KEY"
+
+[[external-providers.routes]]
+model-alias = "gpt-proxy"
+provider = "openai"
+provider-model = "gpt-4o-mini"
+
+[[models]]
+alias = "gpt-proxy"
+path = "/models/remote-placeholder"
+role = "chat"
+"#,
+        )
+        .expect("parse external provider config");
+
+        assert!(cfg.external_providers.enabled);
+        let provider = cfg.external_providers.provider("openai").expect("provider");
+        assert_eq!(provider.kind, ExternalProviderKind::OpenAiCompatible);
+        assert_eq!(provider.api_key_env, "OPENAI_API_KEY");
+        let route = cfg
+            .external_providers
+            .route_for_model("gpt-proxy")
+            .expect("provider route");
+        assert_eq!(route.provider, "openai");
+        assert_eq!(route.provider_model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn parses_native_embedding_runtime_contract() {
         let cfg: Config = toml::from_str(
             r#"
 [runtime]
-backend = "llama-server"
-heartbeat-interval-seconds = 10
+backend = "candle-native"
+
+[runtime.embeddings]
+mode = "semantic"
+model-alias = "embed-prod"
 "#,
         )
         .expect("parse config");
 
-        assert_eq!(cfg.runtime.backend, RuntimeBackend::LlamaServer);
-        assert_eq!(cfg.runtime.heartbeat_interval_seconds, 10);
-    }
+        assert_eq!(cfg.runtime.embeddings.mode, NativeEmbeddingMode::Semantic);
+        assert_eq!(
+            cfg.runtime.embeddings.model_alias.as_deref(),
+            Some("embed-prod")
+        );
 
-    #[tokio::test]
-    async fn load_treats_legacy_llama_server_field_as_compatibility_backend() {
-        let path = std::env::temp_dir().join(format!(
-            "rs-llmctl-runtime-compat-{}.toml",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
+        let cfg: Config = toml::from_str(
             r#"
-[server]
-host = "127.0.0.1"
-port = 8765
-worker_base_port = 18765
-llama_server = "/usr/local/bin/llama-server"
-context_size = 4096
+[runtime.embeddings]
+mode = "dev-fallback"
 "#,
         )
-        .await
-        .expect("write config");
+        .expect("parse dev fallback config");
 
-        let cfg = load(&path).await.expect("load config");
-        let _ = fs::remove_file(&path).await;
+        assert_eq!(
+            cfg.runtime.embeddings.mode,
+            NativeEmbeddingMode::DevFallback
+        );
+        assert_eq!(cfg.runtime.embeddings.model_alias, None);
+    }
 
-        assert_eq!(cfg.runtime.backend, RuntimeBackend::LlamaServer);
+    #[test]
+    fn parses_server_tls_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server.tls]
+enabled = true
+cert-path = "/etc/llmctl/tls/server.crt"
+key-path = "/etc/llmctl/tls/server.key"
+require-client-cert = false
+"#,
+        )
+        .expect("parse server tls config");
+
+        assert!(cfg.server.tls.enabled);
+        assert_eq!(
+            cfg.server.tls.cert_path.as_deref(),
+            Some(Path::new("/etc/llmctl/tls/server.crt"))
+        );
+        assert_eq!(
+            cfg.server.tls.key_path.as_deref(),
+            Some(Path::new("/etc/llmctl/tls/server.key"))
+        );
+        assert!(!cfg.server.tls.require_client_cert);
+    }
+
+    #[test]
+    fn api_key_metadata_defaults_for_legacy_config() {
+        let key: ApiKeyConfig = toml::from_str(
+            r#"
+id = "platform-chat"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+subject = "platform"
+team = "infra"
+scopes = ["chat"]
+"#,
+        )
+        .expect("parse api key");
+
+        assert_eq!(key.created_at, None);
+        assert_eq!(key.expires_at, None);
+        assert_eq!(key.rotated_at, None);
+        assert_eq!(key.owner, None);
+        assert_eq!(key.purpose, None);
+        assert_eq!(key.last_four, None);
+        assert_eq!(key.fingerprint, None);
+        assert_eq!(key.status, "active");
+    }
+
+    #[test]
+    fn api_key_metadata_accepts_kebab_case_config_fields() {
+        let key: ApiKeyConfig = toml::from_str(
+            r#"
+id = "platform-chat"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+subject = "platform"
+team = "infra"
+scopes = ["chat"]
+created-at = "2026-01-02T03:04:05Z"
+expires-at = "2027-01-02T03:04:05Z"
+rotated-at = "2026-02-02T03:04:05Z"
+owner = "platform"
+purpose = "chat serving"
+last-four = "cdef"
+fingerprint = "sha256:0123456789abcdef"
+status = "retiring"
+"#,
+        )
+        .expect("parse api key metadata");
+
+        assert_eq!(
+            key.created_at.expect("created_at").to_rfc3339(),
+            "2026-01-02T03:04:05+00:00"
+        );
+        assert_eq!(
+            key.expires_at.expect("expires_at").to_rfc3339(),
+            "2027-01-02T03:04:05+00:00"
+        );
+        assert_eq!(
+            key.rotated_at.expect("rotated_at").to_rfc3339(),
+            "2026-02-02T03:04:05+00:00"
+        );
+        assert_eq!(key.owner.as_deref(), Some("platform"));
+        assert_eq!(key.purpose.as_deref(), Some("chat serving"));
+        assert_eq!(key.last_four.as_deref(), Some("cdef"));
+        assert_eq!(key.fingerprint.as_deref(), Some("sha256:0123456789abcdef"));
+        assert_eq!(key.status, "retiring");
     }
 }

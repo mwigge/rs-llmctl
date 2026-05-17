@@ -20,11 +20,10 @@ mode = "single"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "/usr/local/bin/llama-server"
 context_size = 4096
 
 [runtime]
-backend = "llama-server"
+backend = "candle-native"
 
 [security]
 production = false
@@ -100,9 +99,9 @@ fn server_check_validates_storage_and_server_plan_prints_startup_plan_json() {
     assert_eq!(plan["workers"][0]["worker"]["context_size"], 4096);
     assert_eq!(
         plan["workers"][0]["command"]["program"],
-        "/usr/local/bin/llama-server"
+        "<in-process:candle-native>"
     );
-    assert_eq!(plan["workers"][0]["command"]["args"][0], "--host");
+    assert_eq!(plan["workers"][0]["command"]["args"][0], "--model");
 }
 
 #[test]

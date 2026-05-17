@@ -133,7 +133,6 @@ mod tests {
         let mut cfg = Config::default();
         cfg.server.host = "0.0.0.0".to_string();
         cfg.server.port = 8765;
-        cfg.server.llama_server = "http://upstream.internal:8080".to_string();
         cfg.security.require_auth = true;
         cfg.security.api_keys = vec![ApiKeyConfig {
             id: "operator".to_string(),
@@ -141,11 +140,13 @@ mod tests {
             subject: "alice".to_string(),
             team: "platform".to_string(),
             scopes: vec!["admin".to_string()],
+            ..Default::default()
         }];
         cfg.models = vec![ModelConfig {
             alias: "chat".to_string(),
             path: PathBuf::from("/private/models/chat.gguf"),
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         }];
         cfg.quotas = vec![QuotaConfig {

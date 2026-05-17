@@ -11,25 +11,33 @@ and OTel-ready observability.
 The goal is simple: make model delivery boring in the best way. You should be
 able to stage a model, verify it, plan CPU/RAM/VRAM budgets, serve it to
 internal clients, swap it safely, and keep useful evidence about what happened.
-The product direction is candle-native serving first. `llama-server`
-compatibility and fallback remain available for existing deployments during
-migration; in plain terms, llama-server compatibility and fallback are
-secondary to the native path.
+The product direction is Candle-native serving first. New deployments should
+plan around the in-process runtime and the single `llmctl` service entrypoint.
+Older external-worker deployments can be migrated deliberately, but the README,
+installer, and release package now describe the native path as the default
+operating model.
 
 The MVP runtime target is intentionally small: one query model, one
 recommendation model, one thinking model, and one coding model, starting with
 Qwen3-family GGUF or safetensors artifacts. The Candle contract also tracks
-Gemma 4, Kimi, and Mistral-family options; Mistral is the EU-friendly default
-alternative in the runtime status contract. The default runtime policy budgets
-80% of CPU, RAM, and detected GPU VRAM so the rest of the server has headroom.
-Hardware selection is automatic for NVIDIA/CUDA, AMD/ROCm, Apple/Metal targets,
-and CPU fallback. Inspect the native runtime contract with:
+Gemma-family, Mistral, DeepSeek, Kimi, and MiniMax options; Mistral is the
+EU-friendly default alternative in the runtime status contract. DeepSeek is
+wired for Candle safetensors through DeepSeekV2; DeepSeek GGUF, Kimi, and
+MiniMax fail closed until reviewed Candle-compatible decoders exist. The default
+runtime policy budgets 80% of CPU, RAM, and detected GPU VRAM so the rest of
+the server has headroom. Native decoding is CPU-backed in this release; explicit
+NVIDIA/CUDA, AMD/ROCm, and Apple/Metal execution requests fail closed until the
+Candle device path is wired and validated. Inspect the native runtime contract
+with:
 
 ```bash
 llmctl --config /etc/rs-llmctl/config.toml runtime status
 llmctl --config /etc/rs-llmctl/config.toml runtime heartbeat
 llmctl --config /etc/rs-llmctl/config.toml runtime placement
+llmctl --config /etc/rs-llmctl/config.toml runtime validation-plan
 llmctl --config /etc/rs-llmctl/config.toml runtime validate
+llmctl --config /etc/rs-llmctl/config.toml runtime validation-run \
+  --evidence-output ./native-validation.json
 llmctl --config /etc/rs-llmctl/config.toml runtime route --role coding
 ```
 
@@ -45,23 +53,37 @@ When `llmctl server run` is active it emits the same heartbeat as
 (default `30`; set `0` to disable periodic runtime heartbeat emission).
 The native serving path is alias-keyed: every configured non-zero-weight model
 gets its own in-process Candle engine, and OpenAI-compatible requests route to
-the resolved alias without a sidecar process. Qwen3, Gemma-family, and
-Mistral-family models use native Candle loaders where Candle exposes the
-architecture; Kimi remains blocked until Candle exposes a reviewed Kimi module
-or rs-llmctl vendors one. The native scheduler contract is explicit:
-scheduler metadata, admission/backpressure keys, KV cache budgets, and
-cancellation metadata are serialized in load plans from the start so the engine
-surface is observable as it grows.
-The lower-level scheduler fields remain metadata-only where they describe
-future queue discipline, continuous batching, KV cache budget metadata, and
-cancellation token metadata; those specific scheduler knobs are reported with
-`implemented=false` until they are backed by runtime behavior.
+the resolved alias without a sidecar process. Qwen3, Gemma-family, Mistral
+safetensors, and DeepSeek safetensors models use native Candle loaders where
+Candle exposes the architecture and artifact format; DeepSeek GGUF, Kimi, and
+MiniMax remain blocked until reviewed native decoders are wired. The native scheduler contract is explicit:
+the in-process runtime now applies an implemented FIFO queue with bounded
+per-engine concurrency and observable queue/admission wait metadata. It also
+stamps deterministic prefill/decode phase scheduling metadata so operators can
+separate admission timing from the request-local decode loop. Continuous
+batching, KV cache budget metadata, KV cache key metadata, and cancellation
+token metadata remain serialized as contract fields with `implemented=false`;
+cross-request KV reuse and token-level decode cancellation are unsupported until
+those specific behaviors are backed by runtime execution.
+
+The native validation track starts offline and becomes executable on the target
+host. `runtime validation-plan` emits JSON for real Qwen/Gemma/Mistral/DeepSeek
+safetensors smoke tests, CPU/NVIDIA/AMD-Vulkan/Apple Metal coverage, long
+streaming soak tests, graceful drain during active streams, circuit breaker and
+heartbeat checks under load, API-key rotation with quota concurrency, and
+benchmark fields for latency, tokens/sec, RSS memory, and VRAM. `runtime
+validation-run` validates the configured positive-weight artifacts and writes
+pass/fail evidence without downloading models.
 
 ## What It Does
 
 - Serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints.
-- Runs CPU-only servers and GPU-backed workers for NVIDIA, AMD/Vulkan, and
-  Apple Metal style deployments.
+- Documents a separate `rs-llmctl-client` Rust SDK crate for application code,
+  including client-managed sessions, client-side tool loops, streaming, and
+  non-secret metadata.
+- Runs CPU-only native serving now and reports GPU placement/budget evidence for
+  NVIDIA, AMD/Vulkan, and Apple Metal style deployments without pretending those
+  accelerators are active native decode devices yet.
 - Supports offline model import from local manifests and verified local model
   files, plus controlled direct downloads when networking is allowed.
 - Plans and runs hot-swap, cold-swap, weighted, fallback, and single-model
@@ -93,10 +115,11 @@ to `/usr/local/bin`, creates the `llmctl` system user, stages
 `/etc/rs-llmctl/config.toml`, creates `/var/lib/rs-llmctl`,
 `/var/lib/rs-llmctl/models`, `/var/lib/rs-llmctl/reports`, and
 `/var/log/rs-llmctl`, installs `llmctld.service`, then enables and starts it.
-The service keeps the stable `llmctld.service` unit name for operators, but its
-default `ExecStart` runs `llmctl --config /etc/rs-llmctl/config.toml server
-run`. The default service binds to `http://127.0.0.1:8765/v1` without requiring
-API keys; switch to a production profile before exposing it externally.
+The service intentionally keeps the stable `llmctld.service` unit name for
+operator runbooks, monitoring labels, and upgrade habits, while its default
+`ExecStart` runs `llmctl --config /etc/rs-llmctl/config.toml server run`. The
+default service binds to `http://127.0.0.1:8765/v1` without requiring API keys;
+switch to a production profile before exposing it externally.
 
 Set `PREFIX=/some/path` to choose another binary prefix. System service installs
 must not use a home-directory prefix; use `LLMCTL_INSTALL_SYSTEMD=0` for a
@@ -131,6 +154,33 @@ For production, add at least one hashed API key with `security hash-key`,
 configure TLS termination evidence, import or install a verified model, then run
 `server check`, `security check`, `observe plan`, and `compliance evidence`
 before binding externally.
+
+## First-Run Operator Path
+
+Use `first-run` when bringing up a new host or local operator sandbox. It is
+dry-run by default, emits JSON, does not download a model, and does not write
+plaintext secrets to config:
+
+```bash
+llmctl --config ./config.toml first-run \
+  --secret-output ./operator.secret
+```
+
+Apply only after reviewing the plan. `--apply` requires `--secret-output`; the
+raw key is written once to that file with `0600` permissions on Unix, while the
+config stores only the SHA-256 digest and non-secret metadata. Starter model
+configuration stays offline unless you provide a local file:
+
+```bash
+llmctl --config ./config.toml first-run --apply \
+  --secret-output ./operator.secret \
+  --starter-model-path /models/qwen.gguf \
+  --starter-model-alias qwen
+```
+
+The output includes an `ask_question` smoke plan for `rs-llmctl-client` and an
+OpenAI-compatible `/v1/chat/completions` request plan using the generated key
+from your secret store, without printing the secret.
 
 ## Operate In 10 Steps
 
@@ -168,6 +218,53 @@ For an OpenAI-compatible client:
 export OPENAI_BASE_URL=http://host:8765/v1
 export OPENAI_API_KEY=<your-rs-llmctl-api-key>
 ```
+
+Rust applications should depend on the separate `rs-llmctl-client` crate, not
+the server crate. The SDK is intentionally a client-side wrapper around the
+OpenAI-compatible API: it keeps conversation sessions in the application,
+resends the full message history, attaches stable `metadata.session_id` and
+lineage metadata, and runs tool calls in the caller process before submitting
+tool results back to `/v1/chat/completions`. `rs-llmctl` authorizes, routes,
+audits, meters, and records metadata for those requests; it does not execute
+tools and does not run tool side effects on behalf of clients.
+
+Small Rust applications can use the `ask_question` helper for the first call:
+
+```rust
+use rs_llmctl_client::{AskConfig, LlmctlClient, Question};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = LlmctlClient::from_env()?;
+    let answer = client
+        .ask_question(
+            AskConfig::new("qwen").system("Answer as the internal platform assistant."),
+            Question::new("Which model is serving coding requests?"),
+        )
+        .await?;
+    println!("{answer}");
+    Ok(())
+}
+```
+
+`LlmctlClient::from_env()` accepts `LLMCTL_BASE_URL`/`LLMCTL_API_KEY`,
+`RS_LLMCTL_BASE_URL`/`RS_LLMCTL_API_KEY`, and OpenAI-compatible
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`. `LLMCTL_*` wins when both are present.
+The SDK also exposes `/v1/embeddings` through `EmbeddingRequest` for local
+search, recommendation, and RAG workflows.
+On Candle-native deployments, production embeddings use the semantic native
+embedding contract:
+
+```toml
+[runtime.embeddings]
+mode = "semantic"
+model-alias = "embed"
+```
+
+The configured alias should point to a BERT-style safetensors embedding model
+with `tokenizer.json` and `config.json`. The deterministic native vectorizer is
+kept only for local development with `mode = "dev-fallback"` and labels
+responses as `non-semantic-dev-fallback`.
 
 External bind is intentionally strict. Production configs must enable
 `security.require-auth` and `security.bind-external`, define hashed API keys,
@@ -236,6 +333,7 @@ Minimal manifest:
 alias = "qwen"
 path = "models/qwen.gguf"
 role = "chat"
+family = "qwen3"
 weight = 1
 sha256 = "hex-encoded-sha256"
 ```
@@ -255,6 +353,8 @@ service restart is required before routing changes take effect. Use `--dry-run`
 on `model start`, `model stop`, `model update`, `model upgrade`, or
 `model downgrade` to emit the JSON lifecycle plan without editing the config or
 copying model artifacts.
+`llmctl service ...` targets the installed system unit by default; pass `--user`
+only when you intentionally installed a user-scoped service.
 
 Lifecycle outputs are script-friendly JSON by default. Model and service plans
 include `runtime_backend` and `entrypoint` fields; on the default native path
@@ -283,7 +383,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo build --release --bin llmctl
 packaging/generate-checksums.sh
-# writes dist/rs-llmctl-<os>-<arch>.tar.gz and dist/SHA256SUMS
+# writes dist/rs-llmctl-<os>-<arch>.tar.gz, dist/SHA256SUMS,
+# and stages README.md, CHANGELOG.md, LICENSE, and llmctld.service
 ```
 
 Development is TDD-oriented: add or update the focused test first, make the
@@ -319,6 +420,13 @@ The validation script checks the installed `llmctl` binary, systemd unit,
 `security check`, `server status`, `server plan`, `audit retention plan`,
 `observe plan`, and `systemd-analyze verify` when available.
 
+Release notes live in [CHANGELOG.md](CHANGELOG.md). Each release entry should
+name the native runtime posture, service-unit decision, packaging artifacts,
+and verification commands used for the cut. The default binary archive contains
+the runtime binary plus the operator-facing `README.md`, `CHANGELOG.md`,
+`LICENSE`, and systemd unit template; checksums and optional signatures remain
+separate artifacts in `dist/`.
+
 ## Security Baseline
 
 `rs-llmctl` uses a PCI DSS v4.0.1-aligned baseline for production posture:
@@ -335,17 +443,24 @@ The validation script checks the installed `llmctl` binary, systemd unit,
 - production CORS origins are explicit, not wildcard.
 
 Generate a new API key when you want `rs-llmctl` to mint strong random key
-material for a client. The secret is printed once; store it in a password
-manager or secret store, then keep only the SHA-256 digest in config:
+material for a client. Prefer writing the raw secret directly to a secret-store
+staging file; the file is created with `0600` permissions on Unix and the CLI
+does not print the secret when `--output` is used. Put the raw value in your
+secret manager, systemd credential, Vault/SOPS/1Password item, Kubernetes
+Secret, or equivalent. Keep only the SHA-256 digest and non-secret metadata in
+config:
 
 ```bash
-llmctl security generate-key --prefix llmctl-prod
+llmctl security generate-key --prefix llmctl-prod --output ./ops-admin.secret
 llmctl --config /etc/rs-llmctl/config.toml security add-key \
   --id ops-admin-2026-q2 \
   --sha256 <sha256-from-generate-key> \
   --subject ops-admin \
   --team platform \
-  --scope admin
+  --scope admin \
+  --owner platform-sre \
+  --purpose operations-admin \
+  --last-four <last-four-from-generate-key>
 ```
 
 If your secret store generates the raw key, hash it without putting it in
@@ -364,6 +479,10 @@ sha256 = "<sha256-from-hash-key>"
 subject = "ops-admin"
 team = "platform"
 scopes = ["admin"]
+owner = "platform-sre"
+purpose = "operations-admin"
+last-four = "<last-four>"
+status = "active"
 ```
 
 Keep key IDs stable and non-secret. Use IDs that encode owner and rotation
@@ -375,21 +494,32 @@ llmctl --config /etc/rs-llmctl/config.toml security list-keys
 llmctl --config /etc/rs-llmctl/config.toml security key-usage --id platform-chat-2026-q2 --hours 168
 ```
 
-Rotate by adding the new digest to the same ID, restart the service, then
-confirm usage has moved to the rotated key ID. Revoke stale IDs when clients no
-longer use them:
+Rotate with an overlap window: add a new active key ID, mark the old key as
+`retiring`, restart the service, move clients, confirm usage has moved, then
+revoke the stale ID. `--replace` is still available for emergency in-place
+replacement, but overlap rotation is the default operational path:
 
 ```bash
-llmctl --config /etc/rs-llmctl/config.toml security rotate-key --id platform-chat-2026-q2 --sha256 <new-sha256>
+llmctl --config /etc/rs-llmctl/config.toml security rotate-key \
+  --id platform-chat-2026-q2 \
+  --new-id platform-chat-2026-q3 \
+  --sha256 <new-sha256> \
+  --last-four <new-last-four> \
+  --reason "quarterly rotation"
 sudo systemctl restart llmctld.service
 llmctl --config /etc/rs-llmctl/config.toml security key-usage --hours 24
-llmctl --config /etc/rs-llmctl/config.toml security revoke-key --id old-platform-chat-2026-q1
+llmctl --config /etc/rs-llmctl/config.toml security revoke-key \
+  --id platform-chat-2026-q2 \
+  --reason "clients moved to q3 key"
 sudo systemctl restart llmctld.service
 ```
 
 Every authenticated request is audited with actor, team, action, model/resource,
-outcome, request ID, and non-secret `api_key_id`, so key usage can be reviewed
-without storing or exporting raw secrets. Developer clients stay simple:
+outcome, request ID, and non-secret API-key metadata. `security key-usage`
+joins audit rows to usage rows by request ID so reviewers can see request
+counts, token totals, latency totals, models, actors, teams, and rotation or
+revocation events without storing or exporting raw secrets. Developer clients
+stay simple:
 
 ```bash
 export OPENAI_BASE_URL=http://host:8765/v1
@@ -410,6 +540,16 @@ provider = "envoy-edge"
 evidence = "change-record-or-runbook-url"
 m-tls = true
 ```
+
+This is the production HTTPS control for the service edge. The Rust binary uses
+Rustls-backed HTTP clients for outbound HTTPS model downloads, OTel export, and
+Postgres TLS, and it can also serve inbound HTTPS when `[server.tls]` has a
+certificate and key. The default listener is still plain HTTP on the configured
+bind address. For production, either put the service behind Envoy, NGINX,
+HAProxy, a cloud load balancer, ingress, or service mesh, or use native Rustls
+server-certificate TLS and document the certificate source, rotation owner, and
+evidence URL. Client-certificate mTLS remains an edge/service-mesh control and
+should be recorded in `security.tls-termination`.
 
 ## Policy And Reporting
 
@@ -523,6 +663,21 @@ recommendation requests. `rs-llmctl` records those joins with the request ID,
 model, corpus, and source endpoint so audits can connect a response back to a
 prompt template, document corpus, embedding index, model, or release.
 
+Runtime caveats are part of the product contract. Qwen3, Gemma-family, Mistral
+safetensors, and DeepSeek safetensors are the native runnable families where
+Candle exposes the needed model APIs. DeepSeek GGUF remains closed because
+Candle 0.10.2 does not expose quantized DeepSeek2 weights. Kimi and MiniMax
+remain closed until Candle exposes reviewed architecture modules or rs-llmctl
+vendors maintained implementations. FIFO queue discipline is implemented for
+native chat requests with bounded per-engine concurrency and wait-time metadata.
+Prefill/decode phase scheduling metadata is emitted for every admitted native
+request, but continuous batching and low-level KV-cache scheduler controls are
+still serialized as metadata-only contract fields with `implemented=false`;
+size latency and capacity plans against observed single-request behavior until
+those runtime behaviors are wired. Cancellation has an admission-time cancelled
+metadata check, while cancellation token metadata and token-level decode loop
+cancellation remain explicit unsupported scheduler boundaries.
+
 The dashboard path is intentionally simple. `llmctl aiops slo-plan --format
 prometheus` emits Alertmanager-compatible rules, and `--format grafana` emits a
 Grafana dashboard JSON file. Import those files with your normal monitoring
@@ -562,6 +717,7 @@ focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 
 - [Operations guide](docs/operations.md)
 - [AI developer workflows](docs/ai-developer-workflows.md)
+- [Client SDK and tool loops](docs/client-sdk.md)
 - [Security model](docs/security.md)
 - [Compliance evidence](docs/compliance.md)
 - [Observability and reporting](docs/observability-reporting.md)
@@ -570,6 +726,7 @@ focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 - [AIOps/MLOps platform](docs/aiops-mlops-platform.md)
 - [Storage notes](docs/storage.md)
 - [Final acceptance review](docs/reviews/final-acceptance-review.md)
+- [Changelog](CHANGELOG.md)
 - [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)
 - [Blog: Rust Native Model Operations](docs/blog-rust-native-model-ops.md)
 

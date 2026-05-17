@@ -12,6 +12,31 @@ Create a local development config:
 llmctl init --profile local-dev
 ```
 
+For a safer first-run operator journey, start with the plan-only command. It is
+JSON-friendly, dry-run by default, does not download starter models, and keeps
+plaintext API keys out of config:
+
+```bash
+llmctl --config ./config.toml first-run \
+  --secret-output ./operator.secret
+```
+
+To apply the reviewed plan, provide `--apply`. A generated API key is written
+once to `--secret-output`, the config stores only the SHA-256 digest, and a
+starter model is configured only from a local path supplied by the operator:
+
+```bash
+llmctl --config ./config.toml first-run --apply \
+  --secret-output ./operator.secret \
+  --starter-model-path /models/qwen.gguf \
+  --starter-model-alias qwen
+```
+
+The JSON response includes an `ask_question` smoke plan and an
+OpenAI-compatible `/v1/chat/completions` smoke request plan. Run those after the
+daemon is started and the secret has been moved into the operator's secret
+store or exported through `LLMCTL_API_KEY`.
+
 Create a CPU-only host config:
 
 ```bash
@@ -38,6 +63,13 @@ reports, OTel traces/metrics/logs, JSON daemon logs, schema-versioned event
 output, and the data fabric. It still leaves API key creation as an explicit
 operator action.
 
+The TLS flags populate `security.tls-termination` evidence for the production
+edge. The default listener remains HTTP; put production external bind behind
+Envoy, NGINX, HAProxy, a cloud load balancer, ingress, or service mesh for
+HTTPS/mTLS. Outbound HTTPS from the Rust binary uses Rustls-backed clients for
+verified model downloads, upstream compatibility calls, OTel export, and
+Postgres TLS.
+
 ## Relevant Blocks
 
 ```toml
@@ -47,8 +79,18 @@ graceful-drain-seconds = 5
 circuit-breaker-failures = 3
 circuit-breaker-reset-seconds = 30
 
+[runtime.embeddings]
+mode = "semantic"
+model-alias = "embed"
+
 [security]
 auth-failure-limit-per-minute = 60
+
+[security.tls-termination]
+enabled = true
+provider = "envoy-edge"
+evidence = "change-record-or-runbook-url"
+m-tls = true
 
 [storage]
 max-connections = 5
@@ -95,6 +137,10 @@ audit = true
 `--json-logs`. OTel collector secrets should be referenced through environment
 variables in exporter headers, for example `authorization = "env:OTEL_TOKEN"`.
 `storage.max-connections` controls the SQLx pool size for SQLite/Postgres.
+`runtime.embeddings.mode = "semantic"` is the production native embedding
+contract; the alias must identify a loaded semantic embedding model. Use
+`mode = "dev-fallback"` only for local development because it emits
+deterministic, non-semantic vectors.
 `server.graceful-drain-seconds` flips readiness to `draining` before process
 shutdown, and the circuit-breaker settings protect compatibility upstreams from
 repeated failing retries.

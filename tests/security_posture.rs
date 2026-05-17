@@ -1,5 +1,6 @@
 use rs_llmctl::config::{
-    self, ApiKeyConfig, Config, ObservabilityExporterConfig, OtlpProtocol, ServerConfig,
+    self, ApiKeyConfig, Config, ExternalProviderConfig, ExternalProviderKind,
+    ObservabilityExporterConfig, OtlpProtocol, ServerConfig,
 };
 use rs_llmctl::observability::{sanitize_otel_attributes, Exporter, ObservabilityPlan};
 use serde_json::json;
@@ -12,6 +13,7 @@ fn hashed_key() -> ApiKeyConfig {
         subject: "operator".to_string(),
         team: "platform".to_string(),
         scopes: vec!["models.read".to_string()],
+        ..Default::default()
     }
 }
 
@@ -20,6 +22,14 @@ fn enable_tls_termination(cfg: &mut Config) {
     cfg.security.tls_termination.provider = Some("envoy-edge".to_string());
     cfg.security.tls_termination.evidence = Some("change-record-123".to_string());
     cfg.security.tls_termination.m_tls = true;
+    cfg.audit.monthly_reports = true;
+    cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
+}
+
+fn enable_native_tls(cfg: &mut Config) {
+    cfg.server.tls.enabled = true;
+    cfg.server.tls.cert_path = Some("/etc/llmctl/tls/server.crt".into());
+    cfg.server.tls.key_path = Some("/etc/llmctl/tls/server.key".into());
     cfg.audit.monthly_reports = true;
     cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
 }
@@ -67,6 +77,63 @@ fn external_bind_requires_documented_tls_termination() {
 
     enable_tls_termination(&mut cfg);
     config::validate_production_security(&cfg).expect("documented TLS termination is accepted");
+}
+
+#[test]
+fn external_bind_accepts_native_tls_cert_and_key() {
+    let mut cfg = Config::default();
+    cfg.server.host = "0.0.0.0".to_string();
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![hashed_key()];
+    enable_native_tls(&mut cfg);
+
+    config::validate_production_security(&cfg).expect("native TLS cert/key is accepted");
+}
+
+#[test]
+fn production_external_provider_requires_https_base_url() {
+    let mut cfg = Config::default();
+    cfg.security.production = true;
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![hashed_key()];
+    enable_tls_termination(&mut cfg);
+    cfg.external_providers.enabled = true;
+    cfg.external_providers.providers = vec![ExternalProviderConfig {
+        id: "openai".to_string(),
+        kind: ExternalProviderKind::OpenAiCompatible,
+        base_url: "http://api.openai.example/v1".to_string(),
+        api_key_env: "OPENAI_API_KEY".to_string(),
+    }];
+
+    let err = config::validate_production_security(&cfg).expect_err("https is required");
+    assert!(
+        err.to_string().contains("must use https"),
+        "unexpected error: {err}"
+    );
+
+    cfg.external_providers.providers[0].base_url = "https://api.openai.example/v1".to_string();
+    config::validate_production_security(&cfg).expect("https provider is accepted");
+}
+
+#[test]
+fn native_tls_validation_rejects_missing_cert_or_key() {
+    let mut cfg = Config::default();
+    cfg.server.tls.enabled = true;
+    cfg.server.tls.key_path = Some("/etc/llmctl/tls/server.key".into());
+
+    let err = config::validate_production_security(&cfg).expect_err("missing cert rejected");
+    assert!(
+        err.to_string().contains("server.tls.cert-path"),
+        "unexpected error: {err}"
+    );
+
+    cfg.server.tls.cert_path = Some("/etc/llmctl/tls/server.crt".into());
+    cfg.server.tls.key_path = None;
+    let err = config::validate_production_security(&cfg).expect_err("missing key rejected");
+    assert!(
+        err.to_string().contains("server.tls.key-path"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

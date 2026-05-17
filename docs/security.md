@@ -29,18 +29,25 @@ Generate keys with the CLI when you want rs-llmctl to mint strong random
 client material:
 
 ```bash
-llmctl security generate-key --prefix llmctl-prod
+llmctl security generate-key --prefix llmctl-prod --output ./platform-chat.secret
 llmctl --config /etc/rs-llmctl/config.toml security add-key \
   --id platform-chat-2026-q2 \
   --sha256 <sha256-from-generate-key> \
   --subject alice \
   --team platform \
-  --scope chat
+  --scope chat \
+  --owner platform-sre \
+  --purpose chat-api \
+  --last-four <last-four-from-generate-key>
 ```
 
-The raw secret is printed once. Put it in the client secret store and keep only
-the digest in config. Use stdin or environment variables when an external
-secret store generates the key material:
+With `--output`, the raw secret is written once to a new file with `0600`
+permissions on Unix and is not printed to stdout. Move that raw value into the
+client secret store and keep only the digest plus non-secret metadata in config.
+Suitable raw-secret stores include a password manager, Vault, SOPS, 1Password,
+a systemd credential, Kubernetes Secret, or your platform secret manager. Use
+stdin or environment variables when an external secret store generates the key
+material:
 
 ```bash
 printf '%s' "$LLMCTL_NEW_API_KEY" | llmctl security hash-key --stdin
@@ -55,19 +62,29 @@ commands:
 
 ```bash
 llmctl --config /etc/rs-llmctl/config.toml security list-keys
-llmctl --config /etc/rs-llmctl/config.toml security rotate-key --id platform-chat-2026-q2 --sha256 <new-sha256>
-llmctl --config /etc/rs-llmctl/config.toml security revoke-key --id platform-chat-2026-q1
+llmctl --config /etc/rs-llmctl/config.toml security rotate-key \
+  --id platform-chat-2026-q2 \
+  --new-id platform-chat-2026-q3 \
+  --sha256 <new-sha256> \
+  --last-four <new-last-four> \
+  --reason "quarterly rotation"
+llmctl --config /etc/rs-llmctl/config.toml security revoke-key \
+  --id platform-chat-2026-q2 \
+  --reason "clients moved to q3 key"
 ```
 
-Rotation and revocation update config and require a service restart so the
-running daemon reloads its in-memory key set.
+Overlap rotation marks the old key `retiring` and adds the new key as `active`.
+Revocation removes the key from active config and writes a revocation audit
+event. Both operations require a service restart so the running daemon reloads
+its in-memory key set. Emergency in-place replacement is available with
+`rotate-key --replace`, but overlap rotation is easier to audit.
 
 ## API Key Usage Audit
 
-Each successful authentication attaches the configured key ID to the request
-principal. Audit rows then include `api_key_id` in `detail_json` alongside the
-actor, team, action, model/resource, outcome, and request ID. Review usage by
-key without exposing SHA-256 digests or raw keys:
+Each successful authentication attaches the configured key ID and non-secret
+metadata to the request principal. Audit rows then include `api_key_id` in
+`detail_json` alongside the actor, team, action, model/resource, outcome, and
+request ID. Review usage by key without exposing SHA-256 digests or raw keys:
 
 ```bash
 llmctl --config /etc/rs-llmctl/config.toml security key-usage --hours 24
@@ -75,7 +92,9 @@ llmctl --config /etc/rs-llmctl/config.toml security key-usage --id platform-chat
 ```
 
 Use this report during rotation windows to confirm traffic has moved off an old
-key before revoking it.
+key before revoking it. The report joins audit rows to usage rows by request ID,
+so it includes request counts, token totals, latency totals, models, actors,
+teams, and lifecycle events.
 
 ## External Clients
 
@@ -84,9 +103,9 @@ AQE/OpenAI-compatible clients can use the API through
 identifiers, model aliases, quota state, and policy status. They do not include
 upstream URLs, prompts, file paths, API keys, or bearer tokens.
 
-Production external bind should normally be published as HTTPS through a load
-balancer, ingress, reverse proxy, or service mesh. The runtime validates that
-the deployment config documents that control:
+Production external bind can be published as HTTPS through a load balancer,
+ingress, reverse proxy, or service mesh. The runtime validates that the
+deployment config documents that control:
 
 ```toml
 [security.tls-termination]
@@ -99,3 +118,20 @@ m-tls = true
 `llmctl security check`, `llmctl security audit-config`, and
 `llmctl compliance evidence` include the same TLS evidence fields so monthly
 reviews can prove the control was present at deployment time.
+
+The `llmctl` binary uses Rustls-backed clients for outbound HTTPS model
+downloads, compatibility upstream calls, OTel export, and Postgres TLS. It can
+also serve inbound HTTPS directly with native Rustls:
+
+```toml
+[server.tls]
+enabled = true
+cert-path = "/etc/rs-llmctl/tls/server.crt"
+key-path = "/etc/rs-llmctl/tls/server.key"
+require-client-cert = false
+```
+
+Native TLS currently supports server certificates only. Keep mTLS
+client-certificate validation at the platform edge or service mesh. Either way,
+external bind still requires auth, reviewed CORS origins for browser clients,
+and non-secret response metadata only.

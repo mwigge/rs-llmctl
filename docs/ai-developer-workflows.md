@@ -42,3 +42,13 @@ Use `/v1/chat/completions` and `/v1/embeddings` for OpenAI-compatible model
 access. Requests are audited, quota-checked, and tied to request IDs so a code
 assistant can be reviewed after the fact without exposing prompts in telemetry
 attributes.
+
+Rust applications should use the separate `rs-llmctl-client` crate for model
+calls instead of depending on the server crate. Sessions are client-managed:
+keep the message history in the application, send the required history on each
+request, and attach `metadata.session_id` plus lineage metadata for audit joins.
+Tool calling is also a client-side loop. The assistant can request a tool,
+but the caller validates the tool name and arguments, executes the tool with
+local credentials, appends a tool-result message, and resubmits the session.
+`rs-llmctl` audits, routes, and meters those chat requests; it does not execute
+tools and does not store hidden session state for the client.

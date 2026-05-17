@@ -1,12 +1,13 @@
 use crate::audit::{AuditEvent, UsageEvent};
-use crate::config::{Config, Mode, ModelConfig};
+use crate::config::{
+    ApiKeyConfig, Config, ExternalProviderKind, Mode, ModelConfig, NativeEmbeddingMode,
+};
 use crate::native;
 use crate::observability::{
     emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
 };
 use crate::quota::{check_quota, matching_quota_policies, quota_is_subject_scoped, Principal};
 use crate::rag::{lexical_search, SearchDocument};
-use crate::runtime::RuntimeBackend;
 use crate::storage::{QuotaDecisionRecord, RequestLineageJoinRecord, Storage};
 use crate::worker::{
     PlannedWorker, StartupPlan, SwapExecution, SwapMode, TokioWorkerRunner, WorkerId,
@@ -22,21 +23,29 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{pin_mut, FutureExt, StreamExt};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as HyperBuilder;
+use hyper_util::service::TowerToHyperService;
 use opentelemetry::global;
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
+use tower::ServiceExt;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use uuid::Uuid;
@@ -46,6 +55,7 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_SLO_LATENCY_MS: u64 = 10_000;
 const MAX_SSE_USAGE_BUFFER_BYTES: usize = 1024 * 1024;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type NativeEngineRegistry = BTreeMap<String, Arc<dyn native::NativeEngine>>;
 
@@ -103,6 +113,21 @@ pub fn router_with_native_engines(
     router_with_worker_control_and_native_engines(cfg, storage, limits, None, native_engines)
 }
 
+pub fn router_with_serving_limits_and_native_engines(
+    cfg: Config,
+    storage: Storage,
+    serving_limits: ServingLimits,
+    native_engines: NativeEngineRegistry,
+) -> Router {
+    router_with_worker_control_and_native_engines(
+        cfg,
+        storage,
+        serving_limits,
+        None,
+        native_engines,
+    )
+}
+
 pub fn router_with_worker_control(
     cfg: Config,
     storage: Storage,
@@ -144,6 +169,7 @@ fn router_with_worker_control_native_engine_and_drain(
     draining: Arc<AtomicBool>,
 ) -> Router {
     let upstreams = serving_upstreams(&cfg);
+    let native_engines = scheduled_native_engines(native_engines, &cfg.runtime.scheduler);
     let admission = AdmissionController::new(serving_limits.max_in_flight);
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
@@ -160,7 +186,7 @@ fn router_with_worker_control_native_engine_and_drain(
         serving_limits,
         native_engines,
         worker_control,
-        draining,
+        draining: draining.clone(),
         circuit_breakers: CircuitBreakers::default(),
         auth_failures: AuthFailureLimiter::default(),
     };
@@ -178,6 +204,29 @@ fn router_with_worker_control_native_engine_and_drain(
         .layer(cors)
         .layer(trace_layer())
         .with_state(Arc::new(state))
+}
+
+fn scheduled_native_engines(
+    native_engines: NativeEngineRegistry,
+    scheduler: &crate::config::NativeSchedulerRuntimeConfig,
+) -> NativeEngineRegistry {
+    native_engines
+        .into_iter()
+        .map(|(alias, engine)| {
+            let scheduled: Arc<dyn native::NativeEngine> =
+                Arc::new(native::NativeSchedulerEngine::new(
+                    engine,
+                    native::NativeSchedulerConfig {
+                        max_concurrent_requests: scheduler.max_concurrent_requests,
+                        max_queued_requests: scheduler.max_queued_requests,
+                        max_batch_size: scheduler.max_batch_size,
+                        max_batch_wait_ms: scheduler.max_batch_wait_ms,
+                        kv_cache_budget_bytes: scheduler.kv_cache_budget_bytes,
+                    },
+                ));
+            (alias, scheduled)
+        })
+        .collect()
 }
 
 fn trace_layer() -> TraceLayer<
@@ -502,10 +551,26 @@ async fn livez() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
+fn draining_response(state: &ServerState, request_id: Uuid) -> Option<Response> {
+    if state.draining.load(Ordering::SeqCst) {
+        Some(with_request_id(
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_draining",
+                "server is draining; retry on another node".to_string(),
+            ),
+            request_id,
+        ))
+    } else {
+        None
+    }
+}
+
 async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
     let storage_ready = storage_ready(&state.storage).await;
     let draining = state.draining.load(Ordering::SeqCst);
-    let ready = storage_ready && !draining;
+    let active_models = routed_models(&state.cfg).len();
+    let ready = storage_ready && !draining && active_models > 0;
     let http_status = if ready {
         StatusCode::OK
     } else {
@@ -529,10 +594,10 @@ fn readiness_status_for(cfg: &Config, storage_ready: bool, draining: bool) -> Va
         .map(|model| model.alias.as_str())
         .collect();
     let worker_plan = StartupPlan::from_config(cfg);
-    let ready = storage_ready && !draining;
+    let ready = storage_ready && !draining && !aliases.is_empty();
 
     json!({
-        "status": if ready { "ready" } else if draining { "draining" } else { "unavailable" },
+        "status": if ready { "ready" } else if draining { "draining" } else if aliases.is_empty() { "no_models" } else { "unavailable" },
         "mode": cfg.mode,
         "draining": draining,
         "models": {
@@ -571,6 +636,9 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
+    if let Some(response) = draining_response(&state, request_id) {
+        return response;
+    }
     let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
@@ -658,6 +726,9 @@ async fn local_search(
     Json(request): Json<LocalSearchRequest>,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
+    if let Some(response) = draining_response(&state, request_id) {
+        return response;
+    }
     let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
@@ -720,6 +791,9 @@ async fn local_recommendations(
     Json(request): Json<LocalRecommendationRequest>,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
+    if let Some(response) = draining_response(&state, request_id) {
+        return response;
+    }
     let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
@@ -916,31 +990,59 @@ async fn proxy_embeddings(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    proxy_openai_endpoint(
-        state,
-        connect_info,
-        headers,
-        body,
-        "/v1/embeddings",
-        "embeddings",
-        "chat",
-    )
-    .await
+    native_embeddings(state, connect_info, headers, body).await
 }
 
-async fn proxy_openai_endpoint(
+#[derive(Debug, Deserialize)]
+struct EmbeddingRequest {
+    model: String,
+    input: EmbeddingInput,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    String(String),
+    StringArray(Vec<String>),
+}
+
+impl EmbeddingInput {
+    fn into_strings(self) -> Vec<String> {
+        match self {
+            Self::String(input) => vec![input],
+            Self::StringArray(input) => input,
+        }
+    }
+}
+
+async fn native_embeddings(
     state: Arc<ServerState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
-    path: &'static str,
-    action: &'static str,
-    required_scope: &'static str,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
+    if let Some(response) = draining_response(&state, request_id) {
+        return response;
+    }
+    let started = Instant::now();
     let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
         Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                Principal::anonymous(),
+                "embeddings",
+                "unknown",
+                "denied",
+                json!({ "reason": err }),
+            )
+            .await;
             return with_request_id(
                 error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
                 request_id,
@@ -948,130 +1050,395 @@ async fn proxy_openai_endpoint(
         }
     };
 
-    if !principal.has_scope(required_scope) && !principal.has_scope("chat") {
+    if !principal.has_scope("chat") {
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "embeddings",
+            "unknown",
+            "denied",
+            json!({ "reason": "missing chat scope" }),
+        )
+        .await;
         return with_request_id(
             error_response(
                 StatusCode::FORBIDDEN,
                 "forbidden",
-                format!("missing {required_scope} scope"),
+                "missing chat scope".to_string(),
             ),
             request_id,
         );
     }
 
-    let upstream = match state.upstreams.get("*").cloned().or_else(|| {
-        state
-            .upstreams
-            .iter()
-            .next()
-            .map(|(_alias, upstream)| upstream.clone())
-    }) {
-        Some(upstream) => upstream,
-        None => {
+    let request: EmbeddingRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "embeddings",
+                "unknown",
+                "rejected",
+                json!({ "reason": err.to_string() }),
+            )
+            .await;
             return with_request_id(
                 error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unavailable",
-                    "no upstream configured".to_string(),
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "request body must be valid JSON".to_string(),
                 ),
                 request_id,
             );
         }
     };
 
-    if !state.circuit_breakers.allow_request(
-        &upstream,
-        Duration::from_secs(state.cfg.server.circuit_breaker_reset_seconds),
-    ) {
+    if request
+        .encoding_format
+        .as_deref()
+        .is_some_and(|format| format != "float")
+    {
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "embeddings",
+            request.model,
+            "rejected",
+            json!({ "reason": "native embeddings support only float encoding_format" }),
+        )
+        .await;
         return with_request_id(
             error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_circuit_open",
-                "upstream circuit breaker is open".to_string(),
+                StatusCode::BAD_REQUEST,
+                "unsupported_encoding_format",
+                "native embeddings support only float encoding_format".to_string(),
             ),
             request_id,
         );
     }
 
-    let response = match timeout(
-        upstream_timeout_budget(&state),
-        state
-            .client
-            .post(format!("{upstream}{path}"))
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send(),
-    )
-    .await
-    {
-        Ok(Ok(response)) => {
-            if response.status().is_success() {
-                state.circuit_breakers.record_success(&upstream);
-            } else if should_retry_upstream_status(response.status()) {
-                state
-                    .circuit_breakers
-                    .record_failure(&upstream, state.cfg.server.circuit_breaker_failures);
-            }
-            response
+    let route = match resolve_model_route(&state.cfg, &request.model, request_id) {
+        Ok(route) => route,
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "embeddings",
+                request.model,
+                "rejected",
+                json!({ "reason": err.to_string() }),
+            )
+            .await;
+            return with_request_id(
+                error_response(StatusCode::BAD_REQUEST, "unknown_model", err.to_string()),
+                request_id,
+            );
         }
-        Ok(Err(err)) => {
-            state
-                .circuit_breakers
-                .record_failure(&upstream, state.cfg.server.circuit_breaker_failures);
-            let (status, code, message, _usage_status) = upstream_request_error(&err);
-            return with_request_id(error_response(status, code, message), request_id);
-        }
-        Err(_) => {
-            state
-                .circuit_breakers
-                .record_failure(&upstream, state.cfg.server.circuit_breaker_failures);
+    };
+
+    let embedding_selection = match native_embedding_selection(&state.cfg, &route) {
+        Ok(selection) => selection,
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "embeddings",
+                route.requested_alias,
+                "rejected",
+                json!({ "reason": err }),
+            )
+            .await;
             return with_request_id(
                 error_response(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
-                    "upstream request timed out".to_string(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "native_embedding_model_unavailable",
+                    err,
                 ),
                 request_id,
             );
         }
     };
 
-    record_audit(
+    let metadata = native_embedding_metadata(
+        request.metadata,
+        request_id,
+        &route,
+        embedding_selection.mode,
+        &embedding_selection.model_alias,
+    );
+    let native_request = native::NativeEmbeddingRequest {
+        model: embedding_selection.model_alias.clone(),
+        input: request.input.into_strings(),
+        metadata,
+    };
+    let native_response = match embedding_selection.mode {
+        NativeEmbeddingMode::Semantic => {
+            let Some(engine) = state
+                .native_engines
+                .get(&embedding_selection.model_alias)
+                .cloned()
+            else {
+                record_audit(
+                    &state,
+                    Some(request_id),
+                    principal,
+                    "embeddings",
+                    route.requested_alias,
+                    "error",
+                    json!({
+                        "reason": "native_embedding_model_unavailable",
+                        "runtime_backend": "candle-native",
+                        "embedding_mode": embedding_selection.mode.as_str(),
+                        "embedding_model_alias": embedding_selection.model_alias
+                    }),
+                )
+                .await;
+                return with_request_id(
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "native_embedding_model_unavailable",
+                        "semantic native embedding model is not loaded".to_string(),
+                    ),
+                    request_id,
+                );
+            };
+
+            match engine.embeddings(native_request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::warn!(error = %err, "native embedding runtime failed");
+                    record_audit(
+                        &state,
+                        Some(request_id),
+                        principal,
+                        "embeddings",
+                        route.requested_alias,
+                        "error",
+                        json!({
+                            "reason": "native_embedding_runtime_error",
+                            "runtime_backend": "candle-native",
+                            "embedding_mode": embedding_selection.mode.as_str(),
+                            "embedding_model_alias": embedding_selection.model_alias
+                        }),
+                    )
+                    .await;
+                    return with_request_id(
+                        error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "native_embedding_runtime_error",
+                            "native runtime failed to serve semantic embeddings".to_string(),
+                        ),
+                        request_id,
+                    );
+                }
+            }
+        }
+        NativeEmbeddingMode::DevFallback => {
+            match native::deterministic_native_embeddings(native_request) {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::warn!(error = %err, "native embedding fallback failed");
+                    return with_request_id(
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "native_embedding_error",
+                            "native embedding fallback failed".to_string(),
+                        ),
+                        request_id,
+                    );
+                }
+            }
+        }
+    };
+
+    native_embedding_response(
         &state,
+        NativeEmbeddingResponseInput {
+            request_id,
+            principal,
+            route,
+            embedding_mode: embedding_selection.mode,
+            embedding_model_alias: embedding_selection.model_alias,
+            started,
+            native_response,
+        },
+    )
+    .await
+}
+
+fn native_embedding_metadata(
+    metadata: Option<Value>,
+    request_id: Uuid,
+    route: &ResolvedModelRoute,
+    mode: NativeEmbeddingMode,
+    model_alias: &str,
+) -> BTreeMap<String, Value> {
+    let mut metadata: BTreeMap<String, Value> = metadata
+        .and_then(|value| match value {
+            Value::Object(object) => Some(object.into_iter().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    metadata.insert(
+        "llmctl.request_id".to_string(),
+        Value::String(request_id.to_string()),
+    );
+    metadata.insert(
+        "llmctl.requested_model".to_string(),
+        Value::String(route.requested_alias.clone()),
+    );
+    metadata.insert(
+        "llmctl.upstream_model".to_string(),
+        Value::String(route.upstream_alias.clone()),
+    );
+    metadata.insert(
+        "llmctl.embedding_mode".to_string(),
+        Value::String(mode.as_str().to_string()),
+    );
+    metadata.insert(
+        "llmctl.embedding_model_alias".to_string(),
+        Value::String(model_alias.to_string()),
+    );
+    metadata
+}
+
+#[derive(Debug, Clone)]
+struct NativeEmbeddingSelection {
+    mode: NativeEmbeddingMode,
+    model_alias: String,
+}
+
+struct NativeEmbeddingResponseInput {
+    request_id: Uuid,
+    principal: Principal,
+    route: ResolvedModelRoute,
+    embedding_mode: NativeEmbeddingMode,
+    embedding_model_alias: String,
+    started: Instant,
+    native_response: native::NativeEmbeddingResponse,
+}
+
+fn native_embedding_selection(
+    cfg: &Config,
+    route: &ResolvedModelRoute,
+) -> std::result::Result<NativeEmbeddingSelection, String> {
+    let mode = cfg.runtime.embeddings.mode;
+    let model_alias = cfg
+        .runtime
+        .embeddings
+        .model_alias
+        .clone()
+        .unwrap_or_else(|| route.requested_alias.clone());
+    if cfg.models.iter().any(|model| model.alias == model_alias) {
+        Ok(NativeEmbeddingSelection { mode, model_alias })
+    } else {
+        Err(format!(
+            "native embedding model alias '{model_alias}' is not configured"
+        ))
+    }
+}
+
+async fn native_embedding_response(
+    state: &ServerState,
+    input: NativeEmbeddingResponseInput,
+) -> Response {
+    let NativeEmbeddingResponseInput {
+        request_id,
+        principal,
+        route,
+        embedding_mode,
+        embedding_model_alias,
+        started,
+        native_response,
+    } = input;
+    let embedding_count = native_response.embeddings.len();
+    let embedding_dimensions = native_response
+        .embeddings
+        .first()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let usage_status = if native_response.semantic {
+        "native_embedding_semantic"
+    } else {
+        "native_embedding_dev_fallback"
+    };
+    record_usage(
+        state,
+        UsageRecordInput {
+            request_id,
+            principal: &principal,
+            model: &route.requested_alias,
+            input_tokens: native_response.usage.input_tokens,
+            output_tokens: 0,
+            latency_ms: elapsed_ms(started),
+            status: usage_status,
+            accounting_mode: token_accounting_label(&native_response.usage.accounting_mode),
+        },
+    )
+    .await;
+    record_audit(
+        state,
         Some(request_id),
         principal,
-        action,
-        path,
-        if response.status().is_success() {
-            "allowed"
-        } else {
-            "upstream_error"
-        },
-        json!({ "status": response.status().as_u16() }),
+        "embeddings",
+        route.requested_alias.clone(),
+        "ok",
+        json!({
+            "runtime_backend": "candle-native",
+            "embedding_backend": native_response.backend.clone(),
+            "embedding_status": native_response.status.clone(),
+            "embedding_mode": embedding_mode.as_str(),
+            "embedding_model_alias": embedding_model_alias.clone(),
+            "embedding_count": embedding_count,
+            "embedding_dimensions": embedding_dimensions,
+            "token_accounting": native_response.usage.accounting_mode.clone(),
+            "semantic": native_response.semantic
+        }),
     )
     .await;
 
-    let status = response.status();
-    let headers = response_headers(response.headers());
-    match timeout(upstream_timeout_budget(&state), response.bytes()).await {
-        Ok(Ok(bytes)) => build_response(status, headers, Body::from(bytes), request_id),
-        Ok(Err(_)) => with_request_id(
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                "upstream request failed".to_string(),
-            ),
-            request_id,
-        ),
-        Err(_) => with_request_id(
-            error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "timeout",
-                "upstream request timed out".to_string(),
-            ),
-            request_id,
-        ),
-    }
+    let data = native_response
+        .embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            json!({
+                "object": "embedding",
+                "embedding": embedding,
+                "index": index
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = Json(json!({
+        "object": "list",
+        "model": native_response.model,
+        "data": data,
+        "usage": {
+            "prompt_tokens": native_response.usage.input_tokens,
+            "total_tokens": native_response.usage.total_tokens()
+        },
+        "llmctl": {
+            "embedding_backend": native_response.backend,
+            "embedding_status": native_response.status,
+            "embedding_mode": embedding_mode.as_str(),
+            "embedding_model_alias": embedding_model_alias,
+            "embedding_dimensions": embedding_dimensions,
+            "semantic": native_response.semantic,
+            "token_accounting": native_response.usage.accounting_mode
+        }
+    }))
+    .into_response();
+    with_chat_metadata(
+        with_request_id(body, request_id),
+        &route.requested_alias,
+        &route.upstream_alias,
+        "allowed",
+    )
 }
 
 async fn chat_completions(
@@ -1081,6 +1448,9 @@ async fn chat_completions(
     body: Bytes,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
+    if let Some(response) = draining_response(&state, request_id) {
+        return response;
+    }
     let started = Instant::now();
     let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
         Ok(principal) => principal,
@@ -1167,7 +1537,6 @@ async fn chat_completions(
             );
         }
     };
-    let original_body = body.clone();
     let model = route.requested_alias.clone();
     record_request_lineage_joins(
         &state,
@@ -1265,7 +1634,11 @@ async fn chat_completions(
         "chat.completions",
         model.clone(),
         "allowed",
-        json!({ "stream": request.stream, "upstream_model": route.upstream_alias }),
+        chat_route_audit_detail(
+            &request.tool_audit_detail(),
+            json!({ "stream": request.stream, "upstream_model": route.upstream_alias }),
+            route.external_provider.as_ref(),
+        ),
     )
     .await;
 
@@ -1297,109 +1670,97 @@ async fn chat_completions(
         }
     };
 
-    if matches!(state.cfg.runtime.backend, RuntimeBackend::CandleNative) {
-        return dispatch_native_chat(
-            state,
-            NativeChatContext {
-                request_id,
-                principal,
-                model,
-                upstream_model: route.upstream_alias,
-                started,
-                _admission: admission,
-            },
-            request,
+    if route.external_provider.is_some() {
+        let tool_audit = request.tool_audit_detail();
+        let upstream_timeout = model_upstream_timeout(&state, &model);
+        return match dispatch_chat_request(
+            &state, &route, &body, request_id, &principal, &model, started,
         )
-        .await;
-    }
-
-    let (upstream_response, upstream_alias) = match dispatch_chat_request(
-        &state,
-        &route,
-        &original_body,
-        request_id,
-        &principal,
-        &model,
-        started,
-    )
-    .await
-    {
-        Ok(dispatched) => dispatched,
-        Err(DispatchFailure::NoUpstream(err)) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                principal,
-                "chat.completions",
-                model,
-                "rejected",
-                json!({ "reason": err }),
-            )
-            .await;
-            return with_request_id(
-                error_response(StatusCode::BAD_GATEWAY, "upstream_unavailable", err),
-                request_id,
-            );
-        }
-        Err(DispatchFailure::BadRequest(err)) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                principal,
-                "chat.completions",
-                model,
-                "rejected",
-                json!({ "reason": err }),
-            )
-            .await;
-            return with_request_id(
+        .await
+        {
+            Ok((upstream_response, upstream_model)) if request.stream => {
+                stream_upstream(
+                    state,
+                    upstream_response,
+                    UpstreamRequestContext {
+                        request_id,
+                        principal,
+                        model,
+                        upstream_model,
+                        upstream_timeout,
+                        external_provider: route.external_provider,
+                        tool_audit,
+                        started,
+                        admission,
+                    },
+                )
+                .await
+            }
+            Ok((upstream_response, upstream_model)) => {
+                json_upstream(
+                    state,
+                    upstream_response,
+                    UpstreamRequestContext {
+                        request_id,
+                        principal,
+                        model,
+                        upstream_model,
+                        upstream_timeout,
+                        external_provider: route.external_provider,
+                        tool_audit,
+                        started,
+                        admission,
+                    },
+                )
+                .await
+            }
+            Err(DispatchFailure::BadRequest(err)) => with_request_id(
                 error_response(StatusCode::BAD_REQUEST, "bad_request", err),
                 request_id,
-            );
-        }
-        Err(DispatchFailure::Request {
-            status,
-            code,
-            message,
-            usage_status,
-        }) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                principal,
-                "chat.completions",
-                model,
-                "error",
-                json!({ "reason": usage_status }),
-            )
-            .await;
-            return with_request_id(error_response(status, code, message), request_id);
-        }
-    };
-
-    if request.stream {
-        let upstream_context = UpstreamRequestContext {
-            request_id,
-            principal,
-            model,
-            upstream_model: upstream_alias,
-            upstream_timeout: model_upstream_timeout(&state, &route.requested_alias),
-            started,
-            admission,
+            ),
+            Err(DispatchFailure::NoUpstream(message)) => with_request_id(
+                error_response(StatusCode::BAD_GATEWAY, "upstream_unavailable", message),
+                request_id,
+            ),
+            Err(DispatchFailure::Request {
+                status,
+                code,
+                message,
+                usage_status,
+            }) => {
+                record_usage(
+                    &state,
+                    UsageRecordInput {
+                        request_id,
+                        principal: &principal,
+                        model: &model,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        latency_ms: elapsed_ms(started),
+                        status: usage_status,
+                        accounting_mode: "none",
+                    },
+                )
+                .await;
+                with_request_id(error_response(status, code, message), request_id)
+            }
         };
-        stream_upstream(state, upstream_response, upstream_context).await
-    } else {
-        let upstream_context = UpstreamRequestContext {
-            request_id,
-            principal,
-            model,
-            upstream_model: upstream_alias,
-            upstream_timeout: model_upstream_timeout(&state, &route.requested_alias),
-            started,
-            admission,
-        };
-        json_upstream(state, upstream_response, upstream_context).await
     }
+
+    dispatch_native_chat(
+        state,
+        NativeChatContext {
+            request_id,
+            principal,
+            model,
+            upstream_model: route.upstream_alias,
+            tool_audit: request.tool_audit_detail(),
+            started,
+            _admission: admission,
+        },
+        request,
+    )
+    .await
 }
 
 async fn dispatch_native_chat(
@@ -1413,9 +1774,15 @@ async fn dispatch_native_chat(
 
     let native_request = native::NativeChatRequest {
         model: context.upstream_model.clone(),
-        messages: request.messages,
+        messages: request
+            .messages
+            .into_iter()
+            .map(sanitize_native_chat_message)
+            .collect(),
         temperature: request.temperature,
         max_tokens: request.max_tokens,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
         metadata: native_chat_metadata(request.metadata, &context, request.stream),
     };
 
@@ -1444,6 +1811,7 @@ struct NativeChatContext {
     principal: Principal,
     model: String,
     upstream_model: String,
+    tool_audit: ToolAuditDetail,
     started: Instant,
     _admission: AdmissionPermit,
 }
@@ -1474,6 +1842,13 @@ async fn native_chat_response(
         },
     )
     .await;
+    let detail = chat_audit_detail(
+        &context.tool_audit,
+        json!({
+            "runtime_backend": "candle-native",
+            "token_accounting": native_response.usage.accounting_mode.clone()
+        }),
+    );
     record_audit(
         state,
         Some(context.request_id),
@@ -1481,12 +1856,19 @@ async fn native_chat_response(
         "chat.completions",
         context.model.clone(),
         "ok",
-        json!({
-            "runtime_backend": "candle-native",
-            "token_accounting": native_response.usage.accounting_mode.clone()
-        }),
+        detail,
     )
     .await;
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": native_response.content
+    });
+    if let Some(tool_calls) = native_response.tool_calls {
+        if let Some(object) = message.as_object_mut() {
+            object.insert("tool_calls".to_string(), tool_calls);
+        }
+    }
 
     let body = Json(json!({
         "id": format!("chatcmpl-{}", context.request_id),
@@ -1495,10 +1877,7 @@ async fn native_chat_response(
         "model": native_response.model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": native_response.content
-            },
+            "message": message,
             "finish_reason": native_response.finish_reason
         }],
         "usage": {
@@ -1535,6 +1914,14 @@ async fn native_chat_stream_response(
         },
     )
     .await;
+    let detail = chat_audit_detail(
+        &context.tool_audit,
+        json!({
+            "runtime_backend": "candle-native",
+            "stream": true,
+            "token_accounting": native_response.usage.accounting_mode.clone()
+        }),
+    );
     record_audit(
         state,
         Some(context.request_id),
@@ -1542,11 +1929,7 @@ async fn native_chat_stream_response(
         "chat.completions",
         context.model.clone(),
         "ok",
-        json!({
-            "runtime_backend": "candle-native",
-            "stream": true,
-            "token_accounting": native_response.usage.accounting_mode.clone()
-        }),
+        detail,
     )
     .await;
 
@@ -1602,6 +1985,28 @@ async fn native_chat_runtime_error(
     err: anyhow::Error,
 ) -> Response {
     tracing::warn!(error = %err, "native runtime failed");
+    let message = err.to_string();
+    let queue_full = message.contains("native scheduler queue is full");
+    let status_text = if queue_full {
+        "native_scheduler_queue_full"
+    } else {
+        "native_runtime_error"
+    };
+    let http_status = if queue_full {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let error_code = if queue_full {
+        "rate_limit_exceeded"
+    } else {
+        "native_runtime_error"
+    };
+    let error_message = if queue_full {
+        "native scheduler queue is full; retry later"
+    } else {
+        "native runtime failed to serve chat completions"
+    };
     record_usage(
         state,
         UsageRecordInput {
@@ -1611,7 +2016,7 @@ async fn native_chat_runtime_error(
             input_tokens: 0,
             output_tokens: 0,
             latency_ms: elapsed_ms(context.started),
-            status: "native_runtime_error",
+            status: status_text,
             accounting_mode: "none",
         },
     )
@@ -1624,17 +2029,13 @@ async fn native_chat_runtime_error(
         context.model,
         "error",
         json!({
-            "reason": "native_runtime_error",
+            "reason": status_text,
             "runtime_backend": "candle-native"
         }),
     )
     .await;
     with_request_id(
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "native_runtime_error",
-            "native runtime failed to serve chat completions".to_string(),
-        ),
+        error_response(http_status, error_code, error_message.to_string()),
         context.request_id,
     )
 }
@@ -1706,6 +2107,18 @@ fn native_chat_metadata(
         Value::String(context.upstream_model.clone()),
     );
     metadata.insert("llmctl.stream".to_string(), Value::Bool(stream));
+    metadata.insert(
+        "llmctl.tool_schema_count".to_string(),
+        Value::from(context.tool_audit.tool_schema_count),
+    );
+    metadata.insert(
+        "llmctl.tool_choice".to_string(),
+        context.tool_audit.tool_choice.clone(),
+    );
+    metadata.insert(
+        "llmctl.tool_call_count".to_string(),
+        Value::from(context.tool_audit.tool_call_count),
+    );
     metadata
 }
 
@@ -1769,15 +2182,21 @@ async fn dispatch_chat_request(
     let mut last_failure = None;
 
     for alias in aliases {
+        let external_provider = if alias == route.upstream_alias {
+            route.external_provider.clone()
+        } else {
+            None
+        };
         let attempt_route = ResolvedModelRoute {
             requested_alias: route.requested_alias.clone(),
             upstream_alias: alias.clone(),
             fallback_aliases: Vec::new(),
+            external_provider,
         };
         let body = rewrite_chat_model(original_body, &attempt_route)
             .map_err(DispatchFailure::BadRequest)?;
-        let upstream_base =
-            upstream_for_alias(state, &alias).map_err(DispatchFailure::NoUpstream)?;
+        let target = dispatch_target(state, &attempt_route)?;
+        let upstream_base = target.base_url.clone();
         if !state.circuit_breakers.allow_request(
             &upstream_base,
             Duration::from_secs(state.cfg.server.circuit_breaker_reset_seconds),
@@ -1791,14 +2210,17 @@ async fn dispatch_chat_request(
             continue;
         }
         let upstream = format!("{upstream_base}/v1/chat/completions");
+        let mut request_builder = state
+            .client
+            .post(upstream)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(api_key) = target.api_key {
+            request_builder = request_builder.bearer_auth(api_key);
+        }
         match timeout(
             model_upstream_timeout(state, &route.requested_alias),
-            state
-                .client
-                .post(upstream)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send(),
+            request_builder.send(),
         )
         .await
         {
@@ -1859,6 +2281,50 @@ async fn dispatch_chat_request(
     }))
 }
 
+#[derive(Debug)]
+struct DispatchTarget {
+    base_url: String,
+    api_key: Option<String>,
+}
+
+fn dispatch_target(
+    state: &ServerState,
+    route: &ResolvedModelRoute,
+) -> std::result::Result<DispatchTarget, DispatchFailure> {
+    if let Some(provider) = route.external_provider.as_ref() {
+        let api_key = env::var(&provider.api_key_env).map_err(|_| DispatchFailure::Request {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_api_key_unavailable",
+            message: format!(
+                "external provider {} API key is not available from configured environment reference",
+                provider.id
+            ),
+            usage_status: "provider_api_key_unavailable",
+        })?;
+        if api_key.trim().is_empty() {
+            return Err(DispatchFailure::Request {
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_api_key_unavailable",
+                message: format!(
+                    "external provider {} API key is empty in configured environment reference",
+                    provider.id
+                ),
+                usage_status: "provider_api_key_unavailable",
+            });
+        }
+        return Ok(DispatchTarget {
+            base_url: provider.base_url.clone(),
+            api_key: Some(api_key.trim().to_string()),
+        });
+    }
+
+    Ok(DispatchTarget {
+        base_url: upstream_for_alias(state, &route.upstream_alias)
+            .map_err(DispatchFailure::NoUpstream)?,
+        api_key: None,
+    })
+}
+
 fn should_retry_upstream_status(status: StatusCode) -> bool {
     status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
 }
@@ -1880,6 +2346,8 @@ struct UpstreamRequestContext {
     model: String,
     upstream_model: String,
     upstream_timeout: Duration,
+    external_provider: Option<ResolvedExternalProvider>,
+    tool_audit: ToolAuditDetail,
     started: Instant,
     admission: AdmissionPermit,
 }
@@ -1895,6 +2363,8 @@ async fn json_upstream(
         model,
         upstream_model,
         upstream_timeout,
+        external_provider,
+        tool_audit,
         started,
         admission: _admission,
     } = context;
@@ -1970,7 +2440,11 @@ async fn json_upstream(
         "chat.completions",
         model.clone(),
         status_text,
-        json!({ "status": status.as_u16() }),
+        chat_route_audit_detail(
+            &tool_audit,
+            json!({ "status": status.as_u16() }),
+            external_provider.as_ref(),
+        ),
     )
     .await;
 
@@ -1993,6 +2467,8 @@ async fn stream_upstream(
         model,
         upstream_model,
         upstream_timeout,
+        external_provider,
+        tool_audit,
         started,
         admission,
     } = context;
@@ -2019,7 +2495,11 @@ async fn stream_upstream(
             "chat.completions",
             model,
             "upstream_error",
-            json!({ "status": status.as_u16(), "stream": true }),
+            chat_route_audit_detail(
+                &tool_audit,
+                json!({ "status": status.as_u16(), "stream": true }),
+                external_provider.as_ref(),
+            ),
         )
         .await;
         return with_request_id(
@@ -2076,7 +2556,11 @@ async fn stream_upstream(
                         "chat.completions",
                         model.clone(),
                         "timeout",
-                        json!({ "status": status.as_u16(), "stream": true }),
+                        chat_route_audit_detail(
+                            &tool_audit,
+                            json!({ "status": status.as_u16(), "stream": true }),
+                            external_provider.as_ref(),
+                        ),
                     )
                     .await;
                     yield Err::<Bytes, std::io::Error>(std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream stream timed out"));
@@ -2120,7 +2604,11 @@ async fn stream_upstream(
                                 "chat.completions",
                                 model.clone(),
                                 "stream_error",
-                                json!({ "status": status.as_u16(), "stream": true, "reason": reason }),
+                                chat_route_audit_detail(
+                                    &tool_audit,
+                                    json!({ "status": status.as_u16(), "stream": true, "reason": reason }),
+                                    external_provider.as_ref(),
+                                ),
                             )
                             .await;
                             yield Err::<Bytes, std::io::Error>(std::io::Error::other(reason));
@@ -2157,7 +2645,11 @@ async fn stream_upstream(
                         "chat.completions",
                         model.clone(),
                         "stream_error",
-                        json!({ "status": status.as_u16(), "stream": true, "reason": upstream_error_status(&err) }),
+                        chat_route_audit_detail(
+                            &tool_audit,
+                            json!({ "status": status.as_u16(), "stream": true, "reason": upstream_error_status(&err) }),
+                            external_provider.as_ref(),
+                        ),
                     )
                     .await;
                     yield Err::<Bytes, std::io::Error>(std::io::Error::other("upstream stream failed"));
@@ -2193,7 +2685,11 @@ async fn stream_upstream(
             "chat.completions",
             model.clone(),
             stream_status(input_tokens, output_tokens),
-            json!({ "status": status.as_u16(), "stream": true, "metered": input_tokens > 0 || output_tokens > 0 }),
+            chat_route_audit_detail(
+                &tool_audit,
+                json!({ "status": status.as_u16(), "stream": true, "metered": input_tokens > 0 || output_tokens > 0 }),
+                external_provider.as_ref(),
+            ),
         )
         .await;
     };
@@ -2208,10 +2704,6 @@ async fn stream_upstream(
     } else {
         response
     }
-}
-
-fn upstream_timeout_budget(state: &ServerState) -> Duration {
-    state.serving_limits.upstream_timeout()
 }
 
 fn model_upstream_timeout(state: &ServerState, alias: &str) -> Duration {
@@ -2370,12 +2862,22 @@ struct ResolvedModelRoute {
     requested_alias: String,
     upstream_alias: String,
     fallback_aliases: Vec<String>,
+    external_provider: Option<ResolvedExternalProvider>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedExternalProvider {
+    id: String,
+    kind: ExternalProviderKind,
+    base_url: String,
+    api_key_env: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModelRouteError {
     UnknownAlias(String),
     NoConfiguredModels,
+    ExternalProviderRoutingDisabled(String),
 }
 
 impl std::fmt::Display for ModelRouteError {
@@ -2383,6 +2885,10 @@ impl std::fmt::Display for ModelRouteError {
         match self {
             Self::UnknownAlias(alias) => write!(f, "unknown model alias: {alias}"),
             Self::NoConfiguredModels => write!(f, "no models are configured"),
+            Self::ExternalProviderRoutingDisabled(provider) => write!(
+                f,
+                "external provider routing is disabled for provider {provider}"
+            ),
         }
     }
 }
@@ -2406,6 +2912,7 @@ fn resolve_model_route(
             requested_alias: requested_alias.to_string(),
             upstream_alias: requested_alias.to_string(),
             fallback_aliases: Vec::new(),
+            external_provider: None,
         });
     }
 
@@ -2435,11 +2942,17 @@ fn resolve_model_route(
     } else {
         Vec::new()
     };
+    if let Some(route) = cfg.external_providers.route_for_model(&upstream.alias) {
+        return Err(ModelRouteError::ExternalProviderRoutingDisabled(
+            route.provider.clone(),
+        ));
+    }
 
     Ok(ResolvedModelRoute {
         requested_alias: requested_alias.to_string(),
         upstream_alias: upstream.alias.clone(),
         fallback_aliases,
+        external_provider: None,
     })
 }
 
@@ -2524,14 +3037,26 @@ fn authenticate(cfg: &Config, headers: &HeaderMap) -> std::result::Result<Princi
     cfg.security
         .api_keys
         .iter()
+        .filter(|key| api_key_can_authenticate(key))
         .find(|key| constant_time_eq_case_insensitive(&key.sha256, &digest))
         .map(|key| Principal {
             subject: key.subject.clone(),
             team: key.team.clone(),
             scopes: key.scopes.clone(),
             key_id: Some(key.id.clone()),
+            key_owner: key.owner.clone(),
+            key_purpose: key.purpose.clone(),
+            key_status: Some(key.status.clone()),
         })
         .ok_or_else(|| "invalid bearer token".to_string())
+}
+
+fn api_key_can_authenticate(key: &ApiKeyConfig) -> bool {
+    if !matches!(key.status.as_str(), "active" | "retiring") {
+        return false;
+    }
+    key.expires_at
+        .is_none_or(|expires_at| expires_at > Utc::now())
 }
 
 fn authenticate_request(
@@ -2576,12 +3101,9 @@ fn constant_time_eq_case_insensitive(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
     }
-
-    let mut diff = 0u8;
-    for (left, right) in left.bytes().zip(right.bytes()) {
-        diff |= left.to_ascii_lowercase() ^ right.to_ascii_lowercase();
-    }
-    diff == 0
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    left.as_bytes().ct_eq(right.as_bytes()).into()
 }
 
 async fn record_audit(
@@ -2600,11 +3122,37 @@ async fn record_audit(
                 object
                     .entry("api_key_id".to_string())
                     .or_insert_with(|| json!(key_id));
+                object
+                    .entry("api_key_subject".to_string())
+                    .or_insert_with(|| json!(principal.subject.as_str()));
+                object
+                    .entry("api_key_team".to_string())
+                    .or_insert_with(|| json!(principal.team.as_str()));
+                if let Some(owner) = principal.key_owner.as_deref() {
+                    object
+                        .entry("api_key_owner".to_string())
+                        .or_insert_with(|| json!(owner));
+                }
+                if let Some(purpose) = principal.key_purpose.as_deref() {
+                    object
+                        .entry("api_key_purpose".to_string())
+                        .or_insert_with(|| json!(purpose));
+                }
+                if let Some(status) = principal.key_status.as_deref() {
+                    object
+                        .entry("api_key_status".to_string())
+                        .or_insert_with(|| json!(status));
+                }
             }
             None => {
                 detail = json!({
                     "detail": detail,
                     "api_key_id": key_id,
+                    "api_key_subject": principal.subject.as_str(),
+                    "api_key_team": principal.team.as_str(),
+                    "api_key_owner": principal.key_owner.as_deref(),
+                    "api_key_purpose": principal.key_purpose.as_deref(),
+                    "api_key_status": principal.key_status.as_deref(),
                 });
             }
         }
@@ -3171,6 +3719,7 @@ fn quota_decision_header_name() -> HeaderName {
     HeaderName::from_static("x-llmctl-quota-decision")
 }
 
+#[cfg(test)]
 fn normalize_upstream(raw: &str) -> String {
     let raw = raw.trim().trim_end_matches('/');
     if raw.starts_with("http://") || raw.starts_with("https://") {
@@ -3181,12 +3730,7 @@ fn normalize_upstream(raw: &str) -> String {
 }
 
 fn serving_upstreams(cfg: &Config) -> BTreeMap<String, String> {
-    let raw = cfg.server.llama_server.trim();
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        return BTreeMap::from([("*".to_string(), normalize_upstream(raw))]);
-    }
-
-    let upstreams = StartupPlan::from_config(cfg)
+    StartupPlan::from_config(cfg)
         .workers
         .into_iter()
         .map(|planned| {
@@ -3195,12 +3739,7 @@ fn serving_upstreams(cfg: &Config) -> BTreeMap<String, String> {
                 planned.worker.upstream(),
             )
         })
-        .collect::<BTreeMap<_, _>>();
-    if upstreams.is_empty() {
-        BTreeMap::from([("*".to_string(), normalize_upstream(raw))])
-    } else {
-        upstreams
-    }
+        .collect::<BTreeMap<_, _>>()
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -3220,6 +3759,139 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(default)]
     metadata: Option<Value>,
+    #[serde(default)]
+    tools: Option<Value>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolAuditDetail {
+    tool_schema_count: u64,
+    tool_choice: Value,
+    tool_call_count: u64,
+}
+
+impl ChatCompletionRequest {
+    fn tool_audit_detail(&self) -> ToolAuditDetail {
+        ToolAuditDetail {
+            tool_schema_count: self
+                .tools
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|tools| tools.len() as u64)
+                .unwrap_or(0),
+            tool_choice: safe_tool_choice(self.tool_choice.as_ref()),
+            tool_call_count: self
+                .messages
+                .iter()
+                .filter_map(|message| message.tool_calls.as_ref())
+                .map(tool_call_count)
+                .sum(),
+        }
+    }
+}
+
+fn tool_call_count(value: &Value) -> u64 {
+    value
+        .as_array()
+        .map(|calls| calls.len() as u64)
+        .unwrap_or(1)
+}
+
+fn safe_tool_choice(value: Option<&Value>) -> Value {
+    match value {
+        None => Value::Null,
+        Some(Value::String(choice)) => Value::String(choice.clone()),
+        Some(Value::Object(object)) => {
+            let mut safe = serde_json::Map::new();
+            if let Some(choice_type) = object.get("type").and_then(Value::as_str) {
+                safe.insert("type".to_string(), Value::String(choice_type.to_string()));
+            }
+            if let Some(function_name) = object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            {
+                safe.insert(
+                    "function_name".to_string(),
+                    Value::String(function_name.to_string()),
+                );
+            }
+            Value::Object(safe)
+        }
+        Some(other) => json!({ "type": other_type_name(other) }),
+    }
+}
+
+fn other_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn chat_audit_detail(tool: &ToolAuditDetail, mut detail: Value) -> Value {
+    if let Some(object) = detail.as_object_mut() {
+        object.insert(
+            "tool_schema_count".to_string(),
+            Value::from(tool.tool_schema_count),
+        );
+        object.insert("tool_choice".to_string(), tool.tool_choice.clone());
+        object.insert(
+            "tool_call_count".to_string(),
+            Value::from(tool.tool_call_count),
+        );
+    }
+    detail
+}
+
+fn chat_route_audit_detail(
+    tool: &ToolAuditDetail,
+    detail: Value,
+    provider: Option<&ResolvedExternalProvider>,
+) -> Value {
+    let mut detail = chat_audit_detail(tool, detail);
+    if let Some(object) = detail.as_object_mut() {
+        if let Some(provider) = provider {
+            object.insert("provider_routing".to_string(), json!("external"));
+            object.insert("provider_id".to_string(), json!(provider.id.as_str()));
+            object.insert("provider_kind".to_string(), json!(provider.kind));
+            object.insert("provider_api_key_source".to_string(), json!("env"));
+        } else {
+            object.insert("provider_routing".to_string(), json!("local"));
+        }
+    }
+    detail
+}
+
+fn sanitize_native_chat_message(
+    mut message: native::NativeChatMessage,
+) -> native::NativeChatMessage {
+    message.tool_calls = message.tool_calls.map(sanitize_tool_calls);
+    message
+}
+
+fn sanitize_tool_calls(value: Value) -> Value {
+    match value {
+        Value::Array(calls) => Value::Array(calls.into_iter().map(sanitize_tool_call).collect()),
+        other => sanitize_tool_call(other),
+    }
+}
+
+fn sanitize_tool_call(value: Value) -> Value {
+    let Value::Object(mut object) = value else {
+        return value;
+    };
+    if let Some(Value::Object(function)) = object.get_mut("function") {
+        function.remove("arguments");
+    }
+    Value::Object(object)
 }
 
 #[derive(Debug, Serialize)]
@@ -3341,6 +4013,17 @@ async fn serve_with_storage_worker_control_native_engine_and_shutdown<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    if cfg.server.tls.enabled {
+        return serve_https_with_storage_worker_control_native_engine_and_shutdown(
+            cfg,
+            storage,
+            worker_control,
+            native_engines,
+            shutdown,
+        )
+        .await;
+    }
+
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -3352,7 +4035,7 @@ where
         draining.clone(),
         cfg.server.graceful_drain_seconds,
     );
-    let heartbeat = spawn_runtime_heartbeat(&cfg);
+    let heartbeat = spawn_runtime_heartbeat(&cfg, draining.clone());
     let result = axum::serve(
         listener,
         router_with_worker_control_native_engine_and_drain(
@@ -3371,6 +4054,176 @@ where
         handle.abort();
     }
     result
+}
+
+async fn serve_https_with_storage_worker_control_native_engine_and_shutdown<S>(
+    cfg: Config,
+    storage: Storage,
+    worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    native_engines: NativeEngineRegistry,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let tls_acceptor = build_tls_acceptor(&cfg).await?;
+    let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
+    let limits = ServingLimits::from_config(&cfg);
+    let draining = Arc::new(AtomicBool::new(false));
+    let shutdown = drain_before_shutdown(
+        shutdown,
+        draining.clone(),
+        cfg.server.graceful_drain_seconds,
+    );
+    let app = router_with_worker_control_native_engine_and_drain(
+        cfg.clone(),
+        storage,
+        limits,
+        worker_control,
+        native_engines,
+        draining.clone(),
+    );
+    let heartbeat = spawn_runtime_heartbeat(&cfg, draining.clone());
+    let result = serve_tls(listener, tls_acceptor, app, shutdown)
+        .await
+        .context("serve HTTPS API");
+    if let Some(handle) = heartbeat {
+        handle.abort();
+    }
+    result
+}
+
+async fn build_tls_acceptor(cfg: &Config) -> Result<TlsAcceptor> {
+    let cert_path = cfg
+        .server
+        .tls
+        .cert_path
+        .as_ref()
+        .context("server.tls.cert-path is required when server TLS is enabled")?;
+    let key_path = cfg
+        .server
+        .tls
+        .key_path
+        .as_ref()
+        .context("server.tls.key-path is required when server TLS is enabled")?;
+    anyhow::ensure!(
+        !cfg.server.tls.require_client_cert,
+        "server.tls.require-client-cert is not supported without client CA configuration"
+    );
+
+    let cert_bytes = tokio::fs::read(cert_path)
+        .await
+        .with_context(|| format!("read TLS certificate {}", cert_path.display()))?;
+    let key_bytes = tokio::fs::read(key_path)
+        .await
+        .with_context(|| format!("read TLS private key {}", key_path.display()))?;
+
+    use rustls::pki_types::pem::PemObject;
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_bytes)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parse TLS certificate {}", cert_path.display()))?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "TLS certificate {} did not contain any certificates",
+        cert_path.display()
+    );
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes)
+        .with_context(|| format!("parse TLS private key {}", key_path.display()))?;
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build TLS server config")?;
+
+    Ok(TlsAcceptor::from(Arc::new(tls_config)))
+}
+
+async fn serve_tls<S>(
+    listener: tokio::net::TcpListener,
+    tls_acceptor: TlsAcceptor,
+    app: Router,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
+    let signal_tx = Arc::new(signal_tx);
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(signal_rx);
+    });
+
+    let (close_tx, close_rx) = tokio::sync::watch::channel(());
+    loop {
+        let (tcp_stream, remote_addr) = tokio::select! {
+            result = listener.accept() => result.context("accept TLS connection")?,
+            _ = signal_tx.closed() => break,
+        };
+
+        let tls_acceptor = tls_acceptor.clone();
+        let app = app.clone();
+        let signal_tx = Arc::clone(&signal_tx);
+        let close_rx = close_rx.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = tokio::select! {
+                result = timeout(TLS_HANDSHAKE_TIMEOUT, tls_acceptor.accept(tcp_stream)) => {
+                    match result {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(err)) => {
+                            tracing::debug!(%remote_addr, error = ?err, "TLS handshake failed");
+                            drop(close_rx);
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%remote_addr, "TLS handshake timed out");
+                            drop(close_rx);
+                            return;
+                        }
+                    }
+                }
+                _ = signal_tx.closed() => {
+                    drop(close_rx);
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let tower_service =
+                app.map_request(|req: axum::http::Request<Incoming>| req.map(Body::new));
+            let hyper_service = TowerToHyperService::new(tower_service);
+            let builder = HyperBuilder::new(TokioExecutor::new());
+            let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+            pin_mut!(conn);
+
+            let signal_closed = signal_tx.closed().fuse();
+            pin_mut!(signal_closed);
+
+            loop {
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(err) = result {
+                            tracing::debug!(%remote_addr, error = ?err, "failed to serve TLS connection");
+                        }
+                        break;
+                    }
+                    _ = &mut signal_closed => {
+                        conn.as_mut().graceful_shutdown();
+                    }
+                }
+            }
+
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    close_tx.closed().await;
+
+    Ok(())
 }
 
 async fn drain_before_shutdown<S>(shutdown: S, draining: Arc<AtomicBool>, drain_seconds: u64)
@@ -3396,7 +4249,7 @@ where
     }
 }
 
-fn spawn_runtime_heartbeat(cfg: &Config) -> Option<JoinHandle<()>> {
+fn spawn_runtime_heartbeat(cfg: &Config, draining: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
     let interval_seconds = cfg.runtime.heartbeat_interval_seconds;
     if interval_seconds == 0 {
         return None;
@@ -3404,21 +4257,23 @@ fn spawn_runtime_heartbeat(cfg: &Config) -> Option<JoinHandle<()>> {
 
     let cfg = cfg.clone();
     Some(tokio::spawn(async move {
-        emit_runtime_heartbeat(&cfg);
+        emit_runtime_heartbeat(&cfg, draining.load(Ordering::SeqCst));
         loop {
             tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
-            emit_runtime_heartbeat(&cfg);
+            emit_runtime_heartbeat(&cfg, draining.load(Ordering::SeqCst));
         }
     }))
 }
 
-fn emit_runtime_heartbeat(cfg: &Config) {
+fn emit_runtime_heartbeat(cfg: &Config, draining: bool) {
     let heartbeat = native::heartbeat_from_config(cfg);
+    let mut attributes = heartbeat.safe_telemetry_attributes();
+    attributes.insert("llmctl.server.draining".to_string(), json!(draining));
     emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
         TelemetrySignal::Metric,
         TelemetryEventName::RuntimeHeartbeat,
         Utc::now(),
-        heartbeat.safe_telemetry_attributes(),
+        attributes,
     ));
 }
 
@@ -3557,16 +4412,13 @@ data: [DONE]
     }
 
     #[test]
-    fn executable_llama_server_routes_to_planned_worker_upstream() {
+    fn candle_native_routes_to_planned_worker_upstream_metadata() {
         let cfg = Config {
-            server: ServerConfig {
-                llama_server: "/usr/local/bin/llama-server".to_string(),
-                ..ServerConfig::default()
-            },
             models: vec![ModelConfig {
                 alias: "llama".to_string(),
                 path: "/models/llama.gguf".into(),
                 role: "chat".to_string(),
+                family: Some("qwen3".to_string()),
                 weight: 1,
             }],
             ..Default::default()
@@ -3672,6 +4524,9 @@ data: [DONE]
             team: "platform".to_string(),
             scopes: vec!["chat".to_string()],
             key_id: Some("alice-key".to_string()),
+            key_owner: None,
+            key_purpose: None,
+            key_status: Some("active".to_string()),
         };
 
         assert_eq!(
@@ -3770,6 +4625,14 @@ data: [DONE]
                     subject: "alice".to_string(),
                     team: "platform".to_string(),
                     scopes: vec!["chat".to_string()],
+                    created_at: None,
+                    expires_at: None,
+                    rotated_at: None,
+                    owner: None,
+                    purpose: None,
+                    last_four: None,
+                    fingerprint: None,
+                    status: "active".to_string(),
                 }],
                 ..SecurityConfig::default()
             },
@@ -3872,6 +4735,26 @@ data: [DONE]
         result.expect("server result");
     }
 
+    #[tokio::test]
+    async fn tls_enabled_without_cert_or_key_fails_before_serving() {
+        let storage = Storage::in_memory().await.expect("storage");
+        let mut cfg = Config::default();
+        cfg.server.port = 0;
+        cfg.server.tls.enabled = true;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let err = serve_with_storage_and_shutdown(cfg, storage, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect_err("missing cert/key should fail before serving");
+
+        assert!(
+            err.to_string().contains("server.tls.cert-path"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn fallback_mode_routes_zero_weight_models_to_first_positive_weight_model() {
         let cfg = config_with_models(
@@ -3901,6 +4784,7 @@ data: [DONE]
             requested_alias: "light".to_string(),
             upstream_alias: "heavy".to_string(),
             fallback_aliases: Vec::new(),
+            external_provider: None,
         };
 
         let rewritten = rewrite_chat_model(body, &route).unwrap();
@@ -3923,6 +4807,7 @@ data: [DONE]
             alias: alias.to_string(),
             path: format!("/models/{alias}.gguf").into(),
             role: role.to_string(),
+            family: Some("qwen3".to_string()),
             weight,
         }
     }

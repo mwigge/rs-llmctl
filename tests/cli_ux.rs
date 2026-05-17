@@ -7,6 +7,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -29,7 +31,6 @@ mode = "single"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "127.0.0.1:8080"
 context_size = 8192
 
 [security]
@@ -137,6 +138,184 @@ fn observation_event(kind: &str, model: &str, value: f64) -> ObservationEvent {
         unit: "ratio".to_string(),
         attributes_json: json!({ "source": "cli_ux" }),
     }
+}
+
+#[test]
+fn first_run_defaults_to_json_plan_without_side_effects_or_network() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let secret_file = dir.path().join("operator.secret");
+
+    let mut first_run = llmctl();
+    first_run
+        .arg("--config")
+        .arg(&config)
+        .arg("first-run")
+        .arg("--secret-output")
+        .arg(&secret_file);
+    let plan = assert_success_json(first_run);
+
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["mode"], "dry-run");
+    assert_eq!(plan["side_effects"], false);
+    assert_eq!(plan["config_exists"], false);
+    assert_eq!(plan["api_key"]["action"], "generate");
+    assert_eq!(plan["api_key"]["plaintext_secret_storage"], false);
+    assert_eq!(plan["api_key"]["config_storage"], "sha256-only");
+    assert_eq!(plan["starter_model"]["action"], "recommend");
+    assert_eq!(plan["starter_model"]["network"], false);
+    assert_eq!(plan["smoke"]["action"], "plan");
+    assert_eq!(plan["smoke"]["ask_question"]["helper"], "ask_question");
+    assert_eq!(
+        plan["smoke"]["openai_compatible"]["endpoint"],
+        "/v1/chat/completions"
+    );
+    assert!(plan.get("secret").is_none());
+    assert!(
+        !config.exists(),
+        "dry-run first-run must not create config files"
+    );
+    assert!(
+        !secret_file.exists(),
+        "dry-run first-run must not write generated secrets"
+    );
+}
+
+#[test]
+fn runtime_validation_plan_is_offline_json_without_model_artifacts() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(&dir);
+
+    let mut command = llmctl();
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("--json")
+        .arg("runtime")
+        .arg("validation-plan")
+        .arg("--soak-minutes")
+        .arg("15")
+        .arg("--streaming-concurrency")
+        .arg("4")
+        .arg("--rotation-keys")
+        .arg("2")
+        .arg("--quota-concurrency")
+        .arg("6");
+    let plan = assert_success_json(command);
+
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["mode"], "deterministic-offline");
+    assert_eq!(plan["network"], false);
+    assert_eq!(
+        plan["real_artifact_smoke_tests"].as_array().unwrap().len(),
+        4
+    );
+    assert!(plan["real_artifact_smoke_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|test| test["required_format"] == "safetensors"));
+    assert!(plan["real_artifact_smoke_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|test| test["artifact_validation"]["status"] == "planned-missing-local-artifact"));
+    assert_eq!(plan["hardware_matrix"].as_array().unwrap().len(), 4);
+    assert!(plan["hardware_matrix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["target"] == "amd-vulkan"));
+    assert_eq!(plan["soak_tests"][0]["duration_minutes"], 15);
+    assert_eq!(plan["soak_tests"][0]["concurrency"], 4);
+    assert_eq!(plan["api_key_rotation_and_quota"]["rotation_keys"], 2);
+    assert_eq!(plan["api_key_rotation_and_quota"]["quota_concurrency"], 6);
+    assert!(plan["benchmark"]["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|metric| metric == "tokens_per_second"));
+    assert!(plan["benchmark"]["memory_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "peak_vram_bytes"));
+}
+
+#[test]
+fn first_run_apply_writes_hashed_key_local_model_config_and_smoke_plan() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    let secret_file = dir.path().join("operator.secret");
+    let starter_model = dir.path().join("tiny.gguf");
+    fs::write(&starter_model, b"tiny local starter model").expect("write starter model");
+
+    let mut first_run = llmctl();
+    first_run
+        .arg("--config")
+        .arg(&config)
+        .arg("first-run")
+        .arg("--apply")
+        .arg("--secret-output")
+        .arg(&secret_file)
+        .arg("--api-key-id")
+        .arg("operator-first-run")
+        .arg("--subject")
+        .arg("operator")
+        .arg("--team")
+        .arg("platform")
+        .arg("--scope")
+        .arg("chat")
+        .arg("--scope")
+        .arg("models.read")
+        .arg("--starter-model-path")
+        .arg(&starter_model)
+        .arg("--starter-model-alias")
+        .arg("qwen")
+        .arg("--data-dir")
+        .arg(dir.path().join("state"));
+    let applied = assert_success_json(first_run);
+
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["mode"], "apply");
+    assert_eq!(applied["side_effects"], true);
+    assert_eq!(applied["api_key"]["id"], "operator-first-run");
+    assert_eq!(
+        applied["api_key"]["secret_written"],
+        secret_file.display().to_string()
+    );
+    assert_eq!(applied["api_key"]["plaintext_secret_storage"], false);
+    assert_eq!(applied["api_key"]["sha256_present"], true);
+    assert_eq!(applied["starter_model"]["action"], "configured");
+    assert_eq!(applied["starter_model"]["source_kind"], "local");
+    assert_eq!(applied["starter_model"]["network"], false);
+    assert_eq!(applied["smoke"]["base_url"], "http://127.0.0.1:8765/v1");
+    assert!(applied.get("secret").is_none());
+
+    let secret = fs::read_to_string(&secret_file).expect("read generated secret");
+    let secret = secret.trim_end();
+    assert!(secret.starts_with("llmctl_"));
+    let digest = sha256(secret.as_bytes());
+    let saved = read_config(&config);
+    assert!(saved.contains("id = \"operator-first-run\""));
+    assert!(saved.contains(&digest));
+    assert!(saved.contains("require-auth = true"));
+    assert!(saved.contains("alias = \"qwen\""));
+    assert!(saved.contains(starter_model.to_string_lossy().as_ref()));
+    assert!(
+        !saved.contains(secret),
+        "first-run config must store only the key digest"
+    );
+
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&secret_file)
+            .expect("secret metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[test]
@@ -296,7 +475,6 @@ mode = "hot-swap"
 host = "0.0.0.0"
 port = 8765
 worker_base_port = 18765
-llama_server = "127.0.0.1:8080"
 context_size = 8192
 
 [security]
@@ -386,7 +564,6 @@ mode = "weighted"
 host = "0.0.0.0"
 port = 8765
 worker_base_port = 18765
-llama_server = "http://upstream.internal:8080"
 context_size = 8192
 
 [security]
@@ -529,11 +706,10 @@ mode = "cold-swap"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 19000
-llama_server = "/usr/local/bin/llama-server"
 context_size = 4096
 
 [runtime]
-backend = "llama-server"
+backend = "candle-native"
 
 [security]
 production = false
@@ -603,21 +779,15 @@ weight = 1
     assert_eq!(plan["workers"][0]["worker"]["backend"]["type"], "cpu");
     assert_eq!(
         plan["workers"][0]["command"]["program"],
-        "/usr/local/bin/llama-server"
+        "<in-process:candle-native>"
     );
     assert_eq!(
         plan["workers"][0]["command"]["args"],
         serde_json::json!([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "19000",
             "--model",
             chat_path.display().to_string(),
             "--ctx-size",
-            "4096",
-            "--n-gpu-layers",
-            "0"
+            "4096"
         ])
     );
     assert_eq!(plan["workers"][0]["command"]["env"], serde_json::json!([]));
@@ -643,11 +813,10 @@ mode = "hot-swap"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 19100
-llama_server = "llama-server"
 context_size = 8192
 
 [runtime]
-backend = "llama-server"
+backend = "candle-native"
 
 [security]
 production = false
@@ -701,24 +870,18 @@ weight = 1
         plan["workers"][0]["worker"]["backend"],
         serde_json::json!({ "type": "nvidia", "gpu_layers": 99 })
     );
-    assert_eq!(plan["workers"][0]["command"]["program"], "llama-server");
     assert_eq!(
-        plan["workers"][0]["command"]["env"],
-        serde_json::json!([["GGML_CUDA_VISIBLE_DEVICES", "0"]])
+        plan["workers"][0]["command"]["program"],
+        "<in-process:candle-native>"
     );
+    assert_eq!(plan["workers"][0]["command"]["env"], serde_json::json!([]));
     assert_eq!(
         plan["workers"][0]["command"]["args"],
         serde_json::json!([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "19100",
             "--model",
             model_path.display().to_string(),
             "--ctx-size",
-            "8192",
-            "--n-gpu-layers",
-            "99"
+            "8192"
         ])
     );
     assert!(!raw.contains("gpu-server-plan-token"));
@@ -744,7 +907,7 @@ fn server_plan_diff_reports_alias_changes_without_echoing_command_secrets() {
                         "backend": { "type": "cpu" }
                     },
                     "command": {
-                        "program": "llama-server",
+                        "program": "<in-process:candle-native>",
                         "args": ["--model", "/models/chat-v1.gguf", "--api-key", "old-command-secret"],
                         "env": [["LLAMA_TOKEN", "old-env-secret"]]
                     }
@@ -759,7 +922,7 @@ fn server_plan_diff_reports_alias_changes_without_echoing_command_secrets() {
                         "backend": { "type": "cpu" }
                     },
                     "command": {
-                        "program": "llama-server",
+                        "program": "<in-process:candle-native>",
                         "args": ["--model", "/models/embed.gguf"],
                         "env": []
                     }
@@ -783,7 +946,7 @@ fn server_plan_diff_reports_alias_changes_without_echoing_command_secrets() {
                         "backend": { "type": "cpu" }
                     },
                     "command": {
-                        "program": "llama-server",
+                        "program": "<in-process:candle-native>",
                         "args": ["--model", "/models/chat-v2.gguf", "--api-key", "new-command-secret"],
                         "env": [["LLAMA_TOKEN", "new-env-secret"]]
                     }
@@ -798,7 +961,7 @@ fn server_plan_diff_reports_alias_changes_without_echoing_command_secrets() {
                         "backend": { "type": "cpu" }
                     },
                     "command": {
-                        "program": "llama-server",
+                        "program": "<in-process:candle-native>",
                         "args": ["--model", "/models/coder.gguf"],
                         "env": []
                     }
@@ -910,7 +1073,6 @@ mode = "single"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "127.0.0.1:8080"
 context_size = 8192
 
 [security]
@@ -1423,16 +1585,13 @@ fn service_lifecycle_help_and_dry_run_are_json_friendly() {
     assert_eq!(status["status"], "planned");
     assert_eq!(status["action"], "status");
     assert_eq!(status["service_name"], "llmctld.service");
-    assert_eq!(status["scope"], "user");
+    assert_eq!(status["scope"], "system");
     assert_eq!(status["commands"][0]["program"], "systemctl");
     assert_eq!(
         status["commands"][0]["args"],
-        serde_json::json!(["--user", "status", "llmctld.service"])
+        serde_json::json!(["status", "llmctld.service"])
     );
-    assert_eq!(
-        status["restart_hint"],
-        "systemctl --user restart llmctld.service"
-    );
+    assert_eq!(status["restart_hint"], "systemctl restart llmctld.service");
     assert_eq!(status["one_binary"], true);
     assert_eq!(status["runtime_backend"], "candle-native");
     assert_eq!(status["entrypoint"]["program"], "llmctl");
@@ -1521,10 +1680,7 @@ sha256 = "{}"
     assert_eq!(stop["one_binary"], true);
     assert_eq!(stop["entrypoint"]["program"], "llmctl");
     assert_eq!(stop["entrypoint"]["args"], json!(["server", "run"]));
-    assert_eq!(
-        stop["restart_hint"],
-        "systemctl --user restart llmctld.service"
-    );
+    assert_eq!(stop["restart_hint"], "systemctl restart llmctld.service");
     assert!(read_config(&config).contains("weight = 4"));
 
     let mut upgrade = llmctl();
@@ -1569,7 +1725,6 @@ backend = "candle-native"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "llama-server"
 context_size = 8192
 
 [security]
@@ -1697,7 +1852,6 @@ roles = ["coding"]
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "llama-server"
 context_size = 8192
 
 [security]
@@ -1798,7 +1952,6 @@ roles = ["coding"]
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "llama-server"
 context_size = 8192
 
 [security]
@@ -1912,7 +2065,6 @@ node-id = "local-dev"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "llama-server"
 context_size = 8192
 
 [security]
@@ -2012,10 +2164,7 @@ sha256 = "{}"
     assert_eq!(stopped["previous_weight"], 4);
     assert_eq!(stopped["weight"], 0);
     assert_eq!(stopped["restart_required"], true);
-    assert_eq!(
-        stopped["restart_hint"],
-        "systemctl --user restart llmctld.service"
-    );
+    assert_eq!(stopped["restart_hint"], "systemctl restart llmctld.service");
     assert!(read_config(&config).contains("weight = 0"));
 
     let mut status = llmctl();
@@ -2046,10 +2195,7 @@ sha256 = "{}"
     assert_eq!(started["previous_weight"], 0);
     assert_eq!(started["weight"], 6);
     assert_eq!(started["restart_required"], true);
-    assert_eq!(
-        started["restart_hint"],
-        "systemctl --user restart llmctld.service"
-    );
+    assert_eq!(started["restart_hint"], "systemctl restart llmctld.service");
     assert!(read_config(&config).contains("weight = 6"));
 }
 
@@ -2485,7 +2631,6 @@ mode = "single"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-llama_server = "127.0.0.1:8080"
 context_size = 8192
 
 [security]
@@ -2848,6 +2993,7 @@ async fn data_export_models_redacts_local_model_paths() {
             alias: "qwen".to_string(),
             path: PathBuf::from("/home/alice/.cache/llmctl/models/qwen.gguf"),
             role: "chat".to_string(),
+            family: Some("qwen3".to_string()),
             weight: 1,
         })
         .await
@@ -3339,6 +3485,40 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
     assert_eq!(digest, sha256(secret.as_bytes()));
     assert_eq!(generated["metadata"]["store_secret_once"], true);
 
+    let secret_file = dir.path().join("operator.secret");
+    let mut generate_to_file = llmctl();
+    generate_to_file
+        .arg("--config")
+        .arg(&config)
+        .arg("security")
+        .arg("generate-key")
+        .arg("--prefix")
+        .arg("llmctl-file")
+        .arg("--output")
+        .arg(&secret_file);
+    let generated_file = assert_success_json(generate_to_file);
+    assert!(generated_file["secret"].is_null());
+    assert_eq!(
+        generated_file["secret_written"],
+        secret_file.display().to_string()
+    );
+    let file_secret = fs::read_to_string(&secret_file).expect("read secret file");
+    let file_secret = file_secret.trim_end();
+    assert!(file_secret.starts_with("llmctl-file_"));
+    assert_eq!(
+        generated_file["sha256"].as_str().expect("file sha256"),
+        sha256(file_secret.as_bytes())
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&secret_file)
+            .expect("secret metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
     let mut add = llmctl();
     add.arg("--config")
         .arg(&config)
@@ -3353,7 +3533,13 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
         .arg("--team")
         .arg("platform")
         .arg("--scope")
-        .arg("chat");
+        .arg("chat")
+        .arg("--owner")
+        .arg("platform-sre")
+        .arg("--purpose")
+        .arg("chat-api")
+        .arg("--last-four")
+        .arg(generated["last_four"].as_str().expect("last_four"));
     assert_eq!(assert_success_json(add)["action"], "inserted");
 
     let mut list = llmctl();
@@ -3363,6 +3549,9 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
         .arg("list-keys");
     let listed = assert_success_json(list);
     assert_eq!(listed["api_keys"][0]["id"], "platform-chat");
+    assert_eq!(listed["api_keys"][0]["owner"], "platform-sre");
+    assert_eq!(listed["api_keys"][0]["purpose"], "chat-api");
+    assert_eq!(listed["api_keys"][0]["status"], "active");
     assert!(listed["api_keys"][0].get("sha256").is_none());
     assert_eq!(listed["api_keys"][0]["sha256_present"], true);
 
@@ -3375,22 +3564,34 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
         .arg("rotate-key")
         .arg("--id")
         .arg("platform-chat")
+        .arg("--new-id")
+        .arg("platform-chat-2026-q3")
         .arg("--sha256")
-        .arg(&replacement);
+        .arg(&replacement)
+        .arg("--last-four")
+        .arg("cdef")
+        .arg("--reason")
+        .arg("quarterly rotation");
     let rotated = assert_success_json(rotate);
     assert_eq!(rotated["status"], "rotated");
+    assert_eq!(rotated["mode"], "overlap");
+    assert_eq!(rotated["retiring_id"], "platform-chat");
+    assert_eq!(rotated["active_id"], "platform-chat-2026-q3");
     assert_eq!(rotated["restart_required"], true);
     let saved = read_config(&config);
-    assert!(!saved.contains(digest));
+    assert!(saved.contains(digest));
     assert!(saved.contains(&replacement));
+    assert!(saved.contains("status = \"retiring\""));
+    assert!(saved.contains("platform-chat-2026-q3"));
 
     let cfg = rs_llmctl::config::load(&config).await.expect("load config");
     let storage = Storage::connect_config(&cfg.storage)
         .await
         .expect("storage");
+    let request_id = Uuid::new_v4();
     storage
         .insert_audit_event(&AuditEvent::new(
-            Some(Uuid::new_v4()),
+            Some(request_id),
             "alice",
             "platform",
             "chat.completions",
@@ -3400,6 +3601,12 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
         ))
         .await
         .expect("insert api key audit event");
+    let mut event = usage_event("qwen", "alice", "platform", 11, 17, 123);
+    event.request_id = request_id;
+    storage
+        .insert_usage_event(&event)
+        .await
+        .expect("insert api key usage event");
 
     let mut usage = llmctl();
     usage
@@ -3414,7 +3621,15 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
     let usage_report = assert_success_json(usage);
     assert_eq!(usage_report["keys"][0]["id"], "platform-chat");
     assert_eq!(usage_report["keys"][0]["request_count"], 1);
-    assert_eq!(usage_report["keys"][0]["actors"], json!(["alice"]));
+    assert_eq!(usage_report["keys"][0]["audit_event_count"], 2);
+    assert_eq!(usage_report["keys"][0]["input_tokens"], 11);
+    assert_eq!(usage_report["keys"][0]["output_tokens"], 17);
+    assert_eq!(usage_report["keys"][0]["total_tokens"], 28);
+    assert_eq!(usage_report["keys"][0]["models"], json!(["qwen"]));
+    assert_eq!(
+        usage_report["keys"][0]["actors"],
+        json!(["alice", "llmctl-cli"])
+    );
 
     let mut revoke = llmctl();
     revoke
@@ -3423,13 +3638,16 @@ async fn security_api_key_lifecycle_generates_lists_rotates_revokes_and_reports_
         .arg("security")
         .arg("revoke-key")
         .arg("--id")
-        .arg("platform-chat");
+        .arg("platform-chat")
+        .arg("--reason")
+        .arg("cutover complete");
     let revoked = assert_success_json(revoke);
     assert_eq!(revoked["status"], "revoked");
-    assert_eq!(revoked["api_keys"], 0);
+    assert_eq!(revoked["api_keys"], 1);
     assert_eq!(revoked["restart_required"], true);
     let saved = read_config(&config);
-    assert!(!saved.contains("platform-chat"));
+    assert!(!saved.contains("id = \"platform-chat\""));
+    assert!(saved.contains("platform-chat-2026-q3"));
 }
 
 #[test]
@@ -3598,7 +3816,6 @@ mode = "single"
 host = "0.0.0.0"
 port = 8765
 worker_base_port = 18765
-llama_server = "127.0.0.1:8080"
 context_size = 8192
 
 [security]
@@ -3709,7 +3926,6 @@ mode = "single"
 host = "0.0.0.0"
 port = 8765
 worker_base_port = 18765
-llama_server = "127.0.0.1:8080"
 context_size = 8192
 
 [security]

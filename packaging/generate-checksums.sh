@@ -39,6 +39,14 @@ if [[ -f LICENSE ]]; then
   install -m 0644 LICENSE "${stage}/LICENSE"
 fi
 
+if [[ -f CHANGELOG.md ]]; then
+  install -m 0644 CHANGELOG.md "${stage}/CHANGELOG.md"
+fi
+
+if [[ -f packaging/systemd/llmctld.service ]]; then
+  install -D -m 0644 packaging/systemd/llmctld.service "${stage}/packaging/systemd/llmctld.service"
+fi
+
 tar -C "${stage}" -czf "${tarball}" .
 (
   cd "${DIST_DIR}"

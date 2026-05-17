@@ -267,9 +267,6 @@ mode = "single"
 host = "127.0.0.1"
 port = 8765
 worker_base_port = 18765
-# candle-native is the primary runtime direction. llama_server is kept for
-# llama-server compatibility and fallback during migration.
-llama_server = "llama-server"
 context_size = 8192
 
 [security]

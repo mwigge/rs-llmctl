@@ -18,6 +18,9 @@ fn product_docs() -> String {
     [
         "README.md",
         "docs/operations.md",
+        "docs/client-sdk.md",
+        "docs/ai-developer-workflows.md",
+        "docs/configuration.md",
         "docs/security.md",
         "docs/observability-reporting.md",
         "docs/storage.md",
@@ -74,7 +77,8 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
         "one rust binary",
         "default release package publishes one rust binary",
         "candle-native",
-        "llama-server compatibility and fallback",
+        "candle-native serving first",
+        "single `llmctl` service entrypoint",
         "upstream-reported token counts",
         "native tokenizer metering",
         "pci dss",
@@ -113,6 +117,12 @@ fn docs_cover_tdd_lints_and_enterprise_security_posture() {
     ] {
         assert!(docs.contains(topic), "docs should cover `{topic}`");
     }
+
+    let removed_legacy_phrase = ["llama-server", "compatibility", "and", "fallback"].join(" ");
+    assert!(
+        !docs.contains(&removed_legacy_phrase),
+        "docs should not keep legacy external-worker compatibility wording"
+    );
 }
 
 #[test]
@@ -152,6 +162,30 @@ fn docs_cover_ordered_deployment_operations() {
         assert!(
             docs.contains(command),
             "ordered deployment docs should include `{command}`"
+        );
+    }
+}
+
+#[test]
+fn docs_cover_safe_first_run_operator_path() {
+    let docs = product_docs().to_lowercase();
+    let docs_flat = normalize_doc_text(&docs);
+
+    for required in [
+        "first-run",
+        "dry-run by default",
+        "json-friendly",
+        "--apply",
+        "--secret-output",
+        "stores only the sha-256 digest",
+        "does not download a model by default",
+        "--starter-model-path",
+        "ask_question",
+        "/v1/chat/completions",
+    ] {
+        assert!(
+            docs_flat.contains(required),
+            "docs should cover first-run detail `{required}`"
         );
     }
 }
@@ -425,14 +459,15 @@ fn resource_docs_cover_systemd_enforcement_without_gpu_vram_overclaim() {
 }
 
 #[test]
-fn docs_pin_native_scheduler_as_contract_only() {
+fn docs_pin_native_scheduler_as_fifo_runtime_with_metadata_only_future_controls() {
     let readme = read("README.md");
     let docs_flat = normalize_doc_text(&readme.to_lowercase());
 
     for required in [
         "native scheduler contract",
-        "metadata-only",
-        "queue discipline",
+        "implemented fifo queue",
+        "bounded per-engine concurrency",
+        "queue/admission wait metadata",
         "admission/backpressure",
         "continuous batching",
         "kv cache budget metadata",
@@ -442,6 +477,42 @@ fn docs_pin_native_scheduler_as_contract_only() {
         assert!(
             docs_flat.contains(required),
             "README should document scheduler contract detail `{required}`"
+        );
+    }
+}
+
+#[test]
+fn docs_cover_client_sdk_tool_sessions_tls_and_runtime_caveats() {
+    let docs = product_docs();
+    let docs_lower = docs.to_lowercase();
+    let docs_flat = normalize_doc_text(&docs_lower);
+
+    for required in [
+        "separate `rs-llmctl-client` crate",
+        "rs-llmctl-client = \"1.1\"",
+        "client-managed sessions",
+        "metadata.session_id",
+        "client-side tool loops",
+        "local-first provider abstraction",
+        "contract-only provider metadata",
+        "routes_external_provider_traffic = false",
+        "rs-llmctl` audits, routes, and meters",
+        "does not execute tools",
+        "does not keep hidden conversation state",
+        "security.tls-termination",
+        "rustls-backed clients",
+        "[server.tls]",
+        "native rustls",
+        "server certificates only",
+        "kimi is tracked as a product target but fails closed",
+        "continuous batching",
+        "schedulercontract::fifo_runtime",
+        "routes_external_provider_traffic",
+        "implemented=false",
+    ] {
+        assert!(
+            docs_flat.contains(required),
+            "client/runtime docs should cover `{required}`"
         );
     }
 }
@@ -549,6 +620,8 @@ fn installer_docs_cover_systemd_defaults_and_overrides() {
         "sudo systemctl stop llmctld.service",
         "sudo systemctl start llmctld.service",
         "http://127.0.0.1:8765/v1",
+        "stable `llmctld.service` unit name",
+        "llmctl --config /etc/rs-llmctl/config.toml server run",
         "LLMCTL_INSTALL_SYSTEMD=0",
         "binary-only install",
         "LLMCTL_CONFIG_DIR",
@@ -565,6 +638,12 @@ fn installer_docs_cover_systemd_defaults_and_overrides() {
             "README should document installer behavior `{required}`"
         );
     }
+
+    let removed_legacy_phrase = ["llama-server", "compatibility", "and", "fallback"].join(" ");
+    assert!(
+        !readme_lower.contains(&removed_legacy_phrase),
+        "README should describe native-first operation without legacy compatibility wording"
+    );
 }
 
 #[test]
@@ -671,6 +750,8 @@ fn release_checksum_artifact_generation_is_pinned() {
         "artifact=\"rs-llmctl-${OS}-${ARCH}\"",
         "tarball=\"${DIST_DIR}/${artifact}.tar.gz\"",
         "install -m 0755 target/release/llmctl \"${stage}/llmctl\"",
+        "install -m 0644 CHANGELOG.md \"${stage}/CHANGELOG.md\"",
+        "install -D -m 0644 packaging/systemd/llmctld.service \"${stage}/packaging/systemd/llmctld.service\"",
         "sha256sum \"${artifact}.tar.gz\" > SHA256SUMS",
         "test -x target/release/llmctl",
     ] {
@@ -692,12 +773,45 @@ fn release_checksum_artifact_generation_is_pinned() {
         "packaging/generate-checksums.sh",
         "dist/rs-llmctl-<os>-<arch>.tar.gz",
         "SHA256SUMS",
+        "CHANGELOG.md",
+        "llmctld.service",
     ] {
         assert!(
             readme.contains(required),
             "README should document `{required}`"
         );
     }
+}
+
+#[test]
+fn changelog_documents_native_release_artifacts_and_service_name() {
+    let changelog = read("CHANGELOG.md").to_lowercase();
+    let readme = read("README.md").to_lowercase();
+
+    for required in [
+        "native-first packaging",
+        "single `llmctl`",
+        "stable service name",
+        "llmctld.service",
+        "execstart",
+        "packaging/validate-install.sh",
+        "passive and offline",
+        "dist/rs-llmctl-<os>-<arch>.tar.gz",
+        "dist/sha256sums",
+        "packaging/sign-release.sh dist",
+    ] {
+        assert!(
+            changelog.contains(required),
+            "CHANGELOG.md should document `{required}`"
+        );
+    }
+
+    assert!(
+        readme.contains("release notes live in [changelog.md](changelog.md)")
+            && readme.contains("`readme.md`, `changelog.md`,")
+            && readme.contains("systemd unit template"),
+        "README should point operators to changelog-backed release artifact notes"
+    );
 }
 
 #[test]

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::any::{install_default_drivers, AnyPoolOptions};
 use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyPool, Row};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -370,6 +371,30 @@ pub struct RequestLineageJoinRecord {
     pub source: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeyUsageRecord {
+    pub request_id: Uuid,
+    pub api_key_id: String,
+    pub actor: String,
+    pub team: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub latency_ms: u64,
+    pub status: String,
+    pub usage_at: DateTime<Utc>,
+    pub first_audit_at: DateTime<Utc>,
+    pub audit_outcome: String,
+}
+
+#[derive(Debug, Clone)]
+struct ApiKeyAuditMetadata {
+    api_key_id: String,
+    first_audit_at: DateTime<Utc>,
+    audit_outcome: String,
+}
+
 impl RequestLineageJoinRecord {
     pub fn new(
         request_id: Uuid,
@@ -700,6 +725,25 @@ impl Storage {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(row_to_usage_event).collect()
+    }
+
+    pub async fn api_key_usage_between(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<ApiKeyUsageRecord>> {
+        let audit_events = self.audit_events_between(from, to).await?;
+        let usage_events = self.usage_events_between(from, to).await?;
+        Ok(join_api_key_usage(audit_events, usage_events))
+    }
+
+    pub async fn api_key_usage_for_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<ApiKeyUsageRecord>> {
+        let audit_events = self.audit_events_for_request(request_id).await?;
+        let usage_events = self.usage_events_for_request(request_id).await?;
+        Ok(join_api_key_usage(audit_events, usage_events))
     }
 
     pub async fn insert_observation_event(&self, event: &ObservationEvent) -> Result<()> {
@@ -1064,6 +1108,57 @@ fn row_to_audit_event(row: sqlx::any::AnyRow) -> Result<AuditEvent> {
     })
 }
 
+fn join_api_key_usage(
+    audit_events: Vec<AuditEvent>,
+    usage_events: Vec<UsageEvent>,
+) -> Vec<ApiKeyUsageRecord> {
+    let mut audit_by_request = BTreeMap::<Uuid, ApiKeyAuditMetadata>::new();
+    for event in audit_events {
+        let Some(request_id) = event.request_id else {
+            continue;
+        };
+        let Some(api_key_id) = event
+            .detail_json
+            .get("api_key_id")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        audit_by_request
+            .entry(request_id)
+            .and_modify(|metadata| {
+                metadata.audit_outcome = event.outcome.clone();
+            })
+            .or_insert_with(|| ApiKeyAuditMetadata {
+                api_key_id: api_key_id.to_string(),
+                first_audit_at: event.at,
+                audit_outcome: event.outcome,
+            });
+    }
+
+    usage_events
+        .into_iter()
+        .filter_map(|event| {
+            let metadata = audit_by_request.get(&event.request_id)?;
+            Some(ApiKeyUsageRecord {
+                request_id: event.request_id,
+                api_key_id: metadata.api_key_id.clone(),
+                actor: event.actor,
+                team: event.team,
+                model: event.model,
+                input_tokens: event.input_tokens,
+                output_tokens: event.output_tokens,
+                total_tokens: event.input_tokens.saturating_add(event.output_tokens),
+                latency_ms: event.latency_ms,
+                status: event.status,
+                usage_at: event.at,
+                first_audit_at: metadata.first_audit_at,
+                audit_outcome: metadata.audit_outcome.clone(),
+            })
+        })
+        .collect()
+}
+
 fn row_to_usage_event(row: sqlx::any::AnyRow) -> Result<UsageEvent> {
     Ok(UsageEvent {
         id: parse_uuid(&row.try_get::<String, _>("id")?)?,
@@ -1237,7 +1332,12 @@ mod tests {
             "chat.create",
             "model/llama",
             "allow",
-            json!({"ip": "127.0.0.1"}),
+            json!({
+                "api_key_id": "alice-key",
+                "api_key_subject": "alice",
+                "api_key_team": "platform",
+                "ip": "127.0.0.1"
+            }),
         );
         storage.insert_audit_event(&audit).await?;
 
@@ -1306,11 +1406,33 @@ mod tests {
             team: "platform".to_string(),
             scopes: vec!["chat".to_string()],
             key_id: Some("alice-key".to_string()),
+            key_owner: None,
+            key_purpose: None,
+            key_status: Some("active".to_string()),
         };
         assert_eq!(storage.audit_events_between(from, to).await?.len(), 1);
         assert_eq!(storage.audit_events_for_request(request_id).await?.len(), 1);
         assert_eq!(storage.usage_events_between(from, to).await?.len(), 1);
         assert_eq!(storage.usage_events_for_request(request_id).await?.len(), 1);
+        assert_eq!(
+            storage.api_key_usage_for_request(request_id).await?,
+            vec![ApiKeyUsageRecord {
+                request_id,
+                api_key_id: "alice-key".to_string(),
+                actor: "alice".to_string(),
+                team: "platform".to_string(),
+                model: "llama".to_string(),
+                input_tokens: 10,
+                output_tokens: 20,
+                total_tokens: 30,
+                latency_ms: 30,
+                status: "ok".to_string(),
+                usage_at: usage.at,
+                first_audit_at: audit.at,
+                audit_outcome: "allow".to_string(),
+            }]
+        );
+        assert_eq!(storage.api_key_usage_between(from, to).await?.len(), 1);
         assert_eq!(storage.observation_events_between(from, to).await?.len(), 1);
         assert_eq!(
             storage

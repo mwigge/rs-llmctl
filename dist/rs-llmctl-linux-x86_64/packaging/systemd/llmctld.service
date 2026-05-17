@@ -1,0 +1,36 @@
+[Unit]
+Description=rs-llmctl OpenAI-compatible model serving daemon
+Documentation=https://github.com/mwigge/rs-llmctl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmctl
+Group=llmctl
+Environment=LLMCTL_CONFIG=/etc/rs-llmctl/config.toml
+ExecStart=/usr/local/bin/llmctl --config ${LLMCTL_CONFIG} server run
+Restart=on-failure
+RestartSec=5s
+
+CPUAccounting=true
+MemoryAccounting=true
+CPUQuota=80%
+MemoryMax=80%
+# Override these defaults with the generated server plan when needed:
+# CPUQuota=<server-plan.resource_limits.systemd.CPUQuota>
+# MemoryMax=<server-plan.resource_limits.systemd.MemoryMax>
+# Or launch an equivalent transient service during tests:
+# systemd-run --property=CPUAccounting=true --property=MemoryAccounting=true \
+#   --property=CPUQuota=<server-plan.resource_limits.systemd.CPUQuota> \
+#   --property=MemoryMax=<server-plan.resource_limits.systemd.MemoryMax> \
+#   /usr/local/bin/llmctl --config ${LLMCTL_CONFIG} server run
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rs-llmctl /var/log/rs-llmctl
+
+[Install]
+WantedBy=multi-user.target
