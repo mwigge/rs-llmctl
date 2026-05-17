@@ -66,32 +66,41 @@ network timeout.
 - `fallback`: prefer the requested model when it has weight, otherwise use the
   preferred weighted model.
 
-The daemon exposes live swap orchestration through the authenticated admin
-endpoint:
+For the default in-process Candle runtime, perform model lifecycle changes with
+`model start`, `model stop`, `model update`, `model upgrade`, and
+`model downgrade`, and review the impact first with `swap plan` or the model
+command's `--dry-run` output. Those commands update config and report whether a
+service restart is required before routing changes take effect.
 
-```bash
-curl -sS \
-  -H "Authorization: Bearer $LLMCTL_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"active":"qwen-prod","replacement":"qwen-canary","mode":"hot"}' \
-  http://127.0.0.1:8765/v1/admin/swap
-```
-
-The caller needs the `admin` scope. Hot swap starts and probes the replacement
-before draining the active worker. Cold swap drains and stops the active worker
-before starting the replacement. Each execution is written to the audit trail
-with request ID, planned steps, worker statuses, and success state.
+The authenticated `/v1/admin/swap` endpoint is reserved for deployments that
+attach an external worker supervisor. Native in-process serving returns
+`native_swap_unavailable` rather than pretending to hot-swap an in-process
+engine.
 
 ## Resource Budget
 
 The default resource budget is 80%. That applies to CPU/RAM/VRAM planning so
 the model service does not assume it owns the whole host.
 
-The packaged Linux systemd unit applies `CPUQuota=80%` and `MemoryMax=80%` as
-the default cgroup guard. Generated `server plan` output also includes
-host-specific `CPUQuota` and `MemoryMax` properties for reviewed drop-ins.
+The packaged Linux installer computes `CPUQuota=(nproc * 80)%` and applies
+`MemoryMax=80%` as the default cgroup guard. Generated `server plan` output also
+includes host-specific `CPUQuota` and `MemoryMax` properties for reviewed
+drop-ins.
 Detected GPU VRAM remains planning evidence because there is no portable
 systemd cgroup property for hard GPU VRAM enforcement.
+
+## Install Smoke
+
+Docker is not required for the default install smoke. Run
+`tests/smoke/smoke_native_release.sh` with `LLMCTL_NATIVE_SMOKE_MODEL_PATH`
+pointing at one real local model artifact. The script installs the packaged
+tarball into a temporary prefix with `LLMCTL_INSTALL_SYSTEMD=0`, runs
+`first-run --apply` to create one API key and one model config, starts the
+server, and checks non-streaming and streaming `/v1/chat/completions`.
+
+Use a VM or a privileged systemd test host when the target is systemd activation
+or distro packaging behavior. Plain Docker is useful for file-layout checks but
+is not a reliable systemd acceptance environment.
 
 ## Native Runtime Validation
 

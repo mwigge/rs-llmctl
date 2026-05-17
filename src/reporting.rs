@@ -1,5 +1,8 @@
 use crate::audit::{AuditEvent, ObservationEvent, UsageEvent};
-use crate::storage::{ModelInventoryRecord, QuotaDecisionRecord, Storage};
+use crate::contracts;
+use crate::storage::{
+    ModelInventoryRecord, QuotaDecisionRecord, RequestLineageJoinRecord, Storage,
+};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,6 +29,9 @@ pub struct ReportMetadata {
     pub report_kind: ReportKind,
     pub generated_at: DateTime<Utc>,
     pub schema_version: u32,
+    pub producer: String,
+    pub contract_schema_version: u32,
+    pub contract_hashes: BTreeMap<String, String>,
     pub sha256: String,
 }
 
@@ -141,6 +147,8 @@ pub struct ReportSummary {
     pub observation_event_count: u64,
     pub model_record_count: u64,
     pub quota_decision_count: u64,
+    #[serde(default)]
+    pub lineage_join_count: u64,
     pub usage: UsageSummary,
 }
 
@@ -151,6 +159,7 @@ impl ReportSummary {
         observation_event_count: u64,
         model_record_count: u64,
         quota_decision_count: u64,
+        lineage_join_count: u64,
         usage: UsageSummary,
     ) -> Self {
         Self {
@@ -159,6 +168,7 @@ impl ReportSummary {
             observation_event_count,
             model_record_count,
             quota_decision_count,
+            lineage_join_count,
             usage,
         }
     }
@@ -176,6 +186,8 @@ pub struct DataExport {
     pub observation_events: Vec<ObservationEvent>,
     pub quota_decisions: Vec<QuotaDecisionRecord>,
     pub models: Vec<ExportModelInventoryRecord>,
+    #[serde(default)]
+    pub lineage: Vec<RequestLineageJoinRecord>,
 }
 
 pub async fn monthly_audit_report(
@@ -201,6 +213,7 @@ pub async fn monthly_audit_report(
         observations.len(),
         models.len(),
         quota_decisions.len(),
+        0,
         usage_summary.clone(),
     );
 
@@ -295,10 +308,38 @@ pub async fn data_export(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<DataExport> {
-    let audit_events = storage.audit_events_between(from, to).await?;
-    let usage_events = storage.usage_events_between(from, to).await?;
-    let observation_events = storage.observation_events_between(from, to).await?;
-    let quota_decisions = storage.quota_decisions_between(from, to).await?;
+    data_export_limited(storage, from, to, None).await
+}
+
+pub async fn data_export_limited(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    max_rows: Option<usize>,
+) -> Result<DataExport> {
+    let query_limit = max_rows.map(|limit| limit.saturating_add(1));
+    let audit_events = storage
+        .audit_events_between_limited(from, to, query_limit)
+        .await?;
+    let usage_events = storage
+        .usage_events_between_limited(from, to, query_limit)
+        .await?;
+    let observation_events = storage
+        .observation_events_between_limited(from, to, query_limit)
+        .await?;
+    let quota_decisions = storage
+        .quota_decisions_between_limited(from, to, query_limit)
+        .await?;
+    let lineage = storage
+        .request_lineage_joins_between_limited(from, to, query_limit)
+        .await?;
+    if let Some(max_rows) = max_rows {
+        ensure_limited("audit", audit_events.len(), max_rows)?;
+        ensure_limited("usage", usage_events.len(), max_rows)?;
+        ensure_limited("observability", observation_events.len(), max_rows)?;
+        ensure_limited("quota", quota_decisions.len(), max_rows)?;
+        ensure_limited("lineage", lineage.len(), max_rows)?;
+    }
     let models = storage
         .list_models()
         .await?
@@ -312,6 +353,7 @@ pub async fn data_export(
         observation_events.len(),
         models.len(),
         quota_decisions.len(),
+        lineage.len(),
         usage_summary.clone(),
     );
 
@@ -325,7 +367,116 @@ pub async fn data_export(
         observation_events,
         quota_decisions,
         models,
+        lineage,
     })
+}
+
+pub async fn data_export_dataset_limited(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    dataset: contracts::DatasetKind,
+    max_rows: Option<usize>,
+) -> Result<DataExport> {
+    let query_limit = max_rows.map(|limit| limit.saturating_add(1));
+    let mut audit_events = Vec::new();
+    let mut usage_events = Vec::new();
+    let mut observation_events = Vec::new();
+    let mut quota_decisions = Vec::new();
+    let mut lineage = Vec::new();
+    let mut models = Vec::new();
+
+    match dataset {
+        contracts::DatasetKind::Security => {
+            audit_events = storage
+                .audit_events_between_limited(from, to, query_limit)
+                .await?;
+            quota_decisions = storage
+                .quota_decisions_between_limited(from, to, query_limit)
+                .await?;
+            if let Some(max_rows) = max_rows {
+                ensure_limited("audit", audit_events.len(), max_rows)?;
+                ensure_limited("quota", quota_decisions.len(), max_rows)?;
+            }
+        }
+        contracts::DatasetKind::Observability | contracts::DatasetKind::Drift => {
+            observation_events = storage
+                .observation_events_between_limited(from, to, query_limit)
+                .await?;
+            if let Some(max_rows) = max_rows {
+                ensure_limited("observability", observation_events.len(), max_rows)?;
+            }
+        }
+        contracts::DatasetKind::Usage
+        | contracts::DatasetKind::User
+        | contracts::DatasetKind::Finops => {
+            usage_events = storage
+                .usage_events_between_limited(from, to, query_limit)
+                .await?;
+            if let Some(max_rows) = max_rows {
+                ensure_limited("usage", usage_events.len(), max_rows)?;
+            }
+        }
+        contracts::DatasetKind::Models => {
+            models = storage
+                .list_models()
+                .await?
+                .into_iter()
+                .map(ExportModelInventoryRecord::from)
+                .collect();
+            if let Some(max_rows) = max_rows {
+                ensure_limited("models", models.len(), max_rows)?;
+            }
+        }
+        contracts::DatasetKind::Lineage => {
+            lineage = storage
+                .request_lineage_joins_between_limited(from, to, query_limit)
+                .await?;
+            if let Some(max_rows) = max_rows {
+                ensure_limited("lineage", lineage.len(), max_rows)?;
+            }
+        }
+        contracts::DatasetKind::Audit => {
+            audit_events = storage
+                .audit_events_between_limited(from, to, query_limit)
+                .await?;
+            if let Some(max_rows) = max_rows {
+                ensure_limited("audit", audit_events.len(), max_rows)?;
+            }
+        }
+    }
+
+    let usage_summary = summarize_usage(&usage_events);
+    let report_summary = summarize_report(
+        audit_events.len(),
+        usage_events.len(),
+        observation_events.len(),
+        models.len(),
+        quota_decisions.len(),
+        lineage.len(),
+        usage_summary.clone(),
+    );
+
+    Ok(DataExport {
+        from,
+        to,
+        report_summary,
+        audit_events,
+        usage_summary,
+        usage_events,
+        observation_events,
+        quota_decisions,
+        models,
+        lineage,
+    })
+}
+
+fn ensure_limited(dataset: &str, count: usize, max_rows: usize) -> Result<()> {
+    anyhow::ensure!(
+        count <= max_rows,
+        "data export dataset `{dataset}` exceeds max_rows {max_rows}; narrow the time window or raise --max-rows"
+    );
+    Ok(())
 }
 
 pub async fn monthly_audit_report_envelope(
@@ -359,6 +510,16 @@ pub async fn data_export_envelope(
     to: DateTime<Utc>,
 ) -> Result<ReportEnvelope<DataExport>> {
     let export = data_export(storage, from, to).await?;
+    report_envelope(ReportKind::DataExport, export)
+}
+
+pub async fn data_export_envelope_limited(
+    storage: &Storage,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    max_rows: Option<usize>,
+) -> Result<ReportEnvelope<DataExport>> {
+    let export = data_export_limited(storage, from, to, max_rows).await?;
     report_envelope(ReportKind::DataExport, export)
 }
 
@@ -428,6 +589,22 @@ pub fn verify_envelope_value(envelope: &Value) -> Result<EnvelopeVerification> {
             ))
         }
     };
+    if schema_version(metadata) != Some(u64::from(REPORT_SCHEMA_VERSION)) {
+        return Ok(invalid_envelope(
+            Some(expected),
+            report_kind(metadata),
+            schema_version(metadata),
+            "unsupported report envelope schema_version",
+        ));
+    }
+    if report_kind(metadata).is_none() {
+        return Ok(invalid_envelope(
+            Some(expected),
+            None,
+            schema_version(metadata),
+            "missing or unknown report_kind",
+        ));
+    }
     let actual = canonical_sha256(payload)?;
     let valid = expected.eq_ignore_ascii_case(&actual);
 
@@ -472,6 +649,7 @@ pub fn summarize_report(
     observation_event_count: usize,
     model_record_count: usize,
     quota_decision_count: usize,
+    lineage_join_count: usize,
     usage: UsageSummary,
 ) -> ReportSummary {
     ReportSummary::new(
@@ -480,6 +658,7 @@ pub fn summarize_report(
         observation_event_count as u64,
         model_record_count as u64,
         quota_decision_count as u64,
+        lineage_join_count as u64,
         usage,
     )
 }
@@ -607,10 +786,23 @@ where
             report_kind,
             generated_at,
             schema_version: REPORT_SCHEMA_VERSION,
+            producer: crate::SERVICE_NAME.to_string(),
+            contract_schema_version: contracts::CONTRACT_SCHEMA_VERSION,
+            contract_hashes: contract_hashes()?,
             sha256: canonical_sha256(&payload)?,
         },
         payload,
     })
+}
+
+fn contract_hashes() -> Result<BTreeMap<String, String>> {
+    contracts::all_contracts()
+        .into_iter()
+        .map(|contract| {
+            let hash = canonical_sha256(&contract)?;
+            Ok((contract.dataset.to_string(), hash))
+        })
+        .collect()
 }
 
 fn canonicalize_value(value: Value) -> Value {
@@ -915,13 +1107,14 @@ mod tests {
             20,
             100,
         )]);
-        let summary = ReportSummary::new(2, 1, 3, 4, 5, usage);
+        let summary = ReportSummary::new(2, 1, 3, 4, 5, 6, usage);
 
         let value = serde_json::to_value(&summary)?;
 
         assert_eq!(value["audit_event_count"], 2);
         assert_eq!(value["usage_event_count"], 1);
         assert_eq!(value["observation_event_count"], 3);
+        assert_eq!(value["lineage_join_count"], 6);
         assert_eq!(value["model_record_count"], 4);
         assert_eq!(value["quota_decision_count"], 5);
         assert_eq!(value["usage"]["total_tokens"], 30);
@@ -972,6 +1165,53 @@ mod tests {
             envelope.metadata.sha256,
             canonical_sha256(&envelope.payload)?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dataset_limited_export_queries_only_requested_dataset() -> Result<()> {
+        let storage = Storage::in_memory().await?;
+        let from = Utc::now() - chrono::Duration::hours(1);
+        let to = Utc::now() + chrono::Duration::hours(1);
+        for index in 0..3 {
+            storage
+                .insert_audit_event(&AuditEvent {
+                    id: Uuid::new_v4(),
+                    request_id: None,
+                    at: Utc::now(),
+                    actor: format!("actor-{index}"),
+                    team: "platform".to_string(),
+                    action: "test".to_string(),
+                    resource: "model/test".to_string(),
+                    outcome: "allowed".to_string(),
+                    detail_json: json!({}),
+                })
+                .await?;
+        }
+        storage
+            .upsert_model_record(&ModelInventoryRecord {
+                alias: "qwen".to_string(),
+                path: "/models/qwen".to_string(),
+                role: "chat".to_string(),
+                weight: 1,
+                updated_at: Utc::now(),
+            })
+            .await?;
+
+        assert!(data_export_limited(&storage, from, to, Some(1))
+            .await
+            .is_err());
+        let models = data_export_dataset_limited(
+            &storage,
+            from,
+            to,
+            contracts::DatasetKind::Models,
+            Some(1),
+        )
+        .await?;
+
+        assert_eq!(models.models.len(), 1);
+        assert!(models.audit_events.is_empty());
         Ok(())
     }
 

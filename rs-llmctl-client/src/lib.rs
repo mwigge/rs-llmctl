@@ -59,12 +59,10 @@ impl ProviderContract {
             base_url_env: vec![
                 "LLMCTL_BASE_URL".to_string(),
                 "RS_LLMCTL_BASE_URL".to_string(),
-                "OPENAI_BASE_URL".to_string(),
             ],
             api_key_env: vec![
                 "LLMCTL_API_KEY".to_string(),
                 "RS_LLMCTL_API_KEY".to_string(),
-                "OPENAI_API_KEY".to_string(),
             ],
         }
     }
@@ -479,11 +477,10 @@ impl LlmctlClient {
     }
 
     pub fn from_env() -> Result<Self> {
-        let base_url = from_env_values(|name| env::var(name).ok())?;
-        let api_key = first_env_value(
-            &["LLMCTL_API_KEY", "RS_LLMCTL_API_KEY", "OPENAI_API_KEY"],
-            |name| env::var(name).ok(),
-        );
+        let base_url = local_from_env_values(|name| env::var(name).ok())?;
+        let api_key = first_env_value(&["LLMCTL_API_KEY", "RS_LLMCTL_API_KEY"], |name| {
+            env::var(name).ok()
+        });
         Self::new(base_url, api_key)
     }
 
@@ -1154,13 +1151,11 @@ fn header_value(headers: &header::HeaderMap, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn from_env_values(mut get: impl FnMut(&str) -> Option<String>) -> Result<String> {
-    first_env_value(
-        &["LLMCTL_BASE_URL", "RS_LLMCTL_BASE_URL", "OPENAI_BASE_URL"],
-        &mut get,
-    )
-    .ok_or_else(|| LlmctlError::BadRequest {
-        message: "LLMCTL_BASE_URL, RS_LLMCTL_BASE_URL, or OPENAI_BASE_URL must be set".to_string(),
+fn local_from_env_values(mut get: impl FnMut(&str) -> Option<String>) -> Result<String> {
+    first_env_value(&["LLMCTL_BASE_URL", "RS_LLMCTL_BASE_URL"], &mut get).ok_or_else(|| {
+        LlmctlError::BadRequest {
+            message: "LLMCTL_BASE_URL or RS_LLMCTL_BASE_URL must be set".to_string(),
+        }
     })
 }
 
@@ -1212,8 +1207,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_resolution_prefers_llmctl_names_before_openai_aliases() {
-        let value = from_env_values(|name| match name {
+    fn env_resolution_uses_only_llmctl_names_for_local_client() {
+        let value = local_from_env_values(|name| match name {
             "LLMCTL_BASE_URL" => Some("http://llmctl".to_string()),
             "RS_LLMCTL_BASE_URL" => Some("http://rs".to_string()),
             "OPENAI_BASE_URL" => Some("http://openai/v1".to_string()),
@@ -1223,13 +1218,13 @@ mod tests {
 
         assert_eq!(value, "http://llmctl");
 
-        let fallback = from_env_values(|name| match name {
+        let err = local_from_env_values(|name| match name {
             "OPENAI_BASE_URL" => Some("http://openai/v1".to_string()),
             _ => None,
         })
-        .expect("openai alias");
+        .expect_err("OpenAI-compatible aliases are explicit provider-only inputs");
 
-        assert_eq!(fallback, "http://openai/v1");
+        assert!(err.to_string().contains("LLMCTL_BASE_URL"));
     }
 
     #[test]

@@ -2,10 +2,10 @@ use crate::config::{Config, OtlpProtocol};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
-use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::{Counter, Gauge};
 use opentelemetry::trace::{Span, Status, Tracer};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
+use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -148,7 +149,6 @@ impl TelemetryRuntime {
                 .boxed(),
             );
         }
-
         tracing_subscriber::registry()
             .with(filter)
             .with(layers)
@@ -191,6 +191,20 @@ fn otlp_headers(headers: &BTreeMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+fn otlp_metadata(headers: &BTreeMap<String, String>) -> Result<MetadataMap> {
+    let mut metadata = MetadataMap::new();
+    for (key, value) in headers {
+        metadata.insert(
+            key.parse::<MetadataKey<_>>()
+                .with_context(|| format!("parse OTLP gRPC metadata key `{key}`"))?,
+            value
+                .parse::<MetadataValue<_>>()
+                .with_context(|| format!("parse OTLP gRPC metadata value for `{key}`"))?,
+        );
+    }
+    Ok(metadata)
+}
+
 fn build_span_exporter(
     endpoint: &str,
     protocol: OtlpProtocol,
@@ -209,6 +223,7 @@ fn build_span_exporter(
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(timeout)
+            .with_metadata(otlp_metadata(headers)?)
             .build()?),
     }
 }
@@ -231,6 +246,7 @@ fn build_metric_exporter(
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(timeout)
+            .with_metadata(otlp_metadata(headers)?)
             .build()?),
     }
 }
@@ -253,6 +269,7 @@ fn build_log_exporter(
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(timeout)
+            .with_metadata(otlp_metadata(headers)?)
             .build()?),
     }
 }
@@ -421,6 +438,22 @@ impl NoopTelemetryExporter {
 pub fn emit_runtime_telemetry(event: &RuntimeTelemetryEvent) {
     let attributes = telemetry_key_values(event);
     runtime_events_counter().add(1, &attributes);
+    if matches!(event.name, TelemetryEventName::RuntimeHeartbeat) {
+        heartbeat_timestamp_gauge().record(event.timestamp.timestamp().max(0) as u64, &attributes);
+        let healthy = event
+            .attributes
+            .get("runtime.healthy")
+            .or_else(|| event.attributes.get("llmctl.runtime.healthy"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        heartbeat_healthy_gauge().record(u64::from(healthy), &attributes);
+        let draining = event
+            .attributes
+            .get("llmctl.server.draining")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        server_draining_gauge().record(u64::from(draining), &attributes);
+    }
 
     if matches!(event.signal, TelemetrySignal::Span) {
         let tracer = global::tracer(crate::SERVICE_NAME);
@@ -452,6 +485,36 @@ fn runtime_events_counter() -> &'static Counter<u64> {
         global::meter(crate::SERVICE_NAME)
             .u64_counter("llmctl.runtime.events")
             .with_description("Runtime telemetry events emitted by rs-llmctl")
+            .build()
+    })
+}
+
+fn heartbeat_timestamp_gauge() -> &'static Gauge<u64> {
+    static GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .u64_gauge("llmctl_runtime_heartbeat_timestamp_seconds")
+            .with_description("Unix timestamp of the most recent rs-llmctl runtime heartbeat")
+            .build()
+    })
+}
+
+fn heartbeat_healthy_gauge() -> &'static Gauge<u64> {
+    static GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .u64_gauge("llmctl_runtime_heartbeat_healthy")
+            .with_description("Runtime heartbeat health as 1 for healthy and 0 for unhealthy")
+            .build()
+    })
+}
+
+fn server_draining_gauge() -> &'static Gauge<u64> {
+    static GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .u64_gauge("llmctl_server_draining")
+            .with_description("Server drain state as 1 while graceful shutdown drain is active")
             .build()
     })
 }

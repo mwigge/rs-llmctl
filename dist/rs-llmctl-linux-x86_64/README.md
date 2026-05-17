@@ -114,23 +114,32 @@ release archive against `SHA256SUMS`, safely extracts the single default `llmctl
 to `/usr/local/bin`, creates the `llmctl` system user, stages
 `/etc/rs-llmctl/config.toml`, creates `/var/lib/rs-llmctl`,
 `/var/lib/rs-llmctl/models`, `/var/lib/rs-llmctl/reports`, and
-`/var/log/rs-llmctl`, installs `llmctld.service`, then enables and starts it.
+`/var/log/rs-llmctl`, and installs `llmctld.service` without starting it.
 The service intentionally keeps the stable `llmctld.service` unit name for
 operator runbooks, monitoring labels, and upgrade habits, while its default
 `ExecStart` runs `llmctl --config /etc/rs-llmctl/config.toml server run`. The
-default service binds to `http://127.0.0.1:8765/v1` without requiring API keys;
-switch to a production profile before exposing it externally.
+default installer flow expects `first-run --apply` with a model and generated
+API key before the service is enabled. Set `LLMCTL_START_SERVICE=1` only when
+the config is already complete and intentionally ready to run. The staged
+default config binds the API to `http://127.0.0.1:8765/v1`.
 
 Set `PREFIX=/some/path` to choose another binary prefix. System service installs
 must not use a home-directory prefix; use `LLMCTL_INSTALL_SYSTEMD=0` for a
 binary-only install. `LLMCTL_CONFIG_DIR`, `LLMCTL_CONFIG`,
 `LLMCTL_STATE_DIR`, `LLMCTL_LOG_DIR`, and `LLMCTL_SERVICE_NAME` override the
-default system paths and service name.
+default system paths and service name. The monthly audit timer is installed
+when packaged units are present but stays disabled by default; set
+`LLMCTL_ENABLE_AUDIT_TIMER=1` only after enabling monthly reports in config.
+
+`install.sh` verifies archive integrity with `SHA256SUMS`. Tagged CI releases
+also publish `SHA256SUMS.sig` or `SHA256SUMS.minisig`; verify that release
+signature with `cosign` or `minisign` before production installation when your
+policy requires publisher authentication.
 
 For a pinned version or another fork:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mwigge/rs-llmctl/main/install.sh | RS_LLMCTL_VERSION=v1.1.0 RS_LLMCTL_REPO=your-org/rs-llmctl sh
+curl -fsSL https://raw.githubusercontent.com/mwigge/rs-llmctl/main/install.sh | RS_LLMCTL_VERSION=v1.2.0 RS_LLMCTL_REPO=your-org/rs-llmctl sh
 ```
 
 After install:
@@ -182,6 +191,13 @@ The output includes an `ask_question` smoke plan for `rs-llmctl-client` and an
 OpenAI-compatible `/v1/chat/completions` request plan using the generated key
 from your secret store, without printing the secret.
 
+The release smoke path does not require Docker. `tests/smoke/smoke_native_release.sh`
+installs the packaged tarball into a temporary prefix, runs `first-run --apply`
+with one generated API key when `LLMCTL_NATIVE_SMOKE_MODEL_PATH` points at a
+real local model artifact, starts `llmctl server run`, and checks both
+non-streaming and streaming chat completions. Use a VM or privileged systemd
+test host only when the test must validate systemd activation itself.
+
 ## Operate In 10 Steps
 
 1. Stage `/etc/rs-llmctl/config.toml` with the `production-aiops` profile.
@@ -219,6 +235,13 @@ export OPENAI_BASE_URL=http://host:8765/v1
 export OPENAI_API_KEY=<your-rs-llmctl-api-key>
 ```
 
+For the Rust `rs-llmctl-client` crate:
+
+```bash
+export LLMCTL_BASE_URL=http://host:8765
+export LLMCTL_API_KEY=<your-rs-llmctl-api-key>
+```
+
 Rust applications should depend on the separate `rs-llmctl-client` crate, not
 the server crate. The SDK is intentionally a client-side wrapper around the
 OpenAI-compatible API: it keeps conversation sessions in the application,
@@ -248,8 +271,9 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 `LlmctlClient::from_env()` accepts `LLMCTL_BASE_URL`/`LLMCTL_API_KEY`,
-`RS_LLMCTL_BASE_URL`/`RS_LLMCTL_API_KEY`, and OpenAI-compatible
-`OPENAI_BASE_URL`/`OPENAI_API_KEY`. `LLMCTL_*` wins when both are present.
+or `RS_LLMCTL_BASE_URL`/`RS_LLMCTL_API_KEY`. It intentionally ignores
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`; those names are for generic
+OpenAI-compatible clients pointed at `/v1`.
 The SDK also exposes `/v1/embeddings` through `EmbeddingRequest` for local
 search, recommendation, and RAG workflows.
 On Candle-native deployments, production embeddings use the semantic native
@@ -359,9 +383,12 @@ only when you intentionally installed a user-scoped service.
 Lifecycle outputs are script-friendly JSON by default. Model and service plans
 include `runtime_backend` and `entrypoint` fields; on the default native path
 they identify `candle-native` and the single service entrypoint
-`llmctl server run`. `llmctl service status/start/stop/restart/upgrade/downgrade`
-wraps the systemd lifecycle around the stable `llmctld.service` unit name while
-keeping the installed runtime binary as `llmctl`.
+`llmctl server run`. `llmctl service status/start/stop/restart` wraps the
+systemd lifecycle around the stable `llmctld.service` unit name while keeping
+the installed runtime binary as `llmctl`. `service upgrade` and
+`service downgrade` are guarded planning commands; use the verified release
+installer or system package manager to change binary versions, then restart the
+service.
 
 ## Production Shape
 
@@ -534,6 +561,9 @@ For production external bind, record where TLS is terminated and where the
 operator evidence lives:
 
 ```toml
+[security]
+trusted-proxies = ["127.0.0.1"]
+
 [security.tls-termination]
 enabled = true
 provider = "envoy-edge"
@@ -594,11 +624,12 @@ for CPU and memory: `CPUQuota` and `MemoryMax` appear under
 `resource_limits.systemd` in `server plan` output. The same plan also exports
 `unit_properties` lines for systemd unit/drop-in files and `systemd_run_args`
 for transient `systemd-run` tests, for example `--property=CPUQuota=640%` and
-`--property=MemoryMax=8589934592`. The packaged systemd unit applies
-`CPUQuota=80%` and `MemoryMax=80%` by default; apply a generated systemd drop-in when a
-specific host plan should override that baseline. The default runtime policy
-budgets 80% of CPU, RAM, and detected GPU VRAM so first-time plans have
-concrete headroom. GPU VRAM budgets are exported as `metadata-only`
+`--property=MemoryMax=8589934592`. The packaged Linux installer computes
+`CPUQuota=(nproc * 80)%` and applies `MemoryMax=80%` by default; apply a
+generated systemd drop-in when a specific host plan should override that
+baseline. The default runtime policy budgets 80% of CPU, RAM, and detected GPU
+VRAM so first-time plans have concrete headroom. GPU VRAM budgets are exported
+as `metadata-only`
 planning evidence with `hard_enforced=false` and no systemd property;
 `rs-llmctl` does not claim hard GPU VRAM enforcement because common GPU runtimes
 do not expose a portable cgroup property equivalent to `MemoryMax`. The

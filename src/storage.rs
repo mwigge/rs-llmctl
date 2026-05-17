@@ -600,14 +600,25 @@ impl Storage {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<AuditEvent>> {
-        let rows = sqlx::query(
+        self.audit_events_between_limited(from, to, None).await
+    }
+
+    pub async fn audit_events_between_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> Result<Vec<AuditEvent>> {
+        let limit_clause = limit_clause(limit);
+        let rows = sqlx::query(&format!(
             r#"
             SELECT id, request_id, at, actor, team, action, resource, outcome, detail_json
             FROM audit_events
             WHERE at >= ? AND at < ?
             ORDER BY at ASC, id ASC
-            "#,
-        )
+            {limit_clause}
+            "#
+        ))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -697,13 +708,26 @@ impl Storage {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<UsageEvent>> {
+        self.usage_events_between_limited(from, to, None).await
+    }
+
+    pub async fn usage_events_between_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> Result<Vec<UsageEvent>> {
+        let limit_clause = limit_clause(limit);
         let rows = sqlx::query(
-            r#"
+            &format!(
+                r#"
             SELECT id, request_id, at, model, actor, team, input_tokens, output_tokens, latency_ms, status
             FROM usage_events
             WHERE at >= ? AND at < ?
             ORDER BY at ASC, id ASC
-            "#,
+            {limit_clause}
+            "#
+            ),
         )
         .bind(encode_time(from))
         .bind(encode_time(to))
@@ -773,14 +797,26 @@ impl Storage {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<ObservationEvent>> {
-        let rows = sqlx::query(
+        self.observation_events_between_limited(from, to, None)
+            .await
+    }
+
+    pub async fn observation_events_between_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ObservationEvent>> {
+        let limit_clause = limit_clause(limit);
+        let rows = sqlx::query(&format!(
             r#"
             SELECT id, request_id, at, kind, model, source, value, unit, attributes_json
             FROM observation_events
             WHERE at >= ? AND at < ?
             ORDER BY at ASC, id ASC
-            "#,
-        )
+            {limit_clause}
+            "#
+        ))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -881,14 +917,25 @@ impl Storage {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<QuotaDecisionRecord>> {
-        let rows = sqlx::query(
+        self.quota_decisions_between_limited(from, to, None).await
+    }
+
+    pub async fn quota_decisions_between_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> Result<Vec<QuotaDecisionRecord>> {
+        let limit_clause = limit_clause(limit);
+        let rows = sqlx::query(&format!(
             r#"
             SELECT id, request_id, at, actor, team, model, allowed, reason, policy_json
             FROM quota_decisions
             WHERE at >= ? AND at < ?
             ORDER BY at ASC, id ASC
-            "#,
-        )
+            {limit_clause}
+            "#
+        ))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -945,6 +992,40 @@ impl Storage {
             ORDER BY at ASC, id ASC
             "#,
         )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(row_to_request_lineage_join_record)
+            .collect()
+    }
+
+    pub async fn request_lineage_joins_between(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<RequestLineageJoinRecord>> {
+        self.request_lineage_joins_between_limited(from, to, None)
+            .await
+    }
+
+    pub async fn request_lineage_joins_between_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RequestLineageJoinRecord>> {
+        let limit_clause = limit_clause(limit);
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT id, request_id, at, lineage_id, model, corpus, source
+            FROM request_lineage_joins
+            WHERE at >= ? AND at < ?
+            ORDER BY at ASC, id ASC
+            {limit_clause}
+            "#
+        ))
+        .bind(encode_time(from))
+        .bind(encode_time(to))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -1084,6 +1165,12 @@ fn parse_optional_uuid(value: Option<String>) -> Result<Option<Uuid>> {
 
 fn parse_json(value: String) -> Result<serde_json::Value> {
     serde_json::from_str(&value).context("parse sqlite json payload")
+}
+
+fn limit_clause(limit: Option<usize>) -> String {
+    limit
+        .map(|limit| format!("LIMIT {}", limit.max(1)))
+        .unwrap_or_default()
 }
 
 fn i64_to_u64(value: i64, field: &str) -> Result<u64> {

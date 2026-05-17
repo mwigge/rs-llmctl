@@ -15,9 +15,9 @@ RestartSec=5s
 
 CPUAccounting=true
 MemoryAccounting=true
-CPUQuota=80%
-MemoryMax=80%
-# Override these defaults with the generated server plan when needed:
+# This packaged template is host-neutral. The installer writes a host-specific
+# CPUQuota=(nproc * 80)% unit; manual deployments should apply the generated
+# server plan values below.
 # CPUQuota=<server-plan.resource_limits.systemd.CPUQuota>
 # MemoryMax=<server-plan.resource_limits.systemd.MemoryMax>
 # Or launch an equivalent transient service during tests:

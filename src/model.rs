@@ -254,8 +254,8 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
         }
     };
 
-    ensure_gguf_path(&path)?;
-    let sha256 = sha256_file(&path).await?;
+    ensure_supported_artifact_path(&path).await?;
+    let sha256 = sha256_model_artifact(&path).await?;
     if let Some(expected) = &plan.verification.expected_sha256 {
         if sha256 != *expected {
             bail!(
@@ -264,10 +264,7 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
             );
         }
     }
-    let bytes = fs::metadata(&path)
-        .await
-        .with_context(|| format!("stat installed model {}", path.display()))?
-        .len();
+    let bytes = model_artifact_len(&path).await?;
     let config = ModelConfig {
         alias: req.alias.clone(),
         path: path.clone(),
@@ -332,16 +329,16 @@ pub async fn install_offline_manifest(
         validate_alias(&entry.alias)?;
         let expected = normalized_sha256(&entry.sha256)?;
         let path = resolve_manifest_path(base_dir, &entry.path);
-        ensure_gguf_path(&path)?;
+        ensure_supported_artifact_path(&path).await?;
         let metadata = fs::metadata(&path)
             .await
             .with_context(|| format!("stat offline model {}", path.display()))?;
         anyhow::ensure!(
-            metadata.is_file(),
-            "offline model is not a file: {}",
+            metadata.is_file() || metadata.is_dir(),
+            "offline model is not a file or native safetensors directory: {}",
             path.display()
         );
-        let sha256 = sha256_file(&path).await?;
+        let sha256 = sha256_model_artifact(&path).await?;
         if sha256 != expected {
             bail!(
                 "sha256 mismatch for {}: expected {expected}, got {sha256}",
@@ -356,11 +353,12 @@ pub async fn install_offline_manifest(
             family: entry.family.clone(),
             weight: entry.weight,
         };
+        let bytes = model_artifact_len(&path).await?;
         installed.push(InstalledModel {
             alias: entry.alias.clone(),
             path,
             sha256: sha256.clone(),
-            bytes: metadata.len(),
+            bytes,
             source,
             source_kind: ModelInstallSourceKind::Offline,
             verification: ModelInstallVerification {
@@ -380,13 +378,13 @@ pub async fn register_local_model(
     cache_dir: &Path,
     copy_to_cache: bool,
 ) -> Result<PathBuf> {
-    ensure_gguf_path(path)?;
+    ensure_supported_artifact_path(path).await?;
     let metadata = fs::metadata(path)
         .await
         .with_context(|| format!("stat local model {}", path.display()))?;
     anyhow::ensure!(
-        metadata.is_file(),
-        "local model is not a file: {}",
+        metadata.is_file() || metadata.is_dir(),
+        "local model is not a file or native safetensors directory: {}",
         path.display()
     );
 
@@ -401,10 +399,43 @@ pub async fn register_local_model(
         .file_name()
         .ok_or_else(|| anyhow!("local model has no filename: {}", path.display()))?;
     let destination = unique_destination(cache_dir, filename);
+    if metadata.is_dir() {
+        copy_dir(path, &destination).await?;
+        return Ok(destination);
+    }
+    if is_safetensors_path(path) {
+        let directory_destination = unique_destination(cache_dir, filename).with_extension("");
+        fs::create_dir_all(&directory_destination)
+            .await
+            .with_context(|| format!("create {}", directory_destination.display()))?;
+        copy_safetensors_file_layout(path, &directory_destination).await?;
+        return Ok(directory_destination);
+    }
     fs::copy(path, &destination)
         .await
         .with_context(|| format!("copy {} to {}", path.display(), destination.display()))?;
     Ok(destination)
+}
+
+async fn copy_dir(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .await
+        .with_context(|| format!("create {}", destination.display()))?;
+    let mut entries = fs::read_dir(source)
+        .await
+        .with_context(|| format!("read {}", source.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let entry_type = entry.file_type().await?;
+        let target = destination.join(entry.file_name());
+        if entry_type.is_dir() {
+            Box::pin(copy_dir(&entry.path(), &target)).await?;
+        } else if entry_type.is_file() {
+            fs::copy(entry.path(), &target).await.with_context(|| {
+                format!("copy {} to {}", entry.path().display(), target.display())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn download_model(
@@ -490,7 +521,14 @@ async fn verify_downloaded_model(
     destination: &Path,
     expected_sha256: &str,
 ) -> Result<()> {
-    ensure_gguf_path(destination)?;
+    let Some(name) = destination.file_name().and_then(|name| name.to_str()) else {
+        bail!("model path has no filename: {}", destination.display());
+    };
+    ensure_supported_model_name(name)?;
+    anyhow::ensure!(
+        !name.to_ascii_lowercase().ends_with(".safetensors"),
+        "direct safetensors downloads are not supported without config.json and tokenizer.json sidecars; use an offline manifest or local safetensors directory"
+    );
     let expected_sha256 = normalized_sha256(expected_sha256)?;
     let sha256 = sha256_file(partial).await?;
     if sha256 != expected_sha256 {
@@ -528,12 +566,12 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
 fn download_filename(url: &str, name_hint: &str) -> Result<String> {
     let without_query = url.split('?').next().unwrap_or(url);
     let from_url = without_query.rsplit('/').next().unwrap_or("");
-    let candidate = if from_url.ends_with(".gguf") {
+    let candidate = if is_supported_model_filename(from_url) {
         from_url
     } else {
         name_hint
     };
-    ensure_gguf_name(candidate)?;
+    ensure_supported_model_name(candidate)?;
     Ok(candidate.to_string())
 }
 
@@ -565,19 +603,161 @@ fn validate_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_gguf_path(path: &Path) -> Result<()> {
+async fn ensure_supported_artifact_path(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .await
+        .with_context(|| format!("stat model artifact {}", path.display()))?;
+    if metadata.is_dir() {
+        ensure_safetensors_layout(path).await?;
+        return Ok(());
+    }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         bail!("model path has no filename: {}", path.display());
     };
-    ensure_gguf_name(name)
+    ensure_supported_model_name(name)?;
+    if is_safetensors_path(path) {
+        ensure_safetensors_file_layout(path).await?;
+    }
+    Ok(())
 }
 
-fn ensure_gguf_name(name: &str) -> Result<()> {
+fn ensure_supported_model_name(name: &str) -> Result<()> {
     anyhow::ensure!(
-        name.to_ascii_lowercase().ends_with(".gguf"),
-        "model file must use .gguf extension: {name}"
+        is_supported_model_filename(name),
+        "model artifact must use .gguf or .safetensors extension: {name}"
     );
     Ok(())
+}
+
+fn is_supported_model_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".gguf") || lower.ends_with(".safetensors")
+}
+
+fn is_safetensors_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".safetensors"))
+}
+
+async fn ensure_safetensors_file_layout(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("native safetensors file has no parent directory"))?;
+    for required in ["config.json", "tokenizer.json"] {
+        let required_path = parent.join(required);
+        anyhow::ensure!(
+            required_path.is_file(),
+            "native safetensors file {} must have sibling {required}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn copy_safetensors_file_layout(source: &Path, destination_dir: &Path) -> Result<()> {
+    ensure_safetensors_file_layout(source).await?;
+    let filename = source
+        .file_name()
+        .ok_or_else(|| anyhow!("native safetensors file has no filename"))?;
+    fs::copy(source, destination_dir.join(filename))
+        .await
+        .with_context(|| format!("copy {} to {}", source.display(), destination_dir.display()))?;
+    let parent = source
+        .parent()
+        .ok_or_else(|| anyhow!("native safetensors file has no parent directory"))?;
+    for sidecar in ["config.json", "tokenizer.json"] {
+        fs::copy(parent.join(sidecar), destination_dir.join(sidecar))
+            .await
+            .with_context(|| format!("copy safetensors sidecar {sidecar}"))?;
+    }
+    Ok(())
+}
+
+async fn ensure_safetensors_layout(path: &Path) -> Result<()> {
+    for required in ["config.json", "tokenizer.json"] {
+        let required_path = path.join(required);
+        anyhow::ensure!(
+            required_path.is_file(),
+            "native safetensors directory {} must include {required}",
+            path.display()
+        );
+    }
+    let mut entries = fs::read_dir(path)
+        .await
+        .with_context(|| format!("read native safetensors directory {}", path.display()))?;
+    let mut has_weights = false;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".safetensors"))
+        {
+            has_weights = true;
+            break;
+        }
+    }
+    anyhow::ensure!(
+        has_weights,
+        "native safetensors directory {} must include at least one .safetensors weight file",
+        path.display()
+    );
+    Ok(())
+}
+
+async fn sha256_model_artifact(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)
+        .await
+        .with_context(|| format!("stat model artifact {}", path.display()))?;
+    if metadata.is_file() {
+        return sha256_file(path).await;
+    }
+    ensure_safetensors_layout(path).await?;
+    let mut files = Vec::new();
+    let mut entries = fs::read_dir(path)
+        .await
+        .with_context(|| format!("read model artifact directory {}", path.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let entry_path = entry.path();
+        if entry.file_type().await?.is_file() {
+            files.push(entry_path);
+        }
+    }
+    files.sort();
+    let mut hasher = Sha256::new();
+    for file in files {
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        let digest = sha256_file(&file).await?;
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+async fn model_artifact_len(path: &Path) -> Result<u64> {
+    let metadata = fs::metadata(path)
+        .await
+        .with_context(|| format!("stat model artifact {}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0_u64;
+    let mut entries = fs::read_dir(path)
+        .await
+        .with_context(|| format!("read model artifact directory {}", path.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata = entry.metadata().await?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn validate_direct_download_url(url: &str) -> Result<()> {
@@ -702,6 +882,95 @@ mod tests {
         assert_eq!(installed.bytes, 4);
         assert_eq!(installed.config.alias, "tiny");
         assert_eq!(installed.config.weight, 7);
+    }
+
+    #[tokio::test]
+    async fn rejects_bare_safetensors_file_without_native_sidecars() {
+        let dir = tempdir().unwrap();
+        let model = dir.path().join("model.safetensors");
+        fs::write(&model, b"safetensors").await.unwrap();
+        let err = install_model(&ModelInstallRequest {
+            alias: "mistral".to_string(),
+            source: ModelSource::LocalPath {
+                path: model.clone(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: "chat".to_string(),
+            family: Some("mistral".to_string()),
+            weight: 1,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("sibling config.json"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registers_local_safetensors_file_with_sidecars_without_copy() {
+        let dir = tempdir().unwrap();
+        let model = dir.path().join("model.safetensors");
+        fs::write(&model, b"safetensors").await.unwrap();
+        fs::write(dir.path().join("config.json"), b"{}")
+            .await
+            .unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"{}")
+            .await
+            .unwrap();
+        let installed = install_model(&ModelInstallRequest {
+            alias: "mistral".to_string(),
+            source: ModelSource::LocalPath {
+                path: model.clone(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: "chat".to_string(),
+            family: Some("mistral".to_string()),
+            weight: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(installed.path, model);
+        assert_eq!(installed.config.family.as_deref(), Some("mistral"));
+    }
+
+    #[tokio::test]
+    async fn registers_safetensors_directory_layout() {
+        let dir = tempdir().unwrap();
+        let model_dir = dir.path().join("deepseek");
+        fs::create_dir_all(&model_dir).await.unwrap();
+        fs::write(model_dir.join("config.json"), b"{}")
+            .await
+            .unwrap();
+        fs::write(model_dir.join("tokenizer.json"), b"{}")
+            .await
+            .unwrap();
+        fs::write(model_dir.join("model.safetensors"), b"weights")
+            .await
+            .unwrap();
+        let installed = install_model(&ModelInstallRequest {
+            alias: "deepseek".to_string(),
+            source: ModelSource::LocalPath {
+                path: model_dir.clone(),
+            },
+            cache_dir: dir.path().join("cache"),
+            copy_to_cache: false,
+            expected_sha256: None,
+            role: "thinking".to_string(),
+            family: Some("deepseek".to_string()),
+            weight: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(installed.path, model_dir);
+        assert!(installed.bytes > 0);
     }
 
     #[tokio::test]

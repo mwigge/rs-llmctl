@@ -108,6 +108,9 @@ ingress, reverse proxy, or service mesh. The runtime validates that the
 deployment config documents that control:
 
 ```toml
+[security]
+trusted-proxies = ["127.0.0.1"]
+
 [security.tls-termination]
 enabled = true
 provider = "envoy-edge"
@@ -120,8 +123,9 @@ m-tls = true
 reviews can prove the control was present at deployment time.
 
 The `llmctl` binary uses Rustls-backed clients for outbound HTTPS model
-downloads, compatibility upstream calls, OTel export, and Postgres TLS. It can
-also serve inbound HTTPS directly with native Rustls:
+downloads, OTel export, and Postgres TLS. External provider routing is disabled
+in this native-only release. It can also serve inbound HTTPS directly with
+native Rustls:
 
 ```toml
 [server.tls]

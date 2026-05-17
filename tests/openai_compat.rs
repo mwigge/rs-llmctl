@@ -1902,10 +1902,10 @@ async fn chat_completions_rejects_unknown_model_before_upstream() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = response_json(response).await;
-    assert_eq!(body["error"]["type"], "unknown_model");
-    assert_eq!(body["error"]["code"], "unknown_model");
+    assert_eq!(body["error"]["type"], "model_not_found");
+    assert_eq!(body["error"]["code"], "model_not_found");
 }
 
 #[tokio::test]
@@ -2055,9 +2055,9 @@ async fn admin_swap_requires_admin_scope_and_attached_worker_control() {
         .await
         .unwrap();
 
-    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
     let body = response_json(unavailable).await;
-    assert_eq!(body["error"]["code"], "worker_control_unavailable");
+    assert_eq!(body["error"]["code"], "native_swap_unavailable");
 }
 
 async fn test_app(cfg: Config) -> Router {

@@ -37,6 +37,17 @@ OpenAI-compatible `/v1/chat/completions` smoke request plan. Run those after the
 daemon is started and the secret has been moved into the operator's secret
 store or exported through `LLMCTL_API_KEY`.
 
+The packaged smoke script automates that default path without Docker when a
+local model artifact is available:
+
+```bash
+LLMCTL_NATIVE_SMOKE_MODEL_PATH=/models/qwen.gguf \
+  tests/smoke/smoke_native_release.sh
+```
+
+It installs the release tarball into a temporary prefix, applies first-run with
+one generated API key, starts the server, and calls the local chat endpoint.
+
 Create a CPU-only host config:
 
 ```bash
@@ -67,8 +78,8 @@ The TLS flags populate `security.tls-termination` evidence for the production
 edge. The default listener remains HTTP; put production external bind behind
 Envoy, NGINX, HAProxy, a cloud load balancer, ingress, or service mesh for
 HTTPS/mTLS. Outbound HTTPS from the Rust binary uses Rustls-backed clients for
-verified model downloads, upstream compatibility calls, OTel export, and
-Postgres TLS.
+verified model downloads, OTel export, and Postgres TLS. External provider
+routing is disabled in this native-only release.
 
 ## Relevant Blocks
 
@@ -85,6 +96,7 @@ model-alias = "embed"
 
 [security]
 auth-failure-limit-per-minute = 60
+trusted-proxies = ["127.0.0.1"]
 
 [security.tls-termination]
 enabled = true
@@ -142,8 +154,8 @@ contract; the alias must identify a loaded semantic embedding model. Use
 `mode = "dev-fallback"` only for local development because it emits
 deterministic, non-semantic vectors.
 `server.graceful-drain-seconds` flips readiness to `draining` before process
-shutdown, and the circuit-breaker settings protect compatibility upstreams from
-repeated failing retries.
+shutdown, and the circuit-breaker settings protect internal runtime/provider
+boundaries from repeated failing retries.
 
 ## Validation
 

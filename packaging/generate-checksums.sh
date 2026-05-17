@@ -43,12 +43,16 @@ if [[ -f CHANGELOG.md ]]; then
   install -m 0644 CHANGELOG.md "${stage}/CHANGELOG.md"
 fi
 
-if [[ -f packaging/systemd/llmctld.service ]]; then
+if [[ "${OS}" == "linux" && -f packaging/systemd/llmctld.service ]]; then
   install -D -m 0644 packaging/systemd/llmctld.service "${stage}/packaging/systemd/llmctld.service"
+fi
+if [[ "${OS}" == "linux" && -f packaging/systemd/llmctl-monthly-audit.service ]]; then
+  install -D -m 0644 packaging/systemd/llmctl-monthly-audit.service "${stage}/packaging/systemd/llmctl-monthly-audit.service"
+  install -D -m 0644 packaging/systemd/llmctl-monthly-audit.timer "${stage}/packaging/systemd/llmctl-monthly-audit.timer"
 fi
 
 tar -C "${stage}" -czf "${tarball}" .
 (
   cd "${DIST_DIR}"
-  sha256sum "${artifact}.tar.gz" > SHA256SUMS
+  sha256sum rs-llmctl-*.tar.gz | sort -k2 > SHA256SUMS
 )

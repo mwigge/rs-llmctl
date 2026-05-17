@@ -1,0 +1,6 @@
+{
+  "format": "cargo-lock-fallback",
+  "component": "rs-llmctl",
+  "lockfile": "Cargo.lock",
+  "note": "CycloneDX output requires pre-cached cargo-cyclonedx. This fallback preserves the locked dependency graph for offline evidence."
+}

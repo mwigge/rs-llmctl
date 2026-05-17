@@ -12,6 +12,8 @@ state_dir="${LLMCTL_STATE_DIR:-/var/lib/rs-llmctl}"
 log_dir="${LLMCTL_LOG_DIR:-/var/log/rs-llmctl}"
 service_name="${LLMCTL_SERVICE_NAME:-llmctld}"
 install_systemd="${LLMCTL_INSTALL_SYSTEMD:-auto}"
+start_service="${LLMCTL_START_SERVICE:-0}"
+enable_audit_timer="${LLMCTL_ENABLE_AUDIT_TIMER:-0}"
 systemd_dir="${LLMCTL_SYSTEMD_DIR:-/etc/systemd/system}"
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
@@ -227,6 +229,7 @@ else
   info "Downloading ${sums_url}"
   curl -fsSL "${sums_url}" -o "${tmp}/SHA256SUMS"
   verify_archive_checksum "${tmp}/rs-llmctl.tar.gz" "${tmp}/SHA256SUMS"
+  warn "verified archive checksum only; verify SHA256SUMS signature from the GitHub release before production installs when publisher authentication is required"
   safe_extract_archive "${tmp}/rs-llmctl.tar.gz" "${extract_dir}"
 fi
 
@@ -305,6 +308,10 @@ EOF
 
   info "Installing systemd service"
   unit_tmp="${tmp}/${service_name}.service"
+  cpu_quota_percent=80
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_quota_percent=$(( $(nproc) * 80 ))
+  fi
   cat > "${unit_tmp}" <<EOF
 [Unit]
 Description=rs-llmctl OpenAI-compatible model serving daemon
@@ -323,7 +330,7 @@ RestartSec=5s
 
 CPUAccounting=true
 MemoryAccounting=true
-CPUQuota=80%
+CPUQuota=${cpu_quota_percent}%
 MemoryMax=80%
 
 NoNewPrivileges=true
@@ -337,15 +344,51 @@ WantedBy=multi-user.target
 EOF
   run_root install -d -m 0755 "${systemd_dir}"
   run_root install -m 0644 "${unit_tmp}" "${systemd_dir}/${service_name}.service"
+  if [ -f "${extract_dir}/packaging/systemd/llmctl-monthly-audit.timer" ]; then
+    audit_unit_tmp="${tmp}/llmctl-monthly-audit.service"
+    cat > "${audit_unit_tmp}" <<EOF
+[Unit]
+Description=Write rs-llmctl monthly audit evidence
+Documentation=https://github.com/${repo}
+
+[Service]
+Type=oneshot
+User=llmctl
+Group=llmctl
+Environment=LLMCTL_CONFIG=${config_file}
+ExecStart=${bin_dir}/llmctl --config \${LLMCTL_CONFIG} audit report monthly --envelope --write
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${state_dir} ${log_dir}
+EOF
+    run_root install -m 0644 "${audit_unit_tmp}" "${systemd_dir}/llmctl-monthly-audit.service"
+    run_root install -m 0644 "${extract_dir}/packaging/systemd/llmctl-monthly-audit.timer" "${systemd_dir}/llmctl-monthly-audit.timer"
+  fi
   run_root systemctl daemon-reload
   run_root systemctl reset-failed "${service_name}.service" >/dev/null 2>&1 || true
+  audit_timer_installed=0
+  if [ -f "${systemd_dir}/llmctl-monthly-audit.timer" ]; then
+    audit_timer_installed=1
+  fi
+  if [ "${audit_timer_installed}" = "1" ] && [ "${enable_audit_timer}" = "1" ]; then
+    run_root systemctl enable --now llmctl-monthly-audit.timer >/dev/null 2>&1 || warn "Installed monthly audit timer but could not enable it automatically"
+  fi
 
-  info "Enabling and starting ${service_name}.service"
-  if run_root systemctl enable --now "${service_name}.service"; then
-    ok "Started ${service_name}.service"
+  if [ "${start_service}" = "1" ]; then
+    info "Enabling and starting ${service_name}.service"
+    if run_root systemctl enable --now "${service_name}.service"; then
+      ok "Started ${service_name}.service"
+    else
+      warn "Installed ${service_name}.service, but systemd could not start it automatically"
+      warn "Check status with: sudo systemctl status ${service_name}.service"
+    fi
   else
-    warn "Installed ${service_name}.service, but systemd could not start it automatically"
-    warn "Check status with: sudo systemctl status ${service_name}.service"
+    ok "Installed ${service_name}.service without starting it"
+    warn "Run first-run with a model and API key before starting the service:"
+    warn "  sudo ${bin_dir}/llmctl --config ${config_file} first-run --apply --secret-output /root/llmctl-api-key.txt --starter-model-path /path/to/safetensors-model-dir"
+    warn "Then start it with: sudo systemctl enable --now ${service_name}.service"
   fi
 else
   case ":${PATH}:" in
@@ -357,7 +400,18 @@ fi
 printf '\n'
 ok "rs-llmctl installed"
 if [ "${install_systemd}" = "1" ]; then
+  if [ "${start_service}" != "1" ]; then
+    printf '  Next:    sudo %s/llmctl --config %s first-run --apply --secret-output /root/llmctl-api-key.txt --starter-model-path /path/to/safetensors-model-dir\n' "${bin_dir}" "${config_file}"
+  fi
   printf '  Service: sudo systemctl status %s.service\n' "${service_name}"
+  printf '  Start:   sudo systemctl enable --now %s.service\n' "${service_name}"
+  if [ "${audit_timer_installed:-0}" = "1" ]; then
+    if [ "${enable_audit_timer}" = "1" ]; then
+      printf '  Audit:   sudo systemctl status llmctl-monthly-audit.timer\n'
+    else
+      printf '  Audit:   sudo systemctl enable --now llmctl-monthly-audit.timer\n'
+    fi
+  fi
   printf '  API:     http://127.0.0.1:8765/v1\n'
   printf '  Config:  %s\n' "${config_file}"
 else

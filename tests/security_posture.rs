@@ -22,7 +22,9 @@ fn enable_tls_termination(cfg: &mut Config) {
     cfg.security.tls_termination.provider = Some("envoy-edge".to_string());
     cfg.security.tls_termination.evidence = Some("change-record-123".to_string());
     cfg.security.tls_termination.m_tls = true;
+    cfg.security.trusted_proxies = vec!["127.0.0.1".to_string()];
     cfg.audit.monthly_reports = true;
+    cfg.audit.report_directory = Some(std::path::PathBuf::from("/var/lib/rs-llmctl/reports"));
     cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
 }
 
@@ -31,6 +33,7 @@ fn enable_native_tls(cfg: &mut Config) {
     cfg.server.tls.cert_path = Some("/etc/llmctl/tls/server.crt".into());
     cfg.server.tls.key_path = Some("/etc/llmctl/tls/server.key".into());
     cfg.audit.monthly_reports = true;
+    cfg.audit.report_directory = Some(std::path::PathBuf::from("/var/lib/rs-llmctl/reports"));
     cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
 }
 
@@ -91,7 +94,7 @@ fn external_bind_accepts_native_tls_cert_and_key() {
 }
 
 #[test]
-fn production_external_provider_requires_https_base_url() {
+fn native_only_release_rejects_external_provider_routing() {
     let mut cfg = Config::default();
     cfg.security.production = true;
     cfg.security.require_auth = true;
@@ -105,14 +108,26 @@ fn production_external_provider_requires_https_base_url() {
         api_key_env: "OPENAI_API_KEY".to_string(),
     }];
 
-    let err = config::validate_production_security(&cfg).expect_err("https is required");
+    let err = config::validate_production_security(&cfg)
+        .expect_err("external providers are not supported in the native-only release");
     assert!(
-        err.to_string().contains("must use https"),
+        err.to_string()
+            .contains("external provider routing is disabled"),
         "unexpected error: {err}"
     );
+}
 
-    cfg.external_providers.providers[0].base_url = "https://api.openai.example/v1".to_string();
-    config::validate_production_security(&cfg).expect("https provider is accepted");
+#[test]
+fn non_loopback_hosts_require_external_security_posture() {
+    let mut cfg = Config::default();
+    cfg.server.host = "192.168.1.10".to_string();
+
+    let err = config::validate_production_security(&cfg)
+        .expect_err("non-loopback bind must be treated as externally reachable");
+    assert!(
+        err.to_string().contains("requires authentication"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -145,6 +160,8 @@ fn external_bind_requires_cra_active_audit_and_otel_controls() {
     cfg.security.tls_termination.enabled = true;
     cfg.security.tls_termination.provider = Some("envoy-edge".to_string());
     cfg.security.tls_termination.evidence = Some("change-record-123".to_string());
+    cfg.security.trusted_proxies = vec!["127.0.0.1".to_string()];
+    cfg.audit.report_directory = Some(std::path::PathBuf::from("/var/lib/rs-llmctl/reports"));
 
     let err = config::validate_production_security(&cfg).expect_err("monthly reports required");
     assert!(
@@ -161,6 +178,36 @@ fn external_bind_requires_cra_active_audit_and_otel_controls() {
 
     cfg.observability.exporter.endpoint = Some("https://otel.example.test/v1/traces".to_string());
     config::validate_production_security(&cfg).expect("CRA active controls accepted");
+}
+
+#[test]
+fn external_bind_rejects_wildcard_trusted_proxy() {
+    let mut cfg = Config::default();
+    cfg.server.host = "0.0.0.0".to_string();
+    cfg.security.require_auth = true;
+    cfg.security.api_keys = vec![hashed_key()];
+    enable_tls_termination(&mut cfg);
+    cfg.security.trusted_proxies = vec!["*".to_string()];
+
+    let err = config::validate_production_security(&cfg).expect_err("wildcard proxy rejected");
+    assert!(
+        err.to_string().contains("wildcard is not allowed"),
+        "unexpected error: {err}"
+    );
+
+    cfg.security.trusted_proxies = vec!["0.0.0.0/0".to_string()];
+    let err = config::validate_production_security(&cfg).expect_err("catch-all proxy rejected");
+    assert!(
+        err.to_string().contains("invalid CIDR prefix"),
+        "unexpected error: {err}"
+    );
+
+    cfg.security.trusted_proxies = vec!["::/0".to_string()];
+    let err = config::validate_production_security(&cfg).expect_err("catch-all proxy rejected");
+    assert!(
+        err.to_string().contains("invalid CIDR prefix"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

@@ -5,9 +5,12 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
 permissions:
-  contents: read
+  contents: write
+  id-token: write
 
 jobs:
   rust:
@@ -28,6 +31,14 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Check feature matrix
+        run: |
+          cargo check --workspace --all-targets --no-default-features
+          cargo check --workspace --all-targets --no-default-features --features native-tokenizers
+          cargo check --workspace --all-targets --no-default-features --features native-candle
+          cargo check --workspace --all-targets --no-default-features --features native
+          cargo check --workspace --all-targets --all-features
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
@@ -43,6 +54,17 @@ jobs:
       - name: Generate release checksums
         run: packaging/generate-checksums.sh
 
+      - name: Generate release SBOM evidence
+        run: packaging/generate-sbom.sh dist
+
+      - name: Install cosign for tagged release signing
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign release checksums for tagged releases
+        if: startsWith(github.ref, 'refs/tags/')
+        run: packaging/sign-release.sh dist
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -50,3 +72,49 @@ jobs:
           path: |
             dist/rs-llmctl-*.tar.gz
             dist/SHA256SUMS
+            dist/SHA256SUMS.*
+            dist/rs-llmctl*.cdx.json
+            dist/rs-llmctl.sbom-fallback.json
+            dist/Cargo.lock
+
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG.md \
+            dist/rs-llmctl-*.tar.gz \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.* \
+            dist/rs-llmctl*.cdx.json \
+            dist/rs-llmctl.sbom-fallback.json \
+            dist/Cargo.lock
+
+  native-release-smoke:
+    name: Native release smoke
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: [self-hosted, linux, x64, llmctl-native-smoke]
+    environment: native-smoke
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native release binary
+        run: cargo build --release --bin llmctl --all-features
+
+      - name: Package native release artifact
+        run: packaging/generate-checksums.sh
+
+      - name: Run native release smoke with mounted model artifacts
+        env:
+          LLMCTL_NATIVE_SMOKE_CONFIG: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG }}
+          LLMCTL_NATIVE_SMOKE_CONFIG_TOML: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG_TOML }}
+          LLMCTL_NATIVE_SMOKE_MODEL_PATH: ${{ secrets.LLMCTL_NATIVE_SMOKE_MODEL_PATH }}
+          LLMCTL_NATIVE_SMOKE_API_KEY: ${{ secrets.LLMCTL_NATIVE_SMOKE_API_KEY }}
+          LLMCTL_NATIVE_SMOKE_MODEL: ${{ vars.LLMCTL_NATIVE_SMOKE_MODEL }}
+        run: tests/smoke/smoke_native_release.sh

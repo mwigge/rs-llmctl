@@ -16,6 +16,7 @@ cors_allowed_origins = ["https://aqe.example.com"]
 production = true
 require_auth = true
 bind_external = true
+trusted-proxies = ["127.0.0.1"]
 
 [security.tls-termination]
 enabled = true

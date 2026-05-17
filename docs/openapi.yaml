@@ -1,0 +1,152 @@
+openapi: 3.1.0
+info:
+  title: rs-llmctl native API
+  version: 1.2.0
+  description: OpenAI-compatible local LLM API served through the rs-llmctl native control plane.
+servers:
+  - url: http://localhost:8765
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+  /livez:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+  /readyz:
+    get:
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: Storage and at least one model are ready.
+        "503":
+          description: Node is unavailable or draining.
+  /v1/models:
+    get:
+      summary: List configured local models
+      responses:
+        "200":
+          description: OpenAI-compatible model list.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/chat/completions:
+    post:
+      summary: Create a chat completion
+      description: Supports non-streaming JSON responses and streaming `text/event-stream` frames ending in `[DONE]`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              additionalProperties: true
+              properties:
+                model:
+                  type: string
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+                stream:
+                  type: boolean
+                tools:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+      responses:
+        "200":
+          description: OpenAI-compatible chat completion or SSE stream.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Model alias was not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          description: Native runtime or model is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+  /v1/embeddings:
+    post:
+      summary: Create embeddings through the native runtime
+      responses:
+        "200":
+          description: OpenAI-compatible embeddings response.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Native embedding runtime is unavailable.
+  /v1/local/search:
+    post:
+      summary: Search caller-supplied local documents
+      responses:
+        "200":
+          description: Ranked local search results.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/local/recommendations:
+    post:
+      summary: Recommend caller-supplied local documents
+      responses:
+        "200":
+          description: Ranked local recommendations.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Unauthorized:
+      description: Missing, invalid, expired, or revoked API key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    RateLimited:
+      description: Request rejected by auth throttling, quota, or admission control.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [message, type, code, status]
+          additionalProperties: true
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+            code:
+              type: string
+            status:
+              type: integer

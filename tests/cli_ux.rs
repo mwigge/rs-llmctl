@@ -570,6 +570,7 @@ context_size = 8192
 production = true
 require_auth = true
 bind_external = true
+trusted-proxies = ["127.0.0.1"]
 
 [security.tls-termination]
 enabled = true
@@ -1323,9 +1324,10 @@ fn data_verify_envelope_accepts_valid_offline_file() {
     assert_eq!(verified["status"], "valid");
     assert_eq!(verified["valid"], true);
     assert_eq!(
-        verified["path"].as_str().expect("path"),
-        envelope_path.to_string_lossy()
+        verified["artifact"].as_str().expect("artifact"),
+        "export-envelope.json"
     );
+    assert!(verified["path_redacted"].as_str().is_some());
     assert_eq!(verified["expected_sha256"], envelope["metadata"]["sha256"]);
     assert_eq!(verified["actual_sha256"], envelope["metadata"]["sha256"]);
 }
@@ -1608,13 +1610,12 @@ fn service_lifecycle_help_and_dry_run_are_json_friendly() {
     let upgrade = assert_success_json(upgrade);
     assert_eq!(upgrade["action"], "upgrade");
     assert_eq!(upgrade["scope"], "system");
-    assert_eq!(
-        upgrade["commands"],
-        serde_json::json!([
-            { "program": "systemctl", "args": ["daemon-reload"] },
-            { "program": "systemctl", "args": ["restart", "llmctld.service"] }
-        ])
-    );
+    assert_eq!(upgrade["commands"], serde_json::json!([]));
+    assert_eq!(upgrade["artifact_action_supported"], false);
+    assert!(upgrade["artifact_action_note"]
+        .as_str()
+        .expect("artifact note")
+        .contains("verified release artifact"));
     assert_eq!(upgrade["restart_hint"], "systemctl restart llmctld.service");
     assert_eq!(upgrade["one_binary"], true);
     assert_eq!(upgrade["runtime_backend"], "candle-native");
@@ -3822,6 +3823,7 @@ context_size = 8192
 production = true
 require_auth = true
 bind_external = true
+trusted-proxies = ["127.0.0.1"]
 
 [security.tls-termination]
 enabled = true
@@ -3875,9 +3877,13 @@ monthly-reports = true
 
     assert_eq!(report["status"], "ok");
     assert_eq!(
-        report["config"].as_str().expect("config path"),
-        config.to_string_lossy()
+        report["config"].as_str().expect("config artifact"),
+        "prod.toml"
     );
+    assert!(report["config_path_redacted"]
+        .as_str()
+        .expect("redacted config path")
+        .ends_with("prod.toml"));
     assert_eq!(report["external_bind"]["enabled"], true);
     assert_eq!(report["external_bind"]["host"], "0.0.0.0");
     assert_eq!(report["auth"]["require_auth"], true);
@@ -3905,9 +3911,12 @@ monthly-reports = true
     assert_eq!(report["systemd"]["checked"], true);
     assert_eq!(report["systemd"]["present"], true);
     assert_eq!(report["systemd"]["has_exec_start"], true);
+    assert_eq!(report["systemd"]["artifact"], "llmctld.service");
+    assert!(report["systemd"].get("path").is_none());
 
     let output = serde_json::to_string(&report).expect("serialize report");
     assert!(!output.contains("0123456789abcdef"));
+    assert!(!output.contains(&unit_path.to_string_lossy().to_string()));
 }
 
 #[test]

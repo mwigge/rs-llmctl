@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "rs-llmctl"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3050,6 +3050,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "toml",
+ "tonic",
  "tower",
  "tower-http",
  "tracing",
@@ -3059,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "rs-llmctl-client"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "async-stream",
  "axum",

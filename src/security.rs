@@ -1,8 +1,16 @@
-use crate::config::{ApiKeyConfig, Config};
+use crate::config::{is_external_host, ApiKeyConfig, Config};
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::BTreeSet;
 
+/// Enforce the production security posture for an `rs-llmctl` configuration.
+///
+/// The validator is intentionally fail-closed for externally reachable service
+/// configs. It rejects plaintext API-key material, unknown or empty scopes,
+/// invalid key lifecycle metadata, plaintext observability secrets, malformed
+/// native TLS settings, unsafe external provider settings, missing auth, missing
+/// TLS evidence, missing audit retention/monthly reports, and incomplete OTLP
+/// telemetry exporters.
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
     validate_api_keys_are_hashes(&cfg.security.api_keys)?;
     validate_api_key_scopes(&cfg.security.api_keys)?;
@@ -11,11 +19,14 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
     validate_native_tls_config(cfg)?;
     validate_external_provider_security(cfg)?;
 
-    if cfg.security.production || cfg.security.bind_external || cfg.server.host == "0.0.0.0" {
+    if cfg.security.production || cfg.security.bind_external || is_external_host(&cfg.server.host) {
         anyhow::ensure!(
             cfg.security.require_auth && !cfg.security.api_keys.is_empty(),
             "external/production serving requires authentication"
         );
+        for proxy in &cfg.security.trusted_proxies {
+            validate_trusted_proxy(proxy)?;
+        }
         validate_api_keys_for_active_serving(&cfg.security.api_keys)?;
         validate_external_tls_posture(cfg)?;
         anyhow::ensure!(
@@ -25,6 +36,13 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
         anyhow::ensure!(
             cfg.audit.monthly_reports,
             "CRA Article 14 active control requires monthly audit reports"
+        );
+        anyhow::ensure!(
+            cfg.audit
+                .report_directory
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty()),
+            "CRA Article 14 active control requires audit.report-directory for monthly evidence"
         );
         anyhow::ensure!(
             cfg.observability.traces_enabled
@@ -51,31 +69,9 @@ fn validate_external_provider_security(cfg: &Config) -> Result<()> {
         return Ok(());
     }
 
-    for provider in &cfg.external_providers.providers {
-        let url = reqwest::Url::parse(provider.base_url.trim()).map_err(|err| {
-            anyhow::anyhow!(
-                "external provider {} base-url is invalid: {err}",
-                provider.id
-            )
-        })?;
-        if cfg.security.production || cfg.security.bind_external || cfg.server.host == "0.0.0.0" {
-            anyhow::ensure!(
-                url.scheme() == "https",
-                "production external provider {} must use https base-url",
-                provider.id
-            );
-        }
-        anyhow::ensure!(
-            provider
-                .api_key_env
-                .trim()
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'),
-            "external provider {} api-key-env must be an environment variable name",
-            provider.id
-        );
-    }
-    Ok(())
+    anyhow::bail!(
+        "external provider routing is disabled for this native-only release; route traffic through local rs-llmctl models"
+    )
 }
 
 fn validate_external_tls_posture(cfg: &Config) -> Result<()> {
@@ -103,6 +99,36 @@ fn validate_external_tls_posture(cfg: &Config) -> Result<()> {
             .is_some_and(|evidence| !evidence.trim().is_empty()),
         "TLS termination must declare evidence"
     );
+    anyhow::ensure!(
+        !cfg.security.trusted_proxies.is_empty(),
+        "TLS termination must declare trusted-proxies for proxy-aware auth throttling"
+    );
+    Ok(())
+}
+
+fn validate_trusted_proxy(value: &str) -> Result<()> {
+    let value = value.trim();
+    anyhow::ensure!(
+        !value.is_empty() && value != "*",
+        "trusted-proxies must list explicit IP addresses or CIDR ranges; wildcard is not allowed"
+    );
+    if let Some((addr, prefix)) = value.split_once('/') {
+        let ip: std::net::IpAddr = addr
+            .parse()
+            .map_err(|_| anyhow::anyhow!("trusted proxy `{value}` has invalid CIDR address"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| anyhow::anyhow!("trusted proxy `{value}` has invalid CIDR prefix"))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        anyhow::ensure!(
+            prefix > 0 && prefix <= max,
+            "trusted proxy `{value}` has invalid CIDR prefix"
+        );
+        return Ok(());
+    }
+    let _ip: std::net::IpAddr = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("trusted proxy `{value}` must be an IP address or CIDR"))?;
     Ok(())
 }
 

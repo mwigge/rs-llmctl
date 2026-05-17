@@ -7,7 +7,9 @@ for Rust applications that call `/v1/models`, `/v1/chat/completions`,
 
 ```toml
 [dependencies]
-rs-llmctl-client = "1.1"
+rs-llmctl-client = "1.2"
+anyhow = "1"
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -38,8 +40,9 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 `LlmctlClient::from_env()` accepts `LLMCTL_BASE_URL`/`LLMCTL_API_KEY`,
-`RS_LLMCTL_BASE_URL`/`RS_LLMCTL_API_KEY`, and OpenAI-compatible
-`OPENAI_BASE_URL`/`OPENAI_API_KEY`. The `LLMCTL_*` names win when both are set.
+or `RS_LLMCTL_BASE_URL`/`RS_LLMCTL_API_KEY`. It intentionally ignores
+`OPENAI_BASE_URL`/`OPENAI_API_KEY` so local rs-llmctl applications cannot
+accidentally bypass the local control plane.
 The SDK sends normal bearer-token requests. Server responses include request
 IDs, model aliases, quota state, and policy status, but not prompts, raw API
 keys, upstream URLs, file paths, or bearer tokens.
@@ -160,12 +163,11 @@ async fn run_tool_loop(client: &LlmctlClient) -> anyhow::Result<String> {
 }
 ```
 
-On the compatibility backend, OpenAI-style tool fields are forwarded to the
-configured upstream. On the Candle-native backend, the current stable contract
-is chat messages plus metadata; use client-side JSON conventions or the
-compatibility backend when a model must emit formal OpenAI tool-call objects.
-In both cases, `rs-llmctl` audits and meters the chat requests, while the client
-owns tool authorization, side effects, retries, and secret handling.
+On the Candle-native backend, the stable contract is chat messages plus
+metadata. Use client-side JSON conventions unless the selected native model and
+decoder emit formal OpenAI tool-call objects. `rs-llmctl` audits and meters the
+chat requests, while the client owns tool authorization, side effects, retries,
+and secret handling.
 
 ## Embeddings
 
@@ -203,8 +205,8 @@ m-tls = true
 ```
 
 The `llmctl` binary uses Rustls-backed clients for outbound HTTPS, including
-verified model downloads, compatibility upstream calls, OTel export, and
-Postgres TLS. Inbound serving can either use platform TLS termination or native
+verified model downloads, OTel export, and Postgres TLS. Inbound serving can
+either use platform TLS termination or native
 Rustls serving:
 
 ```toml

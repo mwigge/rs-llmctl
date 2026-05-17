@@ -5,6 +5,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+pub fn is_external_host(host: &str) -> bool {
+    !matches!(host.trim(), "127.0.0.1" | "localhost" | "::1")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
@@ -268,6 +272,8 @@ pub struct SecurityConfig {
     pub auth_failure_limit_per_minute: u32,
     #[serde(default, alias = "tls_termination")]
     pub tls_termination: TlsTerminationConfig,
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     #[serde(alias = "api_keys")]
     pub api_keys: Vec<ApiKeyConfig>,
 }
@@ -284,6 +290,7 @@ impl Default for SecurityConfig {
             bind_external: false,
             auth_failure_limit_per_minute: default_auth_failure_limit_per_minute(),
             tls_termination: TlsTerminationConfig::default(),
+            trusted_proxies: Vec::new(),
             api_keys: Vec::new(),
         }
     }
@@ -567,6 +574,7 @@ pub struct DataFabricDatasets {
     pub models: bool,
     pub drift: bool,
     pub audit: bool,
+    pub lineage: bool,
 }
 
 impl Default for DataFabricDatasets {
@@ -580,6 +588,7 @@ impl Default for DataFabricDatasets {
             models: true,
             drift: true,
             audit: true,
+            lineage: true,
         }
     }
 }
@@ -667,12 +676,16 @@ pub struct ModelConfig {
     pub role: String,
     #[serde(default)]
     pub family: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_model_weight")]
     pub weight: u32,
 }
 
 fn default_role() -> String {
     "chat".to_string()
+}
+
+fn default_model_weight() -> u32 {
+    1
 }
 
 impl Default for ModelConfig {
@@ -682,7 +695,7 @@ impl Default for ModelConfig {
             path: PathBuf::new(),
             role: default_role(),
             family: None,
-            weight: 0,
+            weight: default_model_weight(),
         }
     }
 }
@@ -719,6 +732,15 @@ pub async fn save(path: &Path, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Validate that a configuration is safe enough for production or external bind.
+///
+/// This is the public configuration-layer entrypoint used by the CLI, tests,
+/// release checks, and embedders. It delegates to [`crate::security`] and
+/// verifies the active security posture, including hashed API keys, supported
+/// scopes, key lifecycle metadata, plaintext-secret rejection, native TLS
+/// shape, external-provider egress constraints, audit retention, monthly
+/// reports, and OpenTelemetry exporter coverage when production/external
+/// serving is enabled.
 pub fn validate_production_security(cfg: &Config) -> Result<()> {
     crate::security::validate_production_security(cfg)
 }

@@ -14,6 +14,7 @@ pub enum DatasetKind {
     Models,
     Drift,
     Audit,
+    Lineage,
 }
 
 impl DatasetKind {
@@ -27,6 +28,20 @@ impl DatasetKind {
             Self::Models => "models",
             Self::Drift => "drift",
             Self::Audit => "audit",
+            Self::Lineage => "lineage",
+        }
+    }
+
+    pub fn primary_time_field(self) -> Option<&'static str> {
+        match self {
+            Self::Security
+            | Self::Observability
+            | Self::Usage
+            | Self::Drift
+            | Self::Audit
+            | Self::Lineage => Some("at"),
+            Self::Models => Some("updated_at"),
+            Self::User | Self::Finops => None,
         }
     }
 }
@@ -44,7 +59,7 @@ pub struct DataContract {
     pub dataset: &'static str,
     pub schema_version: u32,
     pub event_format: &'static str,
-    pub primary_time_field: &'static str,
+    pub primary_time_field: Option<&'static str>,
     pub fields: Vec<FieldContract>,
     pub json_schema: Value,
     pub arrow_schema: Value,
@@ -60,6 +75,7 @@ pub fn all_contracts() -> Vec<DataContract> {
         DatasetKind::Models,
         DatasetKind::Drift,
         DatasetKind::Audit,
+        DatasetKind::Lineage,
     ]
     .into_iter()
     .map(contract_for)
@@ -73,7 +89,7 @@ pub fn contract_for(dataset: DatasetKind) -> DataContract {
         dataset: dataset_name,
         schema_version: CONTRACT_SCHEMA_VERSION,
         event_format: "rs-llmctl.data.v1",
-        primary_time_field: "at",
+        primary_time_field: dataset.primary_time_field(),
         json_schema: json_schema(dataset_name, &fields),
         arrow_schema: arrow_schema(dataset_name, &fields),
         fields,
@@ -160,6 +176,14 @@ fn fields_for(dataset: DatasetKind) -> Vec<FieldContract> {
             field("outcome", "utf8", false, "action outcome"),
             field("request_id", "utf8", true, "request correlation id"),
         ],
+        DatasetKind::Lineage => vec![
+            field("at", "timestamp[ms, tz=UTC]", false, "join timestamp"),
+            field("request_id", "utf8", false, "request correlation id"),
+            field("lineage_id", "utf8", false, "client or runtime lineage id"),
+            field("model", "utf8", true, "model alias"),
+            field("corpus", "utf8", true, "local corpus or document set"),
+            field("source", "utf8", false, "lineage producer"),
+        ],
     }
 }
 
@@ -201,7 +225,7 @@ fn json_schema(dataset: &str, fields: &[FieldContract]) -> Value {
         "$id": format!("https://schemas.rs-llmctl.local/{dataset}/v1.json"),
         "title": format!("rs-llmctl {dataset} data contract"),
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": required,
         "properties": properties
     })

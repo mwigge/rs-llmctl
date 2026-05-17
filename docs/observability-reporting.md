@@ -22,7 +22,7 @@ The daemon emits RED-style metrics for SLO dashboards and alerts:
 - `llmctl_request_errors_total` for non-OK request outcomes;
 - `llmctl_request_latency_ms` as an end-to-end latency histogram;
 - `llmctl_upstream_requests_total`, `llmctl_upstream_errors_total`, and
-  `llmctl_upstream_latency_ms` for compatibility worker calls;
+  `llmctl_upstream_latency_ms` for internal runtime/provider boundary calls;
 - `llmctl_admission_rejections_total` for saturated global or scoped admission
   limits;
 - `llmctl.tokens.input` and `llmctl.tokens.output` for token throughput.

@@ -3,7 +3,7 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
-## Unreleased
+## 1.2.0 - 2026-05-17
 
 - Native-first packaging: the default archive publishes the single `llmctl`
   runtime binary, README, changelog, license, and `llmctld.service` systemd
@@ -19,3 +19,12 @@ operator behavior, packaging contents, service lifecycle, and verification.
   `dist/rs-llmctl-<os>-<arch>.tar.gz` and `dist/SHA256SUMS`; use
   `packaging/sign-release.sh dist` for optional `cosign` or `minisign`
   signatures.
+- Release publishing: tagged CI runs now publish GitHub Release assets and run
+  a self-hosted native smoke job against the packaged tarball.
+- Installer hardening: systemd installs leave the daemon stopped until
+  `first-run --apply`; monthly audit timers are generated with the selected
+  install paths and are opt-in with `LLMCTL_ENABLE_AUDIT_TIMER=1`.
+- Native routing hardening: non-loopback bind addresses trigger production
+  security gates, external provider routing fails closed for the native-only
+  release, readiness reports only active locally routed models, and cluster
+  role placement is honored by the serving router.

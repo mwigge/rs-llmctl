@@ -42,6 +42,16 @@ fn ci_workflow_enforces_core_rust_gates() {
         "cargo clippy --all-targets --all-features -- -D warnings",
         "cargo test --all-targets --all-features",
         "cargo build --release --bin llmctl",
+        "tags:",
+        "'v*'",
+        "tests/smoke/smoke_native_release.sh",
+        "runs-on: [self-hosted, linux, x64, llmctl-native-smoke]",
+        "LLMCTL_NATIVE_SMOKE_CONFIG: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG }}",
+        "LLMCTL_NATIVE_SMOKE_CONFIG_TOML: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG_TOML }}",
+        "LLMCTL_NATIVE_SMOKE_MODEL_PATH: ${{ secrets.LLMCTL_NATIVE_SMOKE_MODEL_PATH }}",
+        "sigstore/cosign-installer@v3",
+        "packaging/sign-release.sh dist",
+        "gh release create",
     ] {
         assert!(workflow.contains(gate), "CI workflow should run `{gate}`");
     }
@@ -489,7 +499,7 @@ fn docs_cover_client_sdk_tool_sessions_tls_and_runtime_caveats() {
 
     for required in [
         "separate `rs-llmctl-client` crate",
-        "rs-llmctl-client = \"1.1\"",
+        "rs-llmctl-client = \"1.2\"",
         "client-managed sessions",
         "metadata.session_id",
         "client-side tool loops",
@@ -595,9 +605,14 @@ fn installer_docs_cover_systemd_defaults_and_overrides() {
         "state_dir=\"${LLMCTL_STATE_DIR:-/var/lib/rs-llmctl}\"",
         "log_dir=\"${LLMCTL_LOG_DIR:-/var/log/rs-llmctl}\"",
         "service_name=\"${LLMCTL_SERVICE_NAME:-llmctld}\"",
+        "start_service=\"${LLMCTL_START_SERVICE:-0}\"",
+        "enable_audit_timer=\"${LLMCTL_ENABLE_AUDIT_TIMER:-0}\"",
         "system service installs cannot use a home-directory PREFIX",
         "useradd --system --gid llmctl",
-        "enable --now \"${service_name}.service\"",
+        "Run first-run with a model and API key before starting the service",
+        "enable --now ${service_name}.service",
+        "cpu_quota_percent=$(( $(nproc) * 80 ))",
+        "systemctl enable --now llmctl-monthly-audit.timer",
         "http://127.0.0.1:8765/v1",
         "release archive includes legacy llmctld",
         "default install uses llmctl only",
@@ -614,7 +629,11 @@ fn installer_docs_cover_systemd_defaults_and_overrides() {
         "`/var/lib/rs-llmctl/models`",
         "`/var/lib/rs-llmctl/reports`",
         "`/var/log/rs-llmctl`",
-        "enables and starts it",
+        "installs `llmctld.service` without starting it",
+        "LLMCTL_START_SERVICE=1",
+        "LLMCTL_ENABLE_AUDIT_TIMER=1",
+        "first-run --apply",
+        "SHA256SUMS.sig",
         "sudo systemctl status llmctld.service",
         "sudo systemctl restart llmctld.service",
         "sudo systemctl stop llmctld.service",
@@ -728,6 +747,9 @@ fn release_checksum_artifact_generation_is_pinned() {
         "release-artifacts",
         "dist/rs-llmctl-*.tar.gz",
         "dist/SHA256SUMS",
+        "packaging/generate-sbom.sh dist",
+        "packaging/sign-release.sh dist",
+        "dist/rs-llmctl.sbom-fallback.json",
     ] {
         assert!(
             workflow.contains(required),
@@ -751,8 +773,8 @@ fn release_checksum_artifact_generation_is_pinned() {
         "tarball=\"${DIST_DIR}/${artifact}.tar.gz\"",
         "install -m 0755 target/release/llmctl \"${stage}/llmctl\"",
         "install -m 0644 CHANGELOG.md \"${stage}/CHANGELOG.md\"",
-        "install -D -m 0644 packaging/systemd/llmctld.service \"${stage}/packaging/systemd/llmctld.service\"",
-        "sha256sum \"${artifact}.tar.gz\" > SHA256SUMS",
+        "if [[ \"${OS}\" == \"linux\" && -f packaging/systemd/llmctld.service ]]; then",
+        "sha256sum rs-llmctl-*.tar.gz | sort -k2 > SHA256SUMS",
         "test -x target/release/llmctl",
     ] {
         assert!(

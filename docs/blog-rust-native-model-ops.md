@@ -2,8 +2,7 @@
 
 `rs-llmctl` now points at the shape we actually want for the MVP: one Rust
 binary running local model operations, not a shell around a long list of
-operator chores. The compatibility path for external workers remains useful,
-but the default direction is Candle-native execution inside `llmctl`.
+operator chores. The release path is Candle-native execution inside `llmctl`.
 
 ![Rust-native cluster](images/rust-native-cluster.svg)
 
@@ -34,12 +33,12 @@ engine.
 ![Native model matrix](images/rust-native-model-matrix.svg)
 
 The same release tightened the operational edges that usually decide whether a
-service is pleasant to run. The Linux service applies `CPUQuota=80%` and
-`MemoryMax=80%` by default. GPU VRAM is still reported as planning evidence,
-because there is no portable systemd cgroup property for hard GPU memory
-enforcement. Direct model downloads require HTTPS, expected SHA-256, and
-public-address DNS resolution. Release installs verify `SHA256SUMS` and safely
-extract archives before installing the binary.
+service is pleasant to run. The Linux installer computes `CPUQuota=(nproc *
+80)%` and applies `MemoryMax=80%` by default. GPU VRAM is still reported as
+planning evidence, because there is no portable systemd cgroup property for hard
+GPU memory enforcement. Direct model downloads require HTTPS, expected SHA-256,
+and public-address DNS resolution. Release installs verify `SHA256SUMS` and
+safely extract archives before installing the binary.
 
 Observability is part of the runtime boundary rather than an afterthought.
 Requests emit RED metrics, upstream circuits are single-flight during

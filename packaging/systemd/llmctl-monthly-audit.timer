@@ -1,0 +1,11 @@
+[Unit]
+Description=Run rs-llmctl monthly audit evidence writer
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=15m
+Unit=llmctl-monthly-audit.service
+
+[Install]
+WantedBy=timers.target

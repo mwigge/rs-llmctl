@@ -27,7 +27,7 @@ use rs_llmctl::worker::{StartupPlan, SwapPlan, WorkerId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs as stdfs;
 use std::io::Read;
 #[cfg(unix)]
@@ -598,6 +598,8 @@ struct AuditReportMonthlyArgs {
     month: Option<u32>,
     #[arg(long)]
     envelope: bool,
+    #[arg(long)]
+    write: bool,
 }
 
 #[derive(Debug, Args)]
@@ -906,6 +908,8 @@ struct DataExportArgs {
     output: Option<PathBuf>,
     #[arg(long)]
     envelope: bool,
+    #[arg(long, default_value_t = 1_000_000)]
+    max_rows: usize,
 }
 
 #[derive(Debug, Args)]
@@ -926,6 +930,7 @@ enum DataDataset {
     Models,
     Drift,
     Audit,
+    Lineage,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -939,6 +944,7 @@ enum DataContractDataset {
     Models,
     Drift,
     Audit,
+    Lineage,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1027,6 +1033,9 @@ async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
         cfg.security.tls_termination.provider = args.tls_provider;
         cfg.security.tls_termination.evidence = args.tls_evidence;
         cfg.security.tls_termination.m_tls = args.mtls;
+        if cfg.security.trusted_proxies.is_empty() {
+            cfg.security.trusted_proxies = vec!["127.0.0.1".to_string()];
+        }
     }
 
     create_storage_dirs(&cfg.storage).await?;
@@ -1234,6 +1243,7 @@ fn first_run_smoke_model(cfg: &Config, args: &FirstRunArgs) -> String {
 }
 
 fn first_run_plan_json(context: &FirstRunRenderContext<'_>) -> Value {
+    let next_command = first_run_apply_command(context);
     json!({
         "status": "planned",
         "mode": "dry-run",
@@ -1254,11 +1264,87 @@ fn first_run_plan_json(context: &FirstRunRenderContext<'_>) -> Value {
             context.smoke_question,
             &context.args.api_key_env
         ),
-        "next_command": format!(
-            "llmctl --config {} first-run --apply --secret-output <secret-file>",
-            context.path.display()
-        )
+        "next_command": shell_join(&next_command),
+        "next_command_argv": next_command
     })
+}
+
+fn first_run_apply_command(context: &FirstRunRenderContext<'_>) -> Vec<String> {
+    let args = context.args;
+    let mut command = vec![
+        "llmctl".to_string(),
+        "--config".to_string(),
+        context.path.display().to_string(),
+        "first-run".to_string(),
+        "--apply".to_string(),
+        "--secret-output".to_string(),
+        args.secret_output
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<secret-file>".to_string()),
+        "--key-prefix".to_string(),
+        args.key_prefix.clone(),
+        "--api-key-id".to_string(),
+        args.api_key_id.clone(),
+        "--subject".to_string(),
+        args.subject.clone(),
+        "--team".to_string(),
+        args.team.clone(),
+    ];
+    for scope in &args.scopes {
+        command.push("--scope".to_string());
+        command.push(scope.clone());
+    }
+    if let Some(owner) = &args.owner {
+        command.push("--owner".to_string());
+        command.push(owner.clone());
+    }
+    if let Some(purpose) = &args.purpose {
+        command.push("--purpose".to_string());
+        command.push(purpose.clone());
+    }
+    if let Some(data_dir) = &args.data_dir {
+        command.push("--data-dir".to_string());
+        command.push(data_dir.display().to_string());
+    }
+    if let Some(path) = &args.starter_model_path {
+        command.push("--starter-model-path".to_string());
+        command.push(path.display().to_string());
+    }
+    command.push("--starter-model-alias".to_string());
+    command.push(args.starter_model_alias.clone());
+    command.push("--starter-model-role".to_string());
+    command.push(args.starter_model_role.clone());
+    command.push("--starter-model-family".to_string());
+    command.push(args.starter_model_family.clone());
+    command.push("--starter-model-weight".to_string());
+    command.push(args.starter_model_weight.to_string());
+    if let Some(base_url) = &args.base_url {
+        command.push("--base-url".to_string());
+        command.push(base_url.clone());
+    }
+    command.push("--api-key-env".to_string());
+    command.push(args.api_key_env.clone());
+    if let Some(question) = &args.smoke_question {
+        command.push("--smoke-question".to_string());
+        command.push(question.clone());
+    }
+    command
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '<' | '>')
+            }) {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn first_run_applied_json(
@@ -1342,7 +1428,7 @@ fn first_run_starter_model_plan(args: &FirstRunArgs) -> Value {
             "weight": args.starter_model_weight,
             "source_kind": "none",
             "network": false,
-            "recommendation": "provide --starter-model-path /path/to/model.gguf or run model import-manifest with a verified offline manifest"
+            "recommendation": "provide --starter-model-path /path/to/model.gguf, /path/to/model.safetensors with sibling config.json/tokenizer.json, or a safetensors directory containing config.json, tokenizer.json, and weights; offline manifests are also supported"
         }),
     }
 }
@@ -1435,8 +1521,20 @@ fn apply_init_profile(cfg: &mut Config, args: &InitArgs) {
             cfg.security.production = true;
             cfg.security.bind_external = true;
             cfg.security.require_auth = true;
+            if cfg.security.trusted_proxies.is_empty() {
+                cfg.security.trusted_proxies = vec!["127.0.0.1".to_string()];
+            }
             cfg.audit.monthly_reports = true;
             cfg.audit.retention_days = 365;
+            if cfg.audit.report_directory.is_none() {
+                cfg.audit.report_directory = Some(
+                    cfg.storage
+                        .db_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join("reports"),
+                );
+            }
             cfg.observability.traces_enabled = true;
             cfg.observability.metrics_enabled = true;
             cfg.observability.logs_enabled = true;
@@ -1460,8 +1558,8 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
         ServerCommand::Run => {
             config::validate_production_security(&cfg)?;
             let storage = init_storage(&cfg.storage).await?;
-            let telemetry = TelemetryRuntime::install(&cfg, cfg.log.format == LogFormat::Json)?;
             let engines = load_native_engines_from_config(&cfg)?;
+            let telemetry = TelemetryRuntime::install(&cfg, cfg.log.format == LogFormat::Json)?;
             emit(
                 as_json,
                 &json!({
@@ -1514,10 +1612,11 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
 fn load_native_engines_from_config(
     cfg: &Config,
 ) -> Result<rs_llmctl::server::NativeEngineRegistry> {
+    let local_aliases = local_native_model_aliases(cfg)?;
     let models = cfg
         .models
         .iter()
-        .filter(|model| model.weight > 0)
+        .filter(|model| model.weight > 0 && local_aliases.contains(&model.alias))
         .collect::<Vec<_>>();
 
     let factory = native::NativeCandleEngineFactory::default();
@@ -1537,6 +1636,22 @@ fn load_native_engines_from_config(
         engines.insert(model.alias.clone(), std::sync::Arc::from(engine));
     }
     Ok(engines)
+}
+
+fn local_native_model_aliases(cfg: &Config) -> Result<BTreeSet<String>> {
+    let placement = native::placement_plan_from_config(cfg);
+    native::validate_placement_plan(&placement)?;
+    let local = placement
+        .nodes
+        .iter()
+        .find(|node| node.id == cfg.cluster.node_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cluster.node-id `{}` is not present in cluster.nodes",
+                cfg.cluster.node_id
+            )
+        })?;
+    Ok(local.model_aliases.iter().cloned().collect())
 }
 
 fn should_load_native_embedding_engine(cfg: &Config, model: &ModelConfig) -> bool {
@@ -2621,9 +2736,24 @@ async fn audit_command(path: &Path, command: AuditCommand, as_json: bool) -> Res
                 if args.envelope {
                     let report =
                         reporting::monthly_audit_report_envelope(&storage, year, month).await?;
+                    if args.write {
+                        let path =
+                            write_audit_report(&cfg, year, month, "envelope", &report).await?;
+                        return emit(
+                            as_json,
+                            &json!({"status": "written", "path_redacted": redact_display_path(&path)}),
+                        );
+                    }
                     emit(as_json, &report)
                 } else {
                     let report = reporting::monthly_audit_report(&storage, year, month).await?;
+                    if args.write {
+                        let path = write_audit_report(&cfg, year, month, "report", &report).await?;
+                        return emit(
+                            as_json,
+                            &json!({"status": "written", "path_redacted": redact_display_path(&path)}),
+                        );
+                    }
                     emit(as_json, &report)
                 }
             }
@@ -2751,12 +2881,38 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
                         && matches!(args.format, DataExportFormat::Json),
                     "data export --envelope currently wraps the canonical all/json export"
                 );
-                let report = reporting::data_export_envelope(&storage, from, to).await?;
+                let report = reporting::data_export_envelope_limited(
+                    &storage,
+                    from,
+                    to,
+                    Some(args.max_rows),
+                )
+                .await?;
                 emit(as_json, &report)
             } else {
-                let report = reporting::data_export(&storage, from, to).await?;
-                let output =
-                    format_data_export(report, args.dataset, args.format, args.output.as_deref())?;
+                let report = if matches!(args.dataset, DataDataset::All) {
+                    reporting::data_export_limited(&storage, from, to, Some(args.max_rows)).await?
+                } else {
+                    let dataset = args
+                        .dataset
+                        .contract_kind()
+                        .context("data export requires a concrete dataset")?;
+                    reporting::data_export_dataset_limited(
+                        &storage,
+                        from,
+                        to,
+                        dataset,
+                        Some(args.max_rows),
+                    )
+                    .await?
+                };
+                let output = format_data_export(
+                    report,
+                    args.dataset,
+                    args.format,
+                    args.output.as_deref(),
+                    args.max_rows,
+                )?;
                 emit(as_json, &output)
             }
         }
@@ -2784,8 +2940,18 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
             let mut output = serde_json::to_value(verification)?;
             if let Some(object) = output.as_object_mut() {
                 object.insert(
-                    "path".to_string(),
-                    serde_json::Value::String(args.path.display().to_string()),
+                    "artifact".to_string(),
+                    serde_json::Value::String(
+                        args.path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("envelope.json")
+                            .to_string(),
+                    ),
+                );
+                object.insert(
+                    "path_redacted".to_string(),
+                    serde_json::Value::String(redact_display_path(&args.path)),
                 );
             }
             emit(as_json, &output)
@@ -2793,13 +2959,57 @@ async fn data_command(path: &Path, command: DataCommand, as_json: bool) -> Resul
     }
 }
 
+async fn write_audit_report<T: Serialize>(
+    cfg: &Config,
+    year: i32,
+    month: u32,
+    suffix: &str,
+    report: &T,
+) -> Result<PathBuf> {
+    let dir = cfg
+        .audit
+        .report_directory
+        .as_ref()
+        .context("audit report monthly --write requires audit.report-directory")?;
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("create audit report directory {}", dir.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .await
+        .with_context(|| format!("secure audit report directory {}", dir.display()))?;
+    let path = dir.join(format!("monthly-audit-{year:04}-{month:02}-{suffix}.json"));
+    let body = serde_json::to_vec_pretty(report)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .await
+        .with_context(|| format!("write audit report {}", path.display()))?;
+    file.write_all(&body)
+        .await
+        .with_context(|| format!("write audit report {}", path.display()))?;
+    Ok(path)
+}
+
 fn format_data_export(
     report: reporting::DataExport,
     dataset: DataDataset,
     format: DataExportFormat,
     output: Option<&Path>,
+    max_rows: usize,
 ) -> Result<serde_json::Value> {
     let rows = dataset_rows(&report, dataset)?;
+    if rows.len() > max_rows {
+        bail!(
+            "data export for dataset `{}` produced {} rows, exceeding --max-rows {}; narrow --hours or raise --max-rows",
+            dataset.as_str(),
+            rows.len(),
+            max_rows
+        );
+    }
     let dataset_name = dataset.as_str();
     let contract = dataset.contract_kind().map(contracts::contract_for);
 
@@ -2845,11 +3055,13 @@ fn format_data_export(
                 anyhow::anyhow!("data export --format arrow-ipc requires a concrete --dataset")
             })?;
             let row_count = rs_llmctl::data_fabric::write_arrow_ipc(path, &contract, &rows)?;
+            let output_path = redact_display_path(path);
             Ok(json!({
                 "format": "arrow-ipc",
                 "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
                 "dataset": dataset_name,
-                "path": path,
+                "artifact": path.file_name().and_then(|name| name.to_str()).unwrap_or("data.arrow"),
+                "output_path_redacted": output_path,
                 "rows": row_count,
                 "arrow_schema": contract.arrow_schema
             }))
@@ -2861,11 +3073,13 @@ fn format_data_export(
                 anyhow::anyhow!("data export --format parquet requires a concrete --dataset")
             })?;
             let row_count = rs_llmctl::data_fabric::write_parquet(path, &contract, &rows)?;
+            let output_path = redact_display_path(path);
             Ok(json!({
                 "format": "parquet",
                 "schema_version": contracts::CONTRACT_SCHEMA_VERSION,
                 "dataset": dataset_name,
-                "path": path,
+                "artifact": path.file_name().and_then(|name| name.to_str()).unwrap_or("data.parquet"),
+                "output_path_redacted": output_path,
                 "rows": row_count,
                 "arrow_schema": contract.arrow_schema
             }))
@@ -3007,6 +3221,20 @@ fn dataset_rows(
                 })
             })
             .collect()),
+        DataDataset::Lineage => Ok(report
+            .lineage
+            .iter()
+            .map(|join| {
+                json!({
+                    "at": join.at,
+                    "request_id": join.request_id,
+                    "lineage_id": join.lineage_id,
+                    "model": join.model,
+                    "corpus": join.corpus,
+                    "source": join.source
+                })
+            })
+            .collect()),
         DataDataset::Audit => Ok(report
             .audit_events
             .iter()
@@ -3023,6 +3251,15 @@ fn dataset_rows(
             })
             .collect()),
     }
+}
+
+fn redact_display_path(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .and_then(|home| rendered.strip_prefix(&home).map(|tail| format!("~{tail}")))
+        .unwrap_or(rendered)
 }
 
 async fn aiops_command(command: AiopsCommand, as_json: bool) -> Result<()> {
@@ -3112,15 +3349,27 @@ fn slo_plan(args: &AiopsSloPlanArgs) -> serde_json::Value {
         "alert_rules": [
             {
                 "name": "llmctl_availability_below_slo",
-                "expr": format!("100 * sum(rate(llmctl_requests_total{{status!=\"error\"}}[5m])) / sum(rate(llmctl_requests_total[5m])) < {}", args.availability_percent),
+                "expr": format!("100 * (1 - (sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])))) < {}", args.availability_percent),
                 "for": "10m",
                 "severity": "page"
             },
             {
                 "name": "llmctl_high_error_rate",
-                "expr": format!("rate(llmctl_requests_total{{status=\"error\"}}[5m]) / rate(llmctl_requests_total[5m]) > {}", args.error_rate_percent / 100.0),
+                "expr": format!("sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {}", args.error_rate_percent / 100.0),
                 "for": "10m",
                 "severity": "page"
+            },
+            {
+                "name": "llmctl_fast_burn_error_budget",
+                "expr": format!("(sum(rate(llmctl_slo_violations_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {fast_burn}) and (sum(rate(llmctl_slo_violations_total[1h])) / sum(rate(llmctl_requests_total[1h])) > {fast_burn})", fast_burn = (100.0 - args.availability_percent) / 100.0 * 14.4),
+                "for": "2m",
+                "severity": "page"
+            },
+            {
+                "name": "llmctl_slow_burn_error_budget",
+                "expr": format!("(sum(rate(llmctl_slo_violations_total[30m])) / sum(rate(llmctl_requests_total[30m])) > {slow_burn}) and (sum(rate(llmctl_slo_violations_total[6h])) / sum(rate(llmctl_requests_total[6h])) > {slow_burn})", slow_burn = (100.0 - args.availability_percent) / 100.0 * 6.0),
+                "for": "15m",
+                "severity": "ticket"
             },
             {
                 "name": "llmctl_high_latency_p95",
@@ -3143,7 +3392,7 @@ fn prometheus_slo_rules(args: &AiopsSloPlanArgs) -> String {
   - name: llmctl_slo_alerts
     rules:
       - alert: LlmctlAvailabilityBelowSlo
-        expr: 100 * sum(rate(llmctl_requests_total{{status!="error"}}[5m])) / sum(rate(llmctl_requests_total[5m])) < {availability_percent}
+        expr: 100 * (1 - (sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])))) < {availability_percent}
         for: 10m
         labels:
           severity: page
@@ -3152,7 +3401,7 @@ fn prometheus_slo_rules(args: &AiopsSloPlanArgs) -> String {
           summary: rs-llmctl availability is below SLO
           description: Availability over 5m is below {availability_percent}%.
       - alert: LlmctlHighErrorRate
-        expr: sum(rate(llmctl_requests_total{{status="error"}}[5m])) / sum(rate(llmctl_requests_total[5m])) > {error_rate}
+        expr: sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {error_rate}
         for: 10m
         labels:
           severity: page
@@ -3160,6 +3409,24 @@ fn prometheus_slo_rules(args: &AiopsSloPlanArgs) -> String {
         annotations:
           summary: rs-llmctl error rate exceeds SLO
           description: Error rate over 5m is above {error_rate_percent}%.
+      - alert: LlmctlFastBurnErrorBudget
+        expr: (sum(rate(llmctl_slo_violations_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {fast_burn}) and (sum(rate(llmctl_slo_violations_total[1h])) / sum(rate(llmctl_requests_total[1h])) > {fast_burn})
+        for: 2m
+        labels:
+          severity: page
+          service: llmctl
+        annotations:
+          summary: rs-llmctl is burning error budget quickly
+          description: 5m and 1h burn-rate windows both exceed the fast-burn threshold.
+      - alert: LlmctlSlowBurnErrorBudget
+        expr: (sum(rate(llmctl_slo_violations_total[30m])) / sum(rate(llmctl_requests_total[30m])) > {slow_burn}) and (sum(rate(llmctl_slo_violations_total[6h])) / sum(rate(llmctl_requests_total[6h])) > {slow_burn})
+        for: 15m
+        labels:
+          severity: ticket
+          service: llmctl
+        annotations:
+          summary: rs-llmctl is steadily burning error budget
+          description: 30m and 6h burn-rate windows both exceed the slow-burn threshold.
       - alert: LlmctlHighLatencyP95
         expr: histogram_quantile(0.95, sum(rate(llmctl_request_latency_ms_bucket[5m])) by (le)) > {latency_p95_ms}
         for: 15m
@@ -3173,6 +3440,8 @@ fn prometheus_slo_rules(args: &AiopsSloPlanArgs) -> String {
         availability_percent = args.availability_percent,
         error_rate = args.error_rate_percent / 100.0,
         error_rate_percent = args.error_rate_percent,
+        fast_burn = (100.0 - args.availability_percent) / 100.0 * 14.4,
+        slow_burn = (100.0 - args.availability_percent) / 100.0 * 6.0,
         latency_p95_ms = args.latency_p95_ms,
     )
 }
@@ -4056,7 +4325,7 @@ fn compliance_evidence(cfg: &Config) -> serde_json::Value {
         "security_posture": {
             "production": cfg.security.production,
             "require_auth": cfg.security.require_auth,
-            "bind_external": cfg.security.bind_external || is_external_host(&cfg.server.host),
+            "bind_external": cfg.security.bind_external || config::is_external_host(&cfg.server.host),
             "hashed_api_keys": cfg.security.api_keys.iter().all(|key| key.sha256.len() == 64),
             "api_key_count": cfg.security.api_keys.len(),
             "tls_termination": {
@@ -4069,7 +4338,7 @@ fn compliance_evidence(cfg: &Config) -> serde_json::Value {
             "monthly_reports": cfg.audit.monthly_reports
         },
         "evidence_completeness": {
-            "production_security_validation": cfg.security.production || cfg.security.bind_external || is_external_host(&cfg.server.host),
+            "production_security_validation": cfg.security.production || cfg.security.bind_external || config::is_external_host(&cfg.server.host),
             "hashed_api_keys": cfg.security.api_keys.iter().all(|key| key.sha256.len() == 64),
             "tls_termination_documented": cfg.security.tls_termination.enabled
                 && cfg.security.tls_termination.provider.as_deref().is_some_and(|value| !value.trim().is_empty())
@@ -4265,6 +4534,8 @@ struct ServiceLifecyclePlan {
     entrypoint: OneBinaryEntrypoint,
     commands: Vec<ServiceCommandPlan>,
     restart_hint: String,
+    artifact_action_supported: bool,
+    artifact_action_note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4315,6 +4586,18 @@ fn plan_service_lifecycle(
             }
         })
         .collect();
+    let artifact_action_supported = !matches!(
+        action,
+        ServiceLifecycleAction::Upgrade | ServiceLifecycleAction::Downgrade
+    );
+    let artifact_action_note = if artifact_action_supported {
+        None
+    } else {
+        Some(
+            "service upgrade/downgrade is a planning guard only; install a verified release artifact with install.sh or the system package manager, then restart the service"
+                .to_string(),
+        )
+    };
 
     ServiceLifecyclePlan {
         status: "planned".to_string(),
@@ -4327,6 +4610,8 @@ fn plan_service_lifecycle(
         entrypoint: one_binary_entrypoint(),
         commands,
         restart_hint: restart_hint(scope, &service_name),
+        artifact_action_supported,
+        artifact_action_note,
     }
 }
 
@@ -4336,14 +4621,20 @@ fn service_systemctl_verbs(action: ServiceLifecycleAction) -> Vec<&'static str> 
         ServiceLifecycleAction::Start => vec!["start"],
         ServiceLifecycleAction::Stop => vec!["stop"],
         ServiceLifecycleAction::Restart => vec!["restart"],
-        ServiceLifecycleAction::Upgrade | ServiceLifecycleAction::Downgrade => {
-            vec!["daemon-reload", "restart"]
-        }
+        ServiceLifecycleAction::Upgrade | ServiceLifecycleAction::Downgrade => Vec::new(),
     }
 }
 
 async fn execute_service_lifecycle(plan: ServiceLifecyclePlan) -> Result<ServiceLifecycleResult> {
     ensure_service_lifecycle_allowed(&plan)?;
+    if !plan.artifact_action_supported {
+        bail!(
+            "{}",
+            plan.artifact_action_note
+                .as_deref()
+                .unwrap_or("service artifact action is not executable")
+        );
+    }
     let mut results = Vec::new();
     for command in &plan.commands {
         let output = TokioCommand::new(&command.program)
@@ -4753,7 +5044,17 @@ fn observability_plan_json(plan: ObservabilityPlan) -> serde_json::Value {
             "type": "otlp",
             "endpoint": endpoint,
             "protocol": protocol,
-            "headers": headers,
+            "headers": headers
+                .into_iter()
+                .map(|(key, value)| {
+                    let rendered = if value.starts_with("env:") {
+                        value
+                    } else {
+                        "[REDACTED]".to_string()
+                    };
+                    (key, rendered)
+                })
+                .collect::<BTreeMap<_, _>>(),
             "timeout_ms": timeout_ms
         }),
     };
@@ -4775,7 +5076,7 @@ async fn audit_config_report(
     cfg: &Config,
     systemd_unit: Option<&Path>,
 ) -> Result<serde_json::Value> {
-    let external_bind = cfg.security.bind_external || is_external_host(&cfg.server.host);
+    let external_bind = cfg.security.bind_external || config::is_external_host(&cfg.server.host);
     let key_reports: Vec<_> = cfg
         .security
         .api_keys
@@ -4816,6 +5117,22 @@ async fn audit_config_report(
         })
         .collect();
     let systemd = systemd_audit(systemd_unit).await?;
+    let trusted_proxy_reports: Vec<_> = cfg
+        .security
+        .trusted_proxies
+        .iter()
+        .map(|proxy| {
+            let valid = trusted_proxy_is_explicit(proxy);
+            json!({
+                "value": proxy,
+                "valid": valid,
+                "wildcard": proxy.trim() == "*"
+            })
+        })
+        .collect();
+    let trusted_proxies_valid = trusted_proxy_reports
+        .iter()
+        .all(|proxy| proxy["valid"].as_bool().unwrap_or(false));
 
     let mut findings = Vec::new();
     if !hashed_api_keys {
@@ -4866,6 +5183,15 @@ async fn audit_config_report(
         {
             findings.push("TLS termination must declare evidence".to_string());
         }
+        if !native_tls && cfg.security.trusted_proxies.is_empty() {
+            findings.push("TLS termination must declare trusted-proxies".to_string());
+        }
+        if !native_tls && !trusted_proxies_valid {
+            findings.push(
+                "trusted-proxies must list explicit IP addresses or CIDR ranges; wildcard is not allowed"
+                    .to_string(),
+            );
+        }
     }
     if cfg
         .observability
@@ -4883,6 +5209,15 @@ async fn audit_config_report(
         if !cfg.audit.monthly_reports {
             findings
                 .push("CRA Article 14 active control requires monthly audit reports".to_string());
+        }
+        if cfg
+            .audit
+            .report_directory
+            .as_ref()
+            .is_none_or(|path| path.as_os_str().is_empty())
+        {
+            findings
+                .push("CRA Article 14 active control requires audit.report-directory".to_string());
         }
         if !(cfg.observability.traces_enabled
             && cfg.observability.metrics_enabled
@@ -4914,7 +5249,8 @@ async fn audit_config_report(
 
     Ok(json!({
         "status": if findings.is_empty() { "ok" } else { "warning" },
-        "config": path,
+        "config": path.file_name().and_then(|name| name.to_str()).unwrap_or("config.toml"),
+        "config_path_redacted": redact_evidence_path(path),
         "external_bind": {
             "enabled": external_bind,
             "host": cfg.server.host,
@@ -4932,7 +5268,12 @@ async fn audit_config_report(
             "enabled": cfg.security.tls_termination.enabled,
             "provider": cfg.security.tls_termination.provider.as_deref(),
             "evidence": cfg.security.tls_termination.evidence.as_deref(),
-            "m_tls": cfg.security.tls_termination.m_tls
+            "m_tls": cfg.security.tls_termination.m_tls,
+            "trusted_proxies": {
+                "count": cfg.security.trusted_proxies.len(),
+                "valid": trusted_proxies_valid,
+                "entries": trusted_proxy_reports
+            }
         },
         "observability": {
             "endpoint_configured": cfg.observability.exporter.endpoint.is_some() || cfg.observability.otlp_endpoint.is_some(),
@@ -4941,7 +5282,8 @@ async fn audit_config_report(
         },
         "audit": {
             "retention_days": cfg.audit.retention_days,
-            "report_directory": cfg.audit.report_directory,
+            "report_directory": cfg.audit.report_directory.as_ref().and_then(|path| path.file_name()).and_then(|name| name.to_str()),
+            "report_directory_redacted": cfg.audit.report_directory.as_ref().map(|path| redact_evidence_path(path)),
             "report_formats": cfg.audit.report_formats,
             "monthly_reports": cfg.audit.monthly_reports
         },
@@ -4968,7 +5310,8 @@ async fn systemd_audit(systemd_unit: Option<&Path>) -> Result<serde_json::Value>
         return Ok(json!({
             "checked": false,
             "present": false,
-            "path": null,
+            "artifact": null,
+            "path_redacted": null,
             "has_service_section": false,
             "has_exec_start": false,
             "mentions_llmctld": false
@@ -4979,7 +5322,8 @@ async fn systemd_audit(systemd_unit: Option<&Path>) -> Result<serde_json::Value>
         Ok(body) => Ok(json!({
             "checked": true,
             "present": true,
-            "path": path,
+            "artifact": path.file_name().and_then(|name| name.to_str()).unwrap_or("systemd-unit"),
+            "path_redacted": redact_evidence_path(path),
             "has_service_section": body.contains("[Service]"),
             "has_exec_start": body.lines().any(|line| line.trim_start().starts_with("ExecStart=")),
             "mentions_llmctld": body.contains("llmctld")
@@ -4987,7 +5331,8 @@ async fn systemd_audit(systemd_unit: Option<&Path>) -> Result<serde_json::Value>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(json!({
             "checked": true,
             "present": false,
-            "path": path,
+            "artifact": path.file_name().and_then(|name| name.to_str()).unwrap_or("systemd-unit"),
+            "path_redacted": redact_evidence_path(path),
             "has_service_section": false,
             "has_exec_start": false,
             "mentions_llmctld": false
@@ -4996,12 +5341,34 @@ async fn systemd_audit(systemd_unit: Option<&Path>) -> Result<serde_json::Value>
     }
 }
 
-fn is_external_host(host: &str) -> bool {
-    !matches!(host, "127.0.0.1" | "localhost" | "::1")
-}
-
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn trusted_proxy_is_explicit(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value == "*" {
+        return false;
+    }
+    if let Some((addr, prefix)) = value.split_once('/') {
+        let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        let Ok(prefix) = prefix.parse::<u8>() else {
+            return false;
+        };
+        return prefix > 0 && prefix <= if ip.is_ipv4() { 32 } else { 128 };
+    }
+    value.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn redact_evidence_path(path: &Path) -> String {
+    format!(
+        "<redacted>/{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artifact")
+    )
 }
 
 fn is_sensitive_name(name: &str) -> bool {
@@ -5084,6 +5451,7 @@ impl DataDataset {
             Self::Models => "models",
             Self::Drift => "drift",
             Self::Audit => "audit",
+            Self::Lineage => "lineage",
         }
     }
 
@@ -5098,6 +5466,7 @@ impl DataDataset {
             Self::Models => Some(DatasetKind::Models),
             Self::Drift => Some(DatasetKind::Drift),
             Self::Audit => Some(DatasetKind::Audit),
+            Self::Lineage => Some(DatasetKind::Lineage),
         }
     }
 }
@@ -5113,6 +5482,7 @@ impl From<DataContractDataset> for DatasetKind {
             DataContractDataset::Models => DatasetKind::Models,
             DataContractDataset::Drift => DatasetKind::Drift,
             DataContractDataset::Audit => DatasetKind::Audit,
+            DataContractDataset::Lineage => DatasetKind::Lineage,
         }
     }
 }

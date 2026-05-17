@@ -1,6 +1,7 @@
 use crate::audit::{AuditEvent, UsageEvent};
 use crate::config::{
-    ApiKeyConfig, Config, ExternalProviderKind, Mode, ModelConfig, NativeEmbeddingMode,
+    is_external_host, ApiKeyConfig, Config, ExternalProviderKind, Mode, ModelConfig,
+    NativeEmbeddingMode,
 };
 use crate::native;
 use crate::observability::{
@@ -36,7 +37,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -569,7 +570,7 @@ fn draining_response(state: &ServerState, request_id: Uuid) -> Option<Response> 
 async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
     let storage_ready = storage_ready(&state.storage).await;
     let draining = state.draining.load(Ordering::SeqCst);
-    let active_models = routed_models(&state.cfg).len();
+    let active_models = active_routed_models(&state.cfg).len();
     let ready = storage_ready && !draining && active_models > 0;
     let http_status = if ready {
         StatusCode::OK
@@ -589,7 +590,7 @@ pub async fn readiness_status(cfg: &Config, storage: &Storage) -> Value {
 }
 
 fn readiness_status_for(cfg: &Config, storage_ready: bool, draining: bool) -> Value {
-    let aliases: Vec<_> = routed_models(cfg)
+    let aliases: Vec<_> = active_routed_models(cfg)
         .into_iter()
         .map(|model| model.alias.as_str())
         .collect();
@@ -626,10 +627,6 @@ async fn storage_ready(storage: &Storage) -> bool {
         .is_ok()
 }
 
-fn is_external_host(host: &str) -> bool {
-    !matches!(host, "127.0.0.1" | "localhost" | "::1")
-}
-
 async fn list_models(
     State(state): State<Arc<ServerState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -639,7 +636,11 @@ async fn list_models(
     if let Some(response) = draining_response(&state, request_id) {
         return response;
     }
-    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
         Ok(principal) => principal,
         Err(err) => {
             record_audit(
@@ -652,10 +653,7 @@ async fn list_models(
                 json!({ "reason": err }),
             )
             .await;
-            return with_request_id(
-                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
-                request_id,
-            );
+            return with_request_id(auth_error_response(err), request_id);
         }
     };
 
@@ -729,13 +727,14 @@ async fn local_search(
     if let Some(response) = draining_response(&state, request_id) {
         return response;
     }
-    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
         Ok(principal) => principal,
         Err(err) => {
-            return with_request_id(
-                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
-                request_id,
-            );
+            return with_request_id(auth_error_response(err), request_id);
         }
     };
 
@@ -794,13 +793,14 @@ async fn local_recommendations(
     if let Some(response) = draining_response(&state, request_id) {
         return response;
     }
-    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
         Ok(principal) => principal,
         Err(err) => {
-            return with_request_id(
-                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
-                request_id,
-            );
+            return with_request_id(auth_error_response(err), request_id);
         }
     };
 
@@ -886,13 +886,14 @@ async fn admin_swap(
     Json(request): Json<AdminSwapRequest>,
 ) -> Response {
     let request_id = request_id_from_headers(&headers);
-    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
         Ok(principal) => principal,
         Err(err) => {
-            return with_request_id(
-                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
-                request_id,
-            );
+            return with_request_id(auth_error_response(err), request_id);
         }
     };
 
@@ -925,14 +926,14 @@ async fn admin_swap(
             "admin.swap",
             &request.replacement,
             "failed",
-            json!({ "reason": "worker supervisor is not attached" }),
+            json!({ "reason": "native in-process runtime does not expose external worker swap" }),
         )
         .await;
         return with_request_id(
             error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "worker_control_unavailable",
-                "daemon worker supervisor is not attached".to_string(),
+                StatusCode::NOT_FOUND,
+                "native_swap_unavailable",
+                "native Candle serving uses model start/stop/upgrade commands; external worker swap is not available".to_string(),
             ),
             request_id,
         );
@@ -1030,7 +1031,11 @@ async fn native_embeddings(
         return response;
     }
     let started = Instant::now();
-    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
         Ok(principal) => principal,
         Err(err) => {
             record_audit(
@@ -1043,10 +1048,7 @@ async fn native_embeddings(
                 json!({ "reason": err }),
             )
             .await;
-            return with_request_id(
-                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
-                request_id,
-            );
+            return with_request_id(auth_error_response(err), request_id);
         }
     };
 
@@ -1133,10 +1135,7 @@ async fn native_embeddings(
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(
-                error_response(StatusCode::BAD_REQUEST, "unknown_model", err.to_string()),
-                request_id,
-            );
+            return with_request_id(model_route_error_response(&err), request_id);
         }
     };
 
@@ -1452,7 +1451,11 @@ async fn chat_completions(
         return response;
     }
     let started = Instant::now();
-    let principal = match authenticate_request(&state, &headers, auth_source_key(connect_info)) {
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
         Ok(principal) => principal,
         Err(err) => {
             record_audit(
@@ -1465,10 +1468,7 @@ async fn chat_completions(
                 json!({ "reason": err }),
             )
             .await;
-            return with_request_id(
-                error_response(StatusCode::UNAUTHORIZED, "unauthorized", err),
-                request_id,
-            );
+            return with_request_id(auth_error_response(err), request_id);
         }
     };
 
@@ -1531,10 +1531,7 @@ async fn chat_completions(
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(
-                error_response(StatusCode::BAD_REQUEST, "unknown_model", err.to_string()),
-                request_id,
-            );
+            return with_request_id(model_route_error_response(&err), request_id);
         }
     };
     let model = route.requested_alias.clone();
@@ -2825,10 +2822,11 @@ fn record_upstream_telemetry(
 }
 
 fn record_circuit_breaker_state(upstream: &str, state: &str, consecutive_failures: u32) {
+    let upstream_id = stable_upstream_id(upstream);
     let attributes = [
-        KeyValue::new("llmctl.upstream", upstream.to_string()),
+        KeyValue::new("llmctl.upstream.id", upstream_id.clone()),
         KeyValue::new("llmctl.circuit.state", state.to_string()),
-        KeyValue::new("upstream", upstream.to_string()),
+        KeyValue::new("upstream_id", upstream_id.clone()),
         KeyValue::new("state", state.to_string()),
     ];
     let meter = global::meter(crate::SERVICE_NAME);
@@ -2847,7 +2845,7 @@ fn record_circuit_breaker_state(upstream: &str, state: &str, consecutive_failure
         TelemetryEventName::CircuitBreaker,
         Utc::now(),
         BTreeMap::from([
-            ("llmctl.upstream".to_string(), json!(upstream)),
+            ("llmctl.upstream.id".to_string(), json!(upstream_id)),
             ("llmctl.circuit.state".to_string(), json!(state)),
             (
                 "llmctl.circuit.consecutive_failures".to_string(),
@@ -2855,6 +2853,11 @@ fn record_circuit_breaker_state(upstream: &str, state: &str, consecutive_failure
             ),
         ]),
     ));
+}
+
+fn stable_upstream_id(upstream: &str) -> String {
+    let digest = Sha256::digest(upstream.as_bytes());
+    format!("upstream-{:x}", digest)[..25].to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2893,10 +2896,42 @@ impl std::fmt::Display for ModelRouteError {
     }
 }
 
+fn model_route_error_response(err: &ModelRouteError) -> Response {
+    match err {
+        ModelRouteError::UnknownAlias(_) | ModelRouteError::NoConfiguredModels => {
+            error_response(StatusCode::NOT_FOUND, "model_not_found", err.to_string())
+        }
+        ModelRouteError::ExternalProviderRoutingDisabled(_) => {
+            error_response(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
+        }
+    }
+}
+
 fn routed_models(cfg: &Config) -> Vec<&ModelConfig> {
-    let mut models: Vec<_> = cfg.models.iter().collect();
+    let mut models: Vec<_> = cfg
+        .models
+        .iter()
+        .filter(|model| model_is_routed_locally(cfg, model))
+        .collect();
     models.sort_by(|left, right| left.alias.cmp(&right.alias));
     models
+}
+
+fn active_routed_models(cfg: &Config) -> Vec<&ModelConfig> {
+    routed_models(cfg)
+        .into_iter()
+        .filter(|model| model.weight > 0)
+        .collect()
+}
+
+fn model_is_routed_locally(cfg: &Config, model: &ModelConfig) -> bool {
+    let placement = native::placement_plan_from_config(cfg);
+    placement
+        .nodes
+        .iter()
+        .find(|node| node.id == placement.local_node)
+        .map(|node| node.model_aliases.iter().any(|alias| alias == &model.alias))
+        .unwrap_or(false)
 }
 
 fn resolve_model_route(
@@ -2919,13 +2954,14 @@ fn resolve_model_route(
     let requested = cfg
         .models
         .iter()
-        .find(|model| model.alias == requested_alias)
+        .find(|model| model.alias == requested_alias && model_is_routed_locally(cfg, model))
         .ok_or_else(|| ModelRouteError::UnknownAlias(requested_alias.to_string()))?;
 
     let upstream = match cfg.mode {
-        Mode::Single => routed_models(cfg)
-            .into_iter()
-            .next()
+        Mode::Single => cfg
+            .models
+            .iter()
+            .find(|model| model_is_routed_locally(cfg, model))
             .ok_or(ModelRouteError::NoConfiguredModels)?,
         Mode::ColdSwap | Mode::HotSwap => requested,
         Mode::Weighted => weighted_model_for_request(cfg, request_id).unwrap_or(requested),
@@ -2960,7 +2996,7 @@ fn weighted_model_for_request(cfg: &Config, request_id: Uuid) -> Option<&ModelCo
     let weighted = cfg
         .models
         .iter()
-        .filter(|model| model.weight > 0)
+        .filter(|model| model.weight > 0 && model_is_routed_locally(cfg, model))
         .collect::<Vec<_>>();
     let total = weighted.iter().fold(0u64, |total, model| {
         total.saturating_add(u64::from(model.weight))
@@ -2982,9 +3018,8 @@ fn weighted_model_for_request(cfg: &Config, request_id: Uuid) -> Option<&ModelCo
 }
 
 fn fallback_aliases(cfg: &Config, selected_alias: &str) -> Vec<String> {
-    let mut models = cfg
-        .models
-        .iter()
+    let mut models = routed_models(cfg)
+        .into_iter()
         .filter(|model| model.alias != selected_alias)
         .collect::<Vec<_>>();
     models.sort_by(|left, right| {
@@ -3086,10 +3121,119 @@ fn authenticate_request(
     }
 }
 
-fn auth_source_key(connect_info: Option<ConnectInfo<SocketAddr>>) -> String {
-    connect_info
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
+fn auth_source_key(
+    cfg: &Config,
+    headers: &HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+) -> String {
+    let peer = connect_info.map(|ConnectInfo(addr)| addr.ip());
+    if peer.is_some_and(|ip| is_trusted_proxy(cfg, ip)) {
+        if let Some(forwarded) = forwarded_client_ip(cfg, headers) {
+            return forwarded;
+        }
+    }
+    peer.map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown-source".to_string())
+}
+
+fn is_trusted_proxy(cfg: &Config, ip: IpAddr) -> bool {
+    cfg.security
+        .trusted_proxies
+        .iter()
+        .any(|trusted| trusted_proxy_matches(trusted, ip))
+}
+
+fn trusted_proxy_matches(trusted: &str, ip: IpAddr) -> bool {
+    let trusted = trusted.trim();
+    if let Ok(exact) = trusted.parse::<IpAddr>() {
+        return exact == ip;
+    }
+    let Some((network, prefix)) = trusted.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match (network, ip) {
+        (IpAddr::V4(network), IpAddr::V4(ip)) if prefix > 0 && prefix <= 32 => {
+            let mask = u32::MAX << (32 - prefix);
+            u32::from(network) & mask == u32::from(ip) & mask
+        }
+        (IpAddr::V6(network), IpAddr::V6(ip)) if prefix > 0 && prefix <= 128 => {
+            let mask = u128::MAX << (128 - prefix);
+            u128::from(network) & mask == u128::from(ip) & mask
+        }
+        _ => false,
+    }
+}
+
+fn forwarded_client_ip(cfg: &Config, headers: &HeaderMap) -> Option<String> {
+    let forwarded_ips = headers
+        .get_all("forwarded")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
+            value
+                .split(',')
+                .flat_map(|element| element.split(';'))
+                .filter_map(|part| {
+                    let part = part.trim();
+                    let for_value = part.strip_prefix("for=")?;
+                    parse_forwarded_ip(for_value)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if !forwarded_ips.is_empty() {
+        if let Some(ip) = first_untrusted_forwarded_ip(cfg, forwarded_ips) {
+            return Some(ip);
+        }
+    }
+    let forwarded_ips = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
+            value
+                .split(',')
+                .filter_map(parse_forwarded_ip)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if !forwarded_ips.is_empty() {
+        if let Some(ip) = first_untrusted_forwarded_ip(cfg, forwarded_ips) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('[')
+        .trim_matches(']');
+    let candidate = if let Ok(ip) = value.parse::<IpAddr>() {
+        ip
+    } else if let Some((host, _port)) = value.rsplit_once(':') {
+        host.trim_matches('[').trim_matches(']').parse().ok()?
+    } else {
+        return None;
+    };
+    Some(candidate)
+}
+
+fn first_untrusted_forwarded_ip(cfg: &Config, forwarded_ips: Vec<IpAddr>) -> Option<String> {
+    for ip in forwarded_ips.into_iter().rev() {
+        if !is_trusted_proxy(cfg, ip) {
+            return Some(ip.to_string());
+        }
+    }
+    None
 }
 
 fn auth_failure_key(source_key: &str) -> String {
@@ -3277,11 +3421,13 @@ async fn record_request_lineage_joins(
     source: &str,
 ) {
     for lineage_id in &lineage.lineage_ids {
+        let lineage_id = sanitize_lineage_value(lineage_id);
+        let corpus = lineage.corpus.as_deref().map(sanitize_lineage_value);
         let record = RequestLineageJoinRecord::new(
             request_id,
-            lineage_id.clone(),
+            lineage_id,
             model.map(str::to_string),
-            lineage.corpus.clone(),
+            corpus,
             source,
         );
         if let Err(err) = state.storage.insert_request_lineage_join(&record).await {
@@ -3353,8 +3499,34 @@ fn extend_lineage_ids_from_str(raw: &str, lineage_ids: &mut Vec<String>) {
         raw.split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string),
+            .map(sanitize_lineage_value),
     );
+}
+
+fn sanitize_lineage_value(raw: &str) -> String {
+    let value = raw.trim();
+    if value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':'))
+        && !looks_sensitive_lineage_value(value)
+    {
+        return value.to_string();
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    format!("redacted:{:x}", digest)[..25].to_string()
+}
+
+fn looks_sensitive_lineage_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.contains('/')
+        || value.contains('\\')
+        || lower.contains("bearer ")
+        || lower.contains("apikey")
+        || lower.contains("api_key")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
 }
 
 fn header_string(headers: &HeaderMap, name: HeaderName) -> Option<String> {
@@ -3624,11 +3796,20 @@ fn error_response(status: StatusCode, code: &str, message: String) -> Response {
             "error": {
                 "message": message,
                 "type": code,
-                "code": code
+                "code": code,
+                "status": status.as_u16()
             }
         })),
     )
         .into_response()
+}
+
+fn auth_error_response(message: String) -> Response {
+    if message.contains("too many failed authentication attempts") {
+        error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message)
+    } else {
+        error_response(StatusCode::UNAUTHORIZED, "unauthorized", message)
+    }
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> Uuid {
@@ -4045,7 +4226,8 @@ where
             worker_control,
             native_engines,
             draining,
-        ),
+        )
+        .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -4191,8 +4373,10 @@ where
                 }
             };
             let io = TokioIo::new(tls_stream);
-            let tower_service =
-                app.map_request(|req: axum::http::Request<Incoming>| req.map(Body::new));
+            let tower_service = app.map_request(move |mut req: axum::http::Request<Incoming>| {
+                req.extensions_mut().insert(ConnectInfo(remote_addr));
+                req.map(Body::new)
+            });
             let hyper_service = TowerToHyperService::new(tower_service);
             let builder = HyperBuilder::new(TokioExecutor::new());
             let conn = builder.serve_connection_with_upgrades(io, hyper_service);
@@ -4311,7 +4495,7 @@ pub async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiKeyConfig, SecurityConfig, ServerConfig};
+    use crate::config::{ApiKeyConfig, ClusterNodeConfig, SecurityConfig, ServerConfig};
 
     #[test]
     fn normalizes_upstream_urls() {
@@ -4394,6 +4578,59 @@ data: [DONE]
         assert!(limiter.is_limited("bad-token", 2));
         limiter.record_success("bad-token");
         assert!(!limiter.is_limited("bad-token", 2));
+    }
+
+    #[test]
+    fn trusted_proxy_forwarded_chain_uses_rightmost_untrusted_client() {
+        let mut cfg = Config::default();
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.10, 198.51.100.20, 10.0.0.5"),
+        );
+
+        assert_eq!(
+            forwarded_client_ip(&cfg, &headers).as_deref(),
+            Some("198.51.100.20")
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_forwarded_chain_reads_duplicate_headers() {
+        let mut cfg = Config::default();
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.20, 10.0.0.5"),
+        );
+
+        assert_eq!(
+            forwarded_client_ip(&cfg, &headers).as_deref(),
+            Some("198.51.100.20")
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_matching_rejects_wildcard_runtime_entries() {
+        let mut cfg = Config::default();
+        cfg.security.trusted_proxies = vec!["*".to_string()];
+
+        assert!(!is_trusted_proxy(
+            &cfg,
+            "203.0.113.1".parse::<IpAddr>().unwrap()
+        ));
+        cfg.security.trusted_proxies = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
+        assert!(!is_trusted_proxy(
+            &cfg,
+            "203.0.113.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_trusted_proxy(
+            &cfg,
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        ));
     }
 
     #[test]
@@ -4708,10 +4945,66 @@ data: [DONE]
             ],
         );
 
-        let resolved = resolve_model_route(&cfg, "light", Uuid::from_u128(2)).unwrap();
+        let resolved = resolve_model_route(&cfg, "light", Uuid::from_u128(50)).unwrap();
 
         assert_eq!(resolved.requested_alias, "light");
         assert_eq!(resolved.upstream_alias, "heavy-b");
+    }
+
+    #[test]
+    fn cluster_node_routes_only_locally_placed_models() {
+        let mut cfg = config_with_models(
+            Mode::Weighted,
+            vec![
+                model("thinking", 100, "thinking"),
+                model("coding", 100, "coding"),
+            ],
+        );
+        cfg.cluster.node_id = "node-a".to_string();
+        cfg.cluster.nodes = vec![
+            ClusterNodeConfig {
+                id: "node-a".to_string(),
+                base_url: "http://node-a:8765".to_string(),
+                roles: vec!["thinking".to_string()],
+                model_aliases: Vec::new(),
+            },
+            ClusterNodeConfig {
+                id: "node-b".to_string(),
+                base_url: "http://node-b:8765".to_string(),
+                roles: vec!["coding".to_string()],
+                model_aliases: Vec::new(),
+            },
+        ];
+
+        let aliases = routed_models(&cfg)
+            .into_iter()
+            .map(|model| model.alias.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(aliases, vec!["thinking"]);
+        assert!(matches!(
+            resolve_model_route(&cfg, "coding", Uuid::nil()),
+            Err(ModelRouteError::UnknownAlias(alias)) if alias == "coding"
+        ));
+        assert_eq!(
+            resolve_model_route(&cfg, "thinking", Uuid::from_u128(1))
+                .unwrap()
+                .upstream_alias,
+            "thinking"
+        );
+    }
+
+    #[test]
+    fn readiness_counts_only_active_routed_models() {
+        let cfg = config_with_models(
+            Mode::Weighted,
+            vec![model("active", 1, "chat"), model("inactive", 0, "chat")],
+        );
+
+        let status = readiness_status_for(&cfg, true, false);
+
+        assert_eq!(status["status"], "ready");
+        assert_eq!(status["models"]["configured"], 1);
+        assert_eq!(status["models"]["aliases"], json!(["active"]));
     }
 
     #[tokio::test]

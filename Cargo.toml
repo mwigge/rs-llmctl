@@ -1,6 +1,6 @@
 [package]
 name = "rs-llmctl"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -13,11 +13,11 @@ path = "src/bin/llmctl.rs"
 
 [features]
 default = ["native"]
-native = ["native-candle", "native-tokenizers"]
+native = ["native-candle"]
 candle-core = ["dep:candle-core"]
 candle-nn = ["dep:candle-nn"]
 candle-transformers = ["dep:candle-transformers"]
-native-candle = ["candle-core", "candle-nn", "candle-transformers"]
+native-candle = ["candle-core", "candle-nn", "candle-transformers", "native-tokenizers"]
 native-tokenizers = ["tokenizers"]
 tokenizers = ["dep:tokenizers"]
 
@@ -58,6 +58,7 @@ tokio-rustls = "0.26"
 tokio-stream = "0.1"
 toml = "0.8"
 tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["onig"] }
+tonic = { version = "0.14.6", default-features = false }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = "0.1"

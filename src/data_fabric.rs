@@ -1,4 +1,4 @@
-use crate::contracts::DataContract;
+use crate::contracts::{DataContract, FieldContract};
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{
     ArrayRef, Float64Array, StringArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
@@ -62,7 +62,7 @@ fn record_batch_with_schema(
     let columns = contract
         .fields
         .iter()
-        .map(|field| array_for_field(field.name, field.data_type, rows))
+        .map(|field| array_for_field(field, rows))
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
@@ -81,7 +81,10 @@ fn arrow_type(data_type: &str) -> DataType {
     }
 }
 
-fn array_for_field(name: &str, data_type: &str, rows: &[Value]) -> Result<ArrayRef> {
+fn array_for_field(field: &FieldContract, rows: &[Value]) -> Result<ArrayRef> {
+    validate_field_values(field, rows)?;
+    let name = field.name;
+    let data_type = field.data_type;
     if data_type.starts_with("timestamp") {
         let values = rows
             .iter()
@@ -112,6 +115,49 @@ fn array_for_field(name: &str, data_type: &str, rows: &[Value]) -> Result<ArrayR
                 .collect::<Vec<_>>(),
         ))),
     }
+}
+
+fn validate_field_values(field: &FieldContract, rows: &[Value]) -> Result<()> {
+    for (index, row) in rows.iter().enumerate() {
+        let value = row.get(field.name);
+        if !field.nullable && matches!(value, None | Some(Value::Null)) {
+            return Err(anyhow!(
+                "row {index} missing required field `{}` for data contract",
+                field.name
+            ));
+        }
+
+        let Some(value) = value else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let valid = if field.data_type.starts_with("timestamp") {
+            value
+                .as_str()
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .is_some()
+        } else {
+            match field.data_type {
+                "uint64" => value.as_u64().is_some(),
+                "uint32" => value
+                    .as_u64()
+                    .is_some_and(|value| u32::try_from(value).is_ok()),
+                "float64" => value.as_f64().is_some(),
+                "utf8" => value.as_str().is_some(),
+                _ => true,
+            }
+        };
+        if !valid {
+            return Err(anyhow!(
+                "row {index} field `{}` does not match data contract type `{}`",
+                field.name,
+                field.data_type
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn optional_string(value: Option<&Value>) -> Option<String> {
@@ -164,4 +210,56 @@ fn timestamp_millis(value: Option<&Value>) -> Result<Option<i64>> {
         .with_context(|| format!("parse timestamp {value:?}"))?
         .with_timezone(&Utc);
     Ok(Some(parsed.timestamp_millis()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{contract_for, DatasetKind};
+    use serde_json::json;
+
+    #[test]
+    fn validates_required_fields_before_arrow_conversion() {
+        let contract = contract_for(DatasetKind::Usage);
+        let err = record_batch_with_schema(
+            &contract,
+            &arrow_schema(&contract),
+            &[json!({
+                "at": "2026-05-17T00:00:00Z",
+                "model": "qwen",
+                "actor": "alice",
+                "team": "platform",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "latency_ms": 10,
+                "status": "ok"
+            })],
+        )
+        .expect_err("missing request_id should fail");
+
+        assert!(err.to_string().contains("request_id"));
+    }
+
+    #[test]
+    fn validates_timestamp_field_types_before_arrow_conversion() {
+        let contract = contract_for(DatasetKind::Usage);
+        let err = record_batch_with_schema(
+            &contract,
+            &arrow_schema(&contract),
+            &[json!({
+                "at": "not-a-date",
+                "request_id": "req",
+                "model": "qwen",
+                "actor": "alice",
+                "team": "platform",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "latency_ms": 10,
+                "status": "ok"
+            })],
+        )
+        .expect_err("bad timestamp should fail");
+
+        assert!(err.to_string().contains("at"));
+    }
 }
