@@ -139,7 +139,7 @@ policy requires publisher authentication.
 For a pinned version or another fork:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mwigge/rs-llmctl/main/install.sh | RS_LLMCTL_VERSION=v1.2.0 RS_LLMCTL_REPO=your-org/rs-llmctl sh
+curl -fsSL https://raw.githubusercontent.com/mwigge/rs-llmctl/main/install.sh | RS_LLMCTL_VERSION=v1.2.1 RS_LLMCTL_REPO=your-org/rs-llmctl sh
 ```
 
 After install:
@@ -192,11 +192,12 @@ OpenAI-compatible `/v1/chat/completions` request plan using the generated key
 from your secret store, without printing the secret.
 
 The release smoke path does not require Docker. `tests/smoke/smoke_native_release.sh`
-installs the packaged tarball into a temporary prefix, runs `first-run --apply`
-with one generated API key when `LLMCTL_NATIVE_SMOKE_MODEL_PATH` points at a
-real local model artifact, starts `llmctl server run`, and checks both
-non-streaming and streaming chat completions. Use a VM or privileged systemd
-test host only when the test must validate systemd activation itself.
+requires `LLMCTL_NATIVE_SMOKE_MODEL_PATH` to point at one real local model
+artifact, installs the packaged tarball into a temporary prefix, runs
+`first-run --apply` with one generated API key, starts `llmctl server run`, and
+queries the model through the `rs-llmctl-client` example. A successful run ends
+with `ok release smoke passed for <model>`. Use a VM or privileged systemd test
+host only when the test must validate systemd activation itself.
 
 ## Operate In 10 Steps
 

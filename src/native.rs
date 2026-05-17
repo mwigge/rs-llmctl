@@ -1920,11 +1920,28 @@ impl RealCandleModel {
             Self::Mistral(model) => model.forward(&input, offset),
         }
         .with_context(|| "native Candle model forward pass failed")?;
-        logits
+        let logits_shape = logits.dims().to_vec();
+        let next_logits = match logits.dims() {
+            [_, seq_len, _] => logits
+                .narrow(1, seq_len.saturating_sub(1), 1)
+                .and_then(|tensor| tensor.squeeze(1)),
+            [seq_len, _] => logits
+                .narrow(0, seq_len.saturating_sub(1), 1)
+                .and_then(|tensor| tensor.squeeze(0)),
+            [_] => Ok(logits),
+            dims => bail!("native Candle model returned unsupported logits shape: {dims:?}"),
+        }
+        .with_context(|| "failed to select native next-token logits")?;
+        let next_logits_shape = next_logits.dims().to_vec();
+        let next_token = next_logits
             .argmax(candle_core::D::Minus1)
-            .and_then(|tensor| tensor.flatten_all())
             .and_then(|tensor| tensor.to_scalar::<u32>())
-            .with_context(|| "failed to select next native token")
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to select next native token from logits shape {logits_shape:?} and next-token logits shape {next_logits_shape:?}: {err}"
+                )
+            })?;
+        Ok(next_token)
     }
 }
 

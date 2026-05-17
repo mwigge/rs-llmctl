@@ -46,7 +46,8 @@ LLMCTL_NATIVE_SMOKE_MODEL_PATH=/models/qwen.gguf \
 ```
 
 It installs the release tarball into a temporary prefix, applies first-run with
-one generated API key, starts the server, and calls the local chat endpoint.
+one generated API key, starts the server, and calls the local chat endpoint
+through `rs-llmctl-client`.
 
 Create a CPU-only host config:
 

@@ -36,6 +36,7 @@ fn product_docs() -> String {
 #[test]
 fn ci_workflow_enforces_core_rust_gates() {
     let workflow = read(".github/workflows/ci.yml");
+    let smoke = read("tests/smoke/smoke_native_release.sh");
 
     for gate in [
         "cargo fmt --all -- --check",
@@ -46,14 +47,19 @@ fn ci_workflow_enforces_core_rust_gates() {
         "'v*'",
         "tests/smoke/smoke_native_release.sh",
         "runs-on: [self-hosted, linux, x64, llmctl-native-smoke]",
-        "LLMCTL_NATIVE_SMOKE_CONFIG: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG }}",
-        "LLMCTL_NATIVE_SMOKE_CONFIG_TOML: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG_TOML }}",
         "LLMCTL_NATIVE_SMOKE_MODEL_PATH: ${{ secrets.LLMCTL_NATIVE_SMOKE_MODEL_PATH }}",
         "sigstore/cosign-installer@v3",
         "packaging/sign-release.sh dist",
         "gh release create",
     ] {
         assert!(workflow.contains(gate), "CI workflow should run `{gate}`");
+    }
+    for gate in [
+        "cargo run -q -p rs-llmctl-client --example chat",
+        "ok release smoke passed",
+        "LLMCTL_NATIVE_SMOKE_MODEL_PATH must point at one real local GGUF or safetensors model artifact",
+    ] {
+        assert!(smoke.contains(gate), "smoke test should run `{gate}`");
     }
 }
 

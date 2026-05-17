@@ -96,7 +96,8 @@ Docker is not required for the default install smoke. Run
 pointing at one real local model artifact. The script installs the packaged
 tarball into a temporary prefix with `LLMCTL_INSTALL_SYSTEMD=0`, runs
 `first-run --apply` to create one API key and one model config, starts the
-server, and checks non-streaming and streaming `/v1/chat/completions`.
+server, and makes a simple chat request through `rs-llmctl-client`. A successful
+run prints `ok release smoke passed for <model>`.
 
 Use a VM or a privileged systemd test host when the target is systemd activation
 or distro packaging behavior. Plain Docker is useful for file-layout checks but

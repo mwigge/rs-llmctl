@@ -3,6 +3,16 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## 1.2.1 - 2026-05-17
+
+- Release smoke now installs the packaged archive into a temporary prefix,
+  runs first-run with one generated API key and one real local model artifact,
+  starts the installed server, and proves the Rust client can complete a chat
+  request before reporting release readiness.
+- Native GGUF generation now selects the last-token logits without reshaping
+  scalar argmax output, fixing the one-token path exercised by the release
+  smoke.
+
 ## 1.2.0 - 2026-05-17
 
 - Native-first packaging: the default archive publishes the single `llmctl`

@@ -120,9 +120,6 @@ jobs:
 
       - name: Run native release smoke with mounted model artifacts
         env:
-          LLMCTL_NATIVE_SMOKE_CONFIG: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG }}
-          LLMCTL_NATIVE_SMOKE_CONFIG_TOML: ${{ secrets.LLMCTL_NATIVE_SMOKE_CONFIG_TOML }}
           LLMCTL_NATIVE_SMOKE_MODEL_PATH: ${{ secrets.LLMCTL_NATIVE_SMOKE_MODEL_PATH }}
-          LLMCTL_NATIVE_SMOKE_API_KEY: ${{ secrets.LLMCTL_NATIVE_SMOKE_API_KEY }}
           LLMCTL_NATIVE_SMOKE_MODEL: ${{ vars.LLMCTL_NATIVE_SMOKE_MODEL }}
         run: tests/smoke/smoke_native_release.sh

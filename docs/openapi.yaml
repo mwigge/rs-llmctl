@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: rs-llmctl native API
-  version: 1.2.0
+  version: 1.2.1
   description: OpenAI-compatible local LLM API served through the rs-llmctl native control plane.
 servers:
   - url: http://localhost:8765
