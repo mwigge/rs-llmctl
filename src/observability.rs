@@ -1,4 +1,4 @@
-use crate::config::{Config, OtlpProtocol};
+use crate::config::{Config, LangfuseExporterConfig, ObservabilityExporterConfig, OtlpProtocol};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
@@ -274,6 +274,48 @@ fn build_log_exporter(
     }
 }
 
+/// Translate Langfuse project credentials into an OTLP/HTTP exporter aimed at
+/// Langfuse's `/api/public/otel` ingestion endpoint, authenticated with HTTP
+/// Basic auth (`base64(public_key:secret_key)`) — the scheme Langfuse expects
+/// from generic OTLP producers. Returns `None` when disabled or incomplete,
+/// so callers can fall back to the explicit exporter configuration.
+pub fn langfuse_otlp_exporter(cfg: &LangfuseExporterConfig) -> Option<Exporter> {
+    if !cfg.enabled {
+        return None;
+    }
+    let host = cfg
+        .host
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/');
+    let public_key = cfg.public_key.as_deref().unwrap_or("").trim();
+    let secret_key = cfg.secret_key.as_deref().unwrap_or("").trim();
+    if host.is_empty() || public_key.is_empty() || secret_key.is_empty() {
+        return None;
+    }
+
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        langfuse_basic_auth_header(public_key, secret_key),
+    );
+
+    Some(Exporter::Otlp {
+        endpoint: format!("{host}/api/public/otel"),
+        protocol: OtlpProtocol::HttpProtobuf,
+        headers,
+        timeout_ms: ObservabilityExporterConfig::default().timeout_ms,
+    })
+}
+
+fn langfuse_basic_auth_header(public_key: &str, secret_key: &str) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let credentials = format!("{public_key}:{secret_key}");
+    format!("Basic {}", STANDARD.encode(credentials))
+}
+
 impl ObservabilityPlan {
     pub fn from_config(cfg: &Config) -> Result<Self> {
         let observability = &cfg.observability;
@@ -290,7 +332,7 @@ impl ObservabilityPlan {
                 headers: observability.exporter.headers.clone(),
                 timeout_ms: observability.exporter.timeout_ms,
             },
-            _ => Exporter::None,
+            _ => langfuse_otlp_exporter(&observability.langfuse).unwrap_or(Exporter::None),
         };
 
         anyhow::ensure!(
@@ -618,6 +660,55 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn langfuse_exporter_derives_otlp_endpoint_and_basic_auth_header() {
+        let cfg = LangfuseExporterConfig {
+            enabled: true,
+            host: Some("https://cloud.langfuse.com/".to_string()),
+            public_key: Some("pk-lf-abc".to_string()),
+            secret_key: Some("sk-lf-xyz".to_string()),
+        };
+
+        let exporter = langfuse_otlp_exporter(&cfg).expect("langfuse exporter should be derived");
+        match exporter {
+            Exporter::Otlp {
+                endpoint,
+                protocol,
+                headers,
+                ..
+            } => {
+                assert_eq!(endpoint, "https://cloud.langfuse.com/api/public/otel");
+                assert_eq!(protocol, OtlpProtocol::HttpProtobuf);
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Basic cGstbGYtYWJjOnNrLWxmLXh5eg==")
+                );
+            }
+            Exporter::None => panic!("expected an OTLP exporter"),
+        }
+    }
+
+    #[test]
+    fn langfuse_exporter_is_none_when_disabled_or_missing_keys() {
+        assert!(langfuse_otlp_exporter(&LangfuseExporterConfig::default()).is_none());
+
+        let missing_secret = LangfuseExporterConfig {
+            enabled: true,
+            host: Some("https://cloud.langfuse.com".to_string()),
+            public_key: Some("pk-lf-abc".to_string()),
+            secret_key: None,
+        };
+        assert!(langfuse_otlp_exporter(&missing_secret).is_none());
+
+        let missing_host = LangfuseExporterConfig {
+            enabled: true,
+            host: None,
+            public_key: Some("pk-lf-abc".to_string()),
+            secret_key: Some("sk-lf-xyz".to_string()),
+        };
+        assert!(langfuse_otlp_exporter(&missing_host).is_none());
+    }
 
     #[test]
     fn runtime_telemetry_event_names_cover_runtime_surfaces() {

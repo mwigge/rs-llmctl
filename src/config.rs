@@ -1,3 +1,4 @@
+use crate::guardrails::GuardrailsConfig;
 use crate::runtime::RuntimeBackend;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,8 @@ pub struct Config {
     pub data_fabric: DataFabricConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub guardrails: GuardrailsConfig,
     #[serde(default, rename = "external-providers", alias = "external_providers")]
     pub external_providers: ExternalProvidersConfig,
     #[serde(default)]
@@ -72,6 +75,7 @@ impl Default for Config {
             events: EventConfig::default(),
             data_fabric: DataFabricConfig::default(),
             audit: AuditConfig::default(),
+            guardrails: GuardrailsConfig::default(),
             external_providers: ExternalProvidersConfig::default(),
             models: vec![],
             quotas: vec![],
@@ -419,6 +423,12 @@ pub struct ObservabilityConfig {
     pub logs_enabled: bool,
     pub resource_attributes: BTreeMap<String, String>,
     pub exporter: ObservabilityExporterConfig,
+    /// Derives an OTLP exporter targeting Langfuse's ingestion endpoint from
+    /// project keys, when no explicit `exporter.endpoint`/`otlp_endpoint` is set.
+    pub langfuse: LangfuseExporterConfig,
+    /// Fire-and-forget HTTP callback fired with usage/lineage metadata after
+    /// every completion — for ecosystems without an OTLP receiver.
+    pub webhook: WebhookExporterConfig,
 }
 
 impl Default for ObservabilityConfig {
@@ -433,6 +443,46 @@ impl Default for ObservabilityConfig {
             logs_enabled: true,
             resource_attributes: BTreeMap::new(),
             exporter: ObservabilityExporterConfig::default(),
+            langfuse: LangfuseExporterConfig::default(),
+            webhook: WebhookExporterConfig::default(),
+        }
+    }
+}
+
+/// Langfuse project credentials. When `enabled` and both keys are present,
+/// these are translated into an OTLP/HTTP exporter targeting Langfuse's
+/// `/api/public/otel` ingestion path with HTTP Basic auth — see
+/// [`crate::observability::langfuse_otlp_exporter`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct LangfuseExporterConfig {
+    pub enabled: bool,
+    /// Langfuse host, e.g. `https://cloud.langfuse.com` or a self-hosted URL.
+    pub host: Option<String>,
+    pub public_key: Option<String>,
+    pub secret_key: Option<String>,
+}
+
+/// Fire-and-forget webhook delivered after every completion, carrying the
+/// same usage/lineage metadata recorded in the audit trail — for ecosystems
+/// (chat ops, custom dashboards, ticketing) that consume callbacks rather
+/// than OTLP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct WebhookExporterConfig {
+    pub enabled: bool,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+impl Default for WebhookExporterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            headers: BTreeMap::new(),
+            timeout_ms: 5_000,
         }
     }
 }

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rs-llmctl playground</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      max-width: 880px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+    h1 { font-size: 1.25rem; }
+    .row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+    .row > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; flex: 1; min-width: 12rem; }
+    input, select, textarea, button {
+      font: inherit;
+      padding: 0.5rem;
+      border-radius: 0.375rem;
+      border: 1px solid #8884;
+    }
+    #log {
+      border: 1px solid #8884;
+      border-radius: 0.5rem;
+      padding: 0.75rem;
+      min-height: 16rem;
+      max-height: 28rem;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: ui-monospace, monospace;
+      font-size: 0.85rem;
+      margin-bottom: 0.75rem;
+    }
+    .msg { margin-bottom: 0.75rem; }
+    .msg .role { font-weight: 600; }
+    .msg.user .role { color: #2563eb; }
+    .msg.assistant .role { color: #16a34a; }
+    .msg.error .role { color: #dc2626; }
+    #composer { display: flex; gap: 0.5rem; }
+    #composer textarea { flex: 1; resize: vertical; min-height: 3rem; }
+    #status { font-size: 0.8rem; color: #888; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>rs-llmctl playground</h1>
+  <p>Talk to any model exposed on this control plane's OpenAI-compatible endpoints.</p>
+
+  <div class="row">
+    <label>
+      API key (sent as <code>Authorization: Bearer …</code>)
+      <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" />
+    </label>
+    <label>
+      Model
+      <select id="model"><option value="">loading…</option></select>
+    </label>
+  </div>
+
+  <div id="log"></div>
+
+  <form id="composer">
+    <textarea id="prompt" placeholder="Ask something…" required></textarea>
+    <button type="submit" id="send">Send</button>
+  </form>
+  <div id="status"></div>
+
+  <script>
+    const log = document.getElementById('log');
+    const modelSelect = document.getElementById('model');
+    const apiKeyInput = document.getElementById('api-key');
+    const promptInput = document.getElementById('prompt');
+    const sendButton = document.getElementById('send');
+    const statusEl = document.getElementById('status');
+    const history = [];
+
+    function authHeaders() {
+      const headers = { 'Content-Type': 'application/json' };
+      const key = apiKeyInput.value.trim();
+      if (key) headers['Authorization'] = `Bearer ${key}`;
+      return headers;
+    }
+
+    function appendMessage(role, text) {
+      const entry = document.createElement('div');
+      entry.className = `msg ${role}`;
+      const roleEl = document.createElement('span');
+      roleEl.className = 'role';
+      roleEl.textContent = `${role}: `;
+      entry.appendChild(roleEl);
+      entry.appendChild(document.createTextNode(text));
+      log.appendChild(entry);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function loadModels() {
+      try {
+        const response = await fetch('/v1/models', { headers: authHeaders() });
+        if (!response.ok) throw new Error(`models request failed: HTTP ${response.status}`);
+        const body = await response.json();
+        const models = Array.isArray(body.data) ? body.data : [];
+        modelSelect.innerHTML = '';
+        if (models.length === 0) {
+          modelSelect.innerHTML = '<option value="">no models available</option>';
+          return;
+        }
+        for (const model of models) {
+          const option = document.createElement('option');
+          option.value = model.id;
+          option.textContent = model.id;
+          modelSelect.appendChild(option);
+        }
+        statusEl.textContent = `${models.length} model(s) available`;
+      } catch (err) {
+        modelSelect.innerHTML = '<option value="">failed to load models</option>';
+        statusEl.textContent = String(err);
+      }
+    }
+
+    async function sendPrompt(event) {
+      event.preventDefault();
+      const text = promptInput.value.trim();
+      const model = modelSelect.value;
+      if (!text || !model) return;
+
+      history.push({ role: 'user', content: text });
+      appendMessage('user', text);
+      promptInput.value = '';
+      sendButton.disabled = true;
+      statusEl.textContent = 'waiting for response…';
+
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ model, messages: history, stream: false }),
+        });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`HTTP ${response.status}: ${detail}`);
+        }
+        const body = await response.json();
+        const reply = body?.choices?.[0]?.message?.content ?? '(empty response)';
+        history.push({ role: 'assistant', content: reply });
+        appendMessage('assistant', reply);
+        statusEl.textContent = '';
+      } catch (err) {
+        appendMessage('error', String(err));
+        statusEl.textContent = '';
+      } finally {
+        sendButton.disabled = false;
+        promptInput.focus();
+      }
+    }
+
+    document.getElementById('composer').addEventListener('submit', sendPrompt);
+    loadModels();
+  </script>
+</body>
+</html>

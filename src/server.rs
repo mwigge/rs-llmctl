@@ -3,6 +3,7 @@ use crate::config::{
     is_external_host, ApiKeyConfig, Config, ExternalProviderKind, Mode, ModelConfig,
     NativeEmbeddingMode,
 };
+use crate::guardrails;
 use crate::native;
 use crate::observability::{
     emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
@@ -20,7 +21,7 @@ use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -193,6 +194,7 @@ fn router_with_worker_control_native_engine_and_drain(
     };
 
     Router::new()
+        .route("/playground", get(playground))
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -542,6 +544,18 @@ impl AuthFailureLimiter {
         let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
         failures.remove(key);
     }
+}
+
+/// Static HTML+JS chat page for exercising the OpenAI-compatible endpoints
+/// directly from a browser — model picker against `/v1/models`, chat against
+/// `/v1/chat/completions`, with a user-supplied bearer API key. No build step,
+/// no framework: served verbatim from `assets/playground.html`.
+fn playground_html() -> &'static str {
+    include_str!("../assets/playground.html")
+}
+
+async fn playground() -> impl IntoResponse {
+    Html(playground_html())
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1493,7 +1507,7 @@ async fn chat_completions(
         );
     }
 
-    let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
+    let mut request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
             record_audit(
@@ -1535,6 +1549,68 @@ async fn chat_completions(
         }
     };
     let model = route.requested_alias.clone();
+
+    if state.cfg.guardrails.is_active() {
+        let message_texts: Vec<(usize, String)> = request
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (index, native::message_content_text(message)))
+            .collect();
+        let verdict = guardrails::evaluate(&message_texts, &state.cfg.guardrails);
+
+        if verdict.is_blocked() {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal,
+                "chat.completions",
+                model,
+                "denied",
+                json!({
+                    "reason": "guardrail_violation",
+                    "guardrails": verdict.block_reasons,
+                    "findings": verdict.findings.audit_detail(),
+                }),
+            )
+            .await;
+            return with_request_id(
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "guardrail_blocked",
+                    format!(
+                        "request blocked by guardrails: {}",
+                        verdict.block_reasons.join(", ")
+                    ),
+                ),
+                request_id,
+            );
+        }
+
+        if verdict.has_findings() {
+            record_audit(
+                &state,
+                Some(request_id),
+                principal.clone(),
+                "chat.completions",
+                model.clone(),
+                "flagged",
+                json!({
+                    "reason": "guardrail_match",
+                    "findings": verdict.findings.audit_detail(),
+                    "redacted": !verdict.redactions.is_empty(),
+                }),
+            )
+            .await;
+        }
+
+        for (index, redacted_text) in verdict.redactions {
+            if let Some(message) = request.messages.get_mut(index) {
+                message.content = Some(Value::String(redacted_text));
+            }
+        }
+    }
+
     record_request_lineage_joins(
         &state,
         request_id,
@@ -3572,6 +3648,118 @@ async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
         tracing::warn!(error = %err, "failed to record usage event");
     }
     record_usage_telemetry(&event, input.accounting_mode);
+    dispatch_usage_webhook(state, &event, input.accounting_mode);
+}
+
+/// GenAI semantic-convention name for this service — surfaced as `gen_ai.system`
+/// on every usage span so downstream OTel consumers (Langfuse, generic GenAI
+/// dashboards) can group spans emitted by rs-llmctl regardless of which model
+/// served the request.
+const GEN_AI_SYSTEM: &str = "rs-llmctl";
+
+/// Build the attribute set for a usage span: the existing `llmctl.*` attributes
+/// plus the OTel GenAI semantic-convention attributes
+/// (`gen_ai.system`, `gen_ai.operation.name`, `gen_ai.request.model`,
+/// `gen_ai.response.model`, `gen_ai.usage.*`) so traces align with the
+/// conventions Langfuse and other GenAI-aware OTel consumers expect.
+fn usage_span_attributes(event: &UsageEvent, accounting_mode: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "llmctl.request_id".to_string(),
+            json!(event.request_id.to_string()),
+        ),
+        ("llmctl.model".to_string(), json!(event.model.as_str())),
+        ("llmctl.actor".to_string(), json!(event.actor.as_str())),
+        ("llmctl.team".to_string(), json!(event.team.as_str())),
+        ("llmctl.latency_ms".to_string(), json!(event.latency_ms)),
+        ("llmctl.status".to_string(), json!(event.status.as_str())),
+        (
+            "llmctl.token_accounting.mode".to_string(),
+            json!(accounting_mode),
+        ),
+        ("gen_ai.system".to_string(), json!(GEN_AI_SYSTEM)),
+        ("gen_ai.operation.name".to_string(), json!("chat")),
+        (
+            "gen_ai.request.model".to_string(),
+            json!(event.model.as_str()),
+        ),
+        (
+            "gen_ai.response.model".to_string(),
+            json!(event.model.as_str()),
+        ),
+        (
+            "gen_ai.usage.input_tokens".to_string(),
+            json!(event.input_tokens),
+        ),
+        (
+            "gen_ai.usage.output_tokens".to_string(),
+            json!(event.output_tokens),
+        ),
+    ])
+}
+
+/// JSON payload delivered to the configured usage webhook — the same
+/// usage/lineage metadata recorded in the audit trail and emitted as OTel
+/// attributes, shaped for ecosystems that consume callbacks rather than OTLP.
+fn webhook_payload(event: &UsageEvent, accounting_mode: &str) -> Value {
+    json!({
+        "type": "llmctl.usage",
+        "id": event.id.to_string(),
+        "request_id": event.request_id.to_string(),
+        "at": event.at.to_rfc3339(),
+        "model": event.model,
+        "actor": event.actor,
+        "team": event.team,
+        "input_tokens": event.input_tokens,
+        "output_tokens": event.output_tokens,
+        "latency_ms": event.latency_ms,
+        "status": event.status,
+        "token_accounting_mode": accounting_mode,
+    })
+}
+
+/// Fire-and-forget delivery of the usage webhook, if configured. Failures are
+/// logged at `warn` and never affect the in-flight request — the webhook is a
+/// best-effort sink, not part of the request's correctness contract.
+fn dispatch_usage_webhook(state: &ServerState, event: &UsageEvent, accounting_mode: &str) {
+    let webhook = &state.cfg.observability.webhook;
+    if !webhook.enabled {
+        return;
+    }
+    let Some(url) = webhook
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    let payload = webhook_payload(event, accounting_mode);
+    let client = state.client.clone();
+    let headers = webhook.headers.clone();
+    let timeout = Duration::from_millis(webhook.timeout_ms.max(1));
+
+    tokio::spawn(async move {
+        let mut request = client.post(&url).json(&payload).timeout(timeout);
+        for (name, value) in &headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        match request.send().await {
+            Ok(response) if !response.status().is_success() => {
+                tracing::warn!(
+                    url = %url,
+                    status = %response.status(),
+                    "usage webhook delivery returned a non-success status"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(url = %url, error = %err, "failed to deliver usage webhook");
+            }
+            Ok(_) => {}
+        }
+    });
 }
 
 fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str) {
@@ -3579,29 +3767,7 @@ fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str) {
         TelemetrySignal::Span,
         TelemetryEventName::RequestRouting,
         Utc::now(),
-        BTreeMap::from([
-            (
-                "llmctl.request_id".to_string(),
-                json!(event.request_id.to_string()),
-            ),
-            ("llmctl.model".to_string(), json!(event.model.as_str())),
-            ("llmctl.actor".to_string(), json!(event.actor.as_str())),
-            ("llmctl.team".to_string(), json!(event.team.as_str())),
-            (
-                "gen_ai.usage.input_tokens".to_string(),
-                json!(event.input_tokens),
-            ),
-            (
-                "gen_ai.usage.output_tokens".to_string(),
-                json!(event.output_tokens),
-            ),
-            ("llmctl.latency_ms".to_string(), json!(event.latency_ms)),
-            ("llmctl.status".to_string(), json!(event.status.as_str())),
-            (
-                "llmctl.token_accounting.mode".to_string(),
-                json!(accounting_mode),
-            ),
-        ]),
+        usage_span_attributes(event, accounting_mode),
     ));
     let attributes = [
         KeyValue::new("llmctl.model", event.model.clone()),
@@ -4566,6 +4732,74 @@ data: [DONE]
         let status = readiness_status_for(&Config::default(), true, true);
         assert_eq!(status["status"], "draining");
         assert_eq!(status["draining"], true);
+    }
+
+    #[test]
+    fn usage_span_attributes_align_with_gen_ai_semantic_conventions() {
+        let event = UsageEvent {
+            id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            at: Utc::now(),
+            model: "llama".to_string(),
+            actor: "alice".to_string(),
+            team: "platform".to_string(),
+            input_tokens: 11,
+            output_tokens: 13,
+            latency_ms: 42,
+            status: "ok".to_string(),
+        };
+
+        let attrs = usage_span_attributes(&event, "estimated");
+
+        assert_eq!(attrs["gen_ai.system"], json!("rs-llmctl"));
+        assert_eq!(attrs["gen_ai.operation.name"], json!("chat"));
+        assert_eq!(attrs["gen_ai.request.model"], json!("llama"));
+        assert_eq!(attrs["gen_ai.response.model"], json!("llama"));
+        assert_eq!(attrs["gen_ai.usage.input_tokens"], json!(11));
+        assert_eq!(attrs["gen_ai.usage.output_tokens"], json!(13));
+        // Existing llmctl-prefixed attributes must be preserved alongside the
+        // gen_ai.* alignment additions.
+        assert_eq!(attrs["llmctl.model"], json!("llama"));
+        assert_eq!(attrs["llmctl.token_accounting.mode"], json!("estimated"));
+    }
+
+    #[test]
+    fn webhook_payload_carries_usage_and_accounting_metadata() {
+        let event = UsageEvent {
+            id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            at: Utc::now(),
+            model: "llama".to_string(),
+            actor: "alice".to_string(),
+            team: "platform".to_string(),
+            input_tokens: 11,
+            output_tokens: 13,
+            latency_ms: 42,
+            status: "ok".to_string(),
+        };
+
+        let payload = webhook_payload(&event, "estimated");
+
+        assert_eq!(payload["type"], json!("llmctl.usage"));
+        assert_eq!(payload["request_id"], json!(event.request_id.to_string()));
+        assert_eq!(payload["model"], json!("llama"));
+        assert_eq!(payload["actor"], json!("alice"));
+        assert_eq!(payload["team"], json!("platform"));
+        assert_eq!(payload["input_tokens"], json!(11));
+        assert_eq!(payload["output_tokens"], json!(13));
+        assert_eq!(payload["latency_ms"], json!(42));
+        assert_eq!(payload["status"], json!("ok"));
+        assert_eq!(payload["token_accounting_mode"], json!("estimated"));
+    }
+
+    #[test]
+    fn playground_html_wires_models_and_chat_endpoints_with_api_key_field() {
+        let html = playground_html();
+        assert!(html.contains("<title>"));
+        assert!(html.contains("/v1/models"));
+        assert!(html.contains("/v1/chat/completions"));
+        assert!(html.to_lowercase().contains("api key") || html.to_lowercase().contains("api-key"));
+        assert!(html.contains("<script"));
     }
 
     #[test]

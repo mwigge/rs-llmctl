@@ -541,7 +541,7 @@ pub fn canonical_native_chat_input(messages: &[NativeChatMessage]) -> String {
     input
 }
 
-fn message_content_text(message: &NativeChatMessage) -> String {
+pub fn message_content_text(message: &NativeChatMessage) -> String {
     match &message.content {
         Some(Value::String(content)) => content.clone(),
         Some(Value::Array(parts)) => parts

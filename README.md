@@ -78,6 +78,11 @@ pass/fail evidence without downloading models.
 ## What It Does
 
 - Serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints.
+- Ships a static, build-step-free chat page at `/playground` for poking at any
+  routed model from a browser with a model picker and a bearer API-key field.
+- Screens inbound chat messages with regex/phrase-based guardrails — PII
+  detection/redaction and prompt-injection ("jailbreak") phrase filtering —
+  with flag/redact/block actions and audit-trail findings.
 - Documents a separate `rs-llmctl-client` Rust SDK crate for application code,
   including client-managed sessions, client-side tool loops, streaming, and
   non-secret metadata.
@@ -582,6 +587,32 @@ server-certificate TLS and document the certificate source, rotation owner, and
 evidence URL. Client-certificate mTLS remains an edge/service-mesh control and
 should be recorded in `security.tls-termination`.
 
+### Guardrails
+
+Inbound chat messages can be screened by lightweight, regex/phrase-based
+guardrails before they reach a model — no external moderation service, zero
+added network calls:
+
+```toml
+[guardrails.pii]
+action = "redact"          # off | flag | redact | block
+categories = ["email", "credit-card", "ssn", "phone", "api-key"]
+
+[guardrails.jailbreak]
+action = "flag"            # off | flag | block
+phrases = ["additional phrase to match"]
+```
+
+PII detection covers email addresses, phone numbers, credit-card numbers,
+SSNs, and common API-key shapes (`sk-…`, `ghp_…`, `xox…`, etc.); jailbreak
+detection matches a built-in list of prompt-injection phrases plus any
+operator-supplied additions. `redact` replaces matched spans with
+`[REDACTED:<CATEGORY>]` markers in place before the request is forwarded;
+`block` rejects the request with HTTP 400 and records a `denied` audit event;
+`flag` records a `flagged` audit event and lets the request through unchanged.
+Findings are always written to the audit trail with category and match counts
+— never the matched text itself.
+
 ## Policy And Reporting
 
 Quota policy moves between environments as reviewed data:
@@ -663,7 +694,37 @@ OTel-oriented observability is configured through
 `observability.exporter.endpoint`, traces/metrics/logs switches, and
 environment-backed headers. Use `env:` for collector credentials. Runtime
 events emit OTel-friendly signals for request routing, audit, quota, usage,
-resource snapshots, native runtime status, and drift observations.
+resource snapshots, native runtime status, and drift observations. Usage spans
+carry GenAI semantic-convention attributes (`gen_ai.system`,
+`gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.response.model`,
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) alongside the
+existing `llmctl.*` attributes, so generic GenAI-aware OTel consumers can
+group and chart `rs-llmctl` spans without custom mapping.
+
+Two ecosystem integrations build on that foundation:
+
+```toml
+# Send OTel data straight to a Langfuse project — derives the OTLP/HTTP
+# endpoint and HTTP Basic auth header from project keys when no explicit
+# observability.exporter.endpoint is set.
+[observability.langfuse]
+enabled = true
+host = "https://cloud.langfuse.com"
+public-key = "env:LANGFUSE_PUBLIC_KEY"
+secret-key = "env:LANGFUSE_SECRET_KEY"
+
+# Fire a fire-and-forget HTTP callback after every completion, carrying the
+# same usage/lineage metadata as the audit trail — for ecosystems (chat ops,
+# dashboards, ticketing) that consume callbacks rather than OTLP.
+[observability.webhook]
+enabled = true
+url = "https://hooks.example.internal/llmctl-usage"
+headers = { "Authorization" = "env:LLMCTL_WEBHOOK_TOKEN" }
+timeout-ms = 5000
+```
+
+The webhook never blocks or fails the in-flight request — delivery runs on a
+background task and failures are logged at `warn`, not surfaced to the caller.
 
 Data movement is explicit and schema-versioned:
 

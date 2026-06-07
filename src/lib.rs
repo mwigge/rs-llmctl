@@ -22,6 +22,7 @@ pub mod audit;
 pub mod config;
 pub mod contracts;
 pub mod data_fabric;
+pub mod guardrails;
 pub mod integrations;
 pub mod model;
 pub mod native;
