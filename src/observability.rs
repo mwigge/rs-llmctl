@@ -3,11 +3,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge};
-use opentelemetry::trace::{Span, Status, Tracer};
+use opentelemetry::propagation::Injector;
+use opentelemetry::trace::{Span, Status, Tracer, TracerProvider as _};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,10 @@ use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
+
+static GLOBAL_TRACER_PROVIDER_REGISTERED: OnceLock<()> = OnceLock::new();
+static GLOBAL_METER_PROVIDER_REGISTERED: OnceLock<()> = OnceLock::new();
+static TRACING_SUBSCRIBER_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 pub const REDACTED_ATTRIBUTE_VALUE: &str = "[REDACTED]";
 
@@ -87,7 +93,10 @@ impl TelemetryRuntime {
                 .with_resource(resource.clone())
                 .with_batch_exporter(exporter)
                 .build();
-            global::set_tracer_provider(provider.clone());
+            GLOBAL_TRACER_PROVIDER_REGISTERED.get_or_init(|| {
+                global::set_tracer_provider(provider.clone());
+                global::set_text_map_propagator(TraceContextPropagator::new());
+            });
             runtime.tracer_provider = Some(provider);
         }
 
@@ -98,7 +107,9 @@ impl TelemetryRuntime {
                 .with_resource(resource.clone())
                 .with_periodic_exporter(exporter)
                 .build();
-            global::set_meter_provider(provider.clone());
+            GLOBAL_METER_PROVIDER_REGISTERED.get_or_init(|| {
+                global::set_meter_provider(provider.clone());
+            });
             runtime.meter_provider = Some(provider);
         }
 
@@ -141,6 +152,11 @@ impl TelemetryRuntime {
         };
         let mut layers = vec![fmt_layer];
 
+        if let Some(provider) = &self.tracer_provider {
+            let tracer = provider.tracer(crate::SERVICE_NAME);
+            layers.push(tracing_opentelemetry::layer().with_tracer(tracer).boxed());
+        }
+
         if let Some(logger_provider) = &self.logger_provider {
             layers.push(
                 opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
@@ -149,13 +165,43 @@ impl TelemetryRuntime {
                 .boxed(),
             );
         }
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(layers)
-            .try_init()
-            .context("install tracing subscriber")?;
+        if TRACING_SUBSCRIBER_INITIALIZED.get().is_none() {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(layers)
+                .try_init()
+                .context("install tracing subscriber")?;
+            let _ = TRACING_SUBSCRIBER_INITIALIZED.set(());
+        }
         Ok(())
     }
+}
+
+struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
+/// Inject the active span's W3C `traceparent` (and `tracestate`) header into a
+/// reqwest request builder. When no active span or propagator is present the
+/// builder is returned unchanged; callers do not need to gate on OTel config.
+pub fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let cx = opentelemetry::Context::current();
+    let mut headers = reqwest::header::HeaderMap::new();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut HeaderInjector(&mut headers));
+    });
+    headers
+        .iter()
+        .fold(builder, |b, (name, value)| b.header(name, value))
 }
 
 fn telemetry_resource(plan: &ObservabilityPlan) -> Resource {
@@ -277,11 +323,15 @@ fn build_log_exporter(
 /// Translate Langfuse project credentials into an OTLP/HTTP exporter aimed at
 /// Langfuse's `/api/public/otel` ingestion endpoint, authenticated with HTTP
 /// Basic auth (`base64(public_key:secret_key)`) — the scheme Langfuse expects
-/// from generic OTLP producers. Returns `None` when disabled or incomplete,
+/// from generic OTLP producers. Returns `Ok(None)` when disabled or incomplete,
 /// so callers can fall back to the explicit exporter configuration.
-pub fn langfuse_otlp_exporter(cfg: &LangfuseExporterConfig) -> Option<Exporter> {
+///
+/// # Errors
+/// Returns an error if the configured host is not a valid http/https URL, which
+/// prevents path-injection attacks via a crafted host value.
+pub fn langfuse_otlp_exporter(cfg: &LangfuseExporterConfig) -> Result<Option<Exporter>> {
     if !cfg.enabled {
-        return None;
+        return Ok(None);
     }
     let host = cfg
         .host
@@ -292,8 +342,27 @@ pub fn langfuse_otlp_exporter(cfg: &LangfuseExporterConfig) -> Option<Exporter> 
     let public_key = cfg.public_key.as_deref().unwrap_or("").trim();
     let secret_key = cfg.secret_key.as_deref().unwrap_or("").trim();
     if host.is_empty() || public_key.is_empty() || secret_key.is_empty() {
-        return None;
+        return Ok(None);
     }
+
+    // Parse the configured host to extract only scheme+authority — reject embedded paths
+    // that could redirect OTLP traffic to an arbitrary endpoint.
+    let parsed_host =
+        url::Url::parse(host).with_context(|| format!("invalid langfuse host: {host:?}"))?;
+    anyhow::ensure!(
+        matches!(parsed_host.scheme(), "http" | "https"),
+        "langfuse host must use http or https scheme"
+    );
+    let hostname = parsed_host
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("langfuse host has no hostname"))?;
+    let origin = format!("{}://{}", parsed_host.scheme(), hostname);
+    let origin = if let Some(port) = parsed_host.port() {
+        format!("{origin}:{port}")
+    } else {
+        origin
+    };
+    let endpoint = format!("{origin}/api/public/otel");
 
     let mut headers = BTreeMap::new();
     headers.insert(
@@ -301,12 +370,12 @@ pub fn langfuse_otlp_exporter(cfg: &LangfuseExporterConfig) -> Option<Exporter> 
         langfuse_basic_auth_header(public_key, secret_key),
     );
 
-    Some(Exporter::Otlp {
-        endpoint: format!("{host}/api/public/otel"),
+    Ok(Some(Exporter::Otlp {
+        endpoint,
         protocol: OtlpProtocol::HttpProtobuf,
         headers,
         timeout_ms: ObservabilityExporterConfig::default().timeout_ms,
-    })
+    }))
 }
 
 fn langfuse_basic_auth_header(public_key: &str, secret_key: &str) -> String {
@@ -316,7 +385,114 @@ fn langfuse_basic_auth_header(public_key: &str, secret_key: &str) -> String {
     format!("Basic {}", STANDARD.encode(credentials))
 }
 
+// DNS-based IMDS hostnames. IP-based IMDS addresses (169.254.169.254, fd00:ec2::254, etc.)
+// are covered by `is_blocked_endpoint_ip` via range checks and do not need to appear here.
+const SSRF_BLOCKED_METADATA_HOSTS: &[&str] =
+    &["metadata.google.internal", "metadata.goog", "instance-data"];
+
+/// Validate that an HTTP endpoint URL is safe to use.
+///
+/// Rejects non-http/https schemes, embedded credentials (userinfo), known cloud
+/// instance metadata DNS hostnames, and all non-routable IP ranges (loopback,
+/// link-local, private, shared address space, and IPv6 ULA/link-local) to
+/// prevent SSRF exfiltration of trace data or webhook payloads.
+///
+/// # Errors
+/// Returns an error if the URL is malformed, uses a non-http/https scheme,
+/// contains credentials, or targets a non-routable or blocked address.
+pub fn validate_http_endpoint(endpoint: &str) -> Result<()> {
+    let parsed = url::Url::parse(endpoint.trim())
+        .with_context(|| format!("invalid endpoint URL: {endpoint:?}"))?;
+
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "endpoint scheme must be http or https, got {:?}",
+        parsed.scheme()
+    );
+
+    // Reject credentials embedded in the URL — no legitimate OTLP/webhook URL needs them,
+    // and userinfo can be used to smuggle a blocked hostname as the "password".
+    anyhow::ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "endpoint URL must not contain credentials (user:pass@ form)"
+    );
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("endpoint URL must include a host"))?;
+    let host_lower = host.to_ascii_lowercase();
+
+    // Block known cloud metadata DNS hostnames.
+    for &blocked in SSRF_BLOCKED_METADATA_HOSTS {
+        anyhow::ensure!(
+            host_lower != blocked,
+            "endpoint host {host:?} is not permitted"
+        );
+    }
+
+    // Block loopback, link-local, private, and unspecified IP ranges.
+    if let Some(ip) = parsed.host().and_then(|h| match h {
+        url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    }) {
+        anyhow::ensure!(
+            !is_blocked_endpoint_ip(ip),
+            "endpoint IP {ip} is not routable (loopback, link-local, or private address)"
+        );
+    }
+
+    Ok(())
+}
+
+fn is_blocked_endpoint_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()           // 127.0.0.0/8
+                || v4.is_link_local()  // 169.254.0.0/16
+                || v4.is_private()     // 10/8, 172.16/12, 192.168/16
+                || v4.is_unspecified() // 0.0.0.0
+                || is_shared_address_space(v4) // 100.64.0.0/10 (RFC 6598, incl. Alibaba 100.100.100.200)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()                // ::1
+                || v6.is_unspecified()      // ::
+                || is_ipv6_link_local(v6)   // fe80::/10
+                || is_ipv6_unique_local(v6) // fc00::/7 (includes fd00:ec2::254)
+        }
+    }
+}
+
+/// Returns true if the IPv4 address falls within the RFC 6598 shared address
+/// space 100.64.0.0/10, which covers the Alibaba Cloud IMDS at 100.100.100.200.
+fn is_shared_address_space(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xC0) == 64
+}
+
+/// Returns true if the IPv6 address falls within the link-local range `fe80::/10`.
+///
+/// `Ipv6Addr::is_unicast_link_local()` is not yet stable, so the check is
+/// implemented manually.
+fn is_ipv6_link_local(ip: std::net::Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Returns true if the IPv6 address falls within the unique-local range
+/// `fc00::/7`, which covers `fd00:ec2::254` and all other ULA addresses.
+///
+/// `Ipv6Addr::is_unique_local()` is not yet stable, so the check is
+/// implemented manually.
+fn is_ipv6_unique_local(ip: std::net::Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
 impl ObservabilityPlan {
+    /// Build an `ObservabilityPlan` from a configuration value.
+    ///
+    /// # Errors
+    /// Returns an error if the OTLP endpoint URL fails SSRF validation or if
+    /// the exporter timeout is zero.
     pub fn from_config(cfg: &Config) -> Result<Self> {
         let observability = &cfg.observability;
         let endpoint = observability
@@ -326,13 +502,23 @@ impl ObservabilityPlan {
             .or_else(|| observability.otlp_endpoint.clone());
 
         let exporter = match endpoint {
-            Some(endpoint) if !endpoint.trim().is_empty() => Exporter::Otlp {
-                endpoint,
-                protocol: observability.exporter.protocol,
-                headers: observability.exporter.headers.clone(),
-                timeout_ms: observability.exporter.timeout_ms,
-            },
-            _ => langfuse_otlp_exporter(&observability.langfuse).unwrap_or(Exporter::None),
+            Some(endpoint) if !endpoint.trim().is_empty() => {
+                validate_http_endpoint(&endpoint)?;
+                Exporter::Otlp {
+                    endpoint,
+                    protocol: observability.exporter.protocol,
+                    headers: observability.exporter.headers.clone(),
+                    timeout_ms: observability.exporter.timeout_ms,
+                }
+            }
+            _ => {
+                let exporter =
+                    langfuse_otlp_exporter(&observability.langfuse)?.unwrap_or(Exporter::None);
+                if let Exporter::Otlp { ref endpoint, .. } = exporter {
+                    validate_http_endpoint(endpoint)?;
+                }
+                exporter
+            }
         };
 
         anyhow::ensure!(
@@ -561,6 +747,26 @@ fn server_draining_gauge() -> &'static Gauge<u64> {
     })
 }
 
+pub fn genai_input_tokens_counter() -> &'static Counter<u64> {
+    static COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .u64_counter("gen_ai.usage.input_tokens")
+            .with_description("Input tokens per GenAI semantic conventions")
+            .build()
+    })
+}
+
+pub fn genai_output_tokens_counter() -> &'static Counter<u64> {
+    static COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .u64_counter("gen_ai.usage.output_tokens")
+            .with_description("Output tokens per GenAI semantic conventions")
+            .build()
+    })
+}
+
 fn telemetry_key_values(event: &RuntimeTelemetryEvent) -> Vec<KeyValue> {
     let mut attributes = vec![
         KeyValue::new("llmctl.telemetry.name", event.name.as_str()),
@@ -670,7 +876,9 @@ mod tests {
             secret_key: Some("sk-lf-xyz".to_string()),
         };
 
-        let exporter = langfuse_otlp_exporter(&cfg).expect("langfuse exporter should be derived");
+        let exporter = langfuse_otlp_exporter(&cfg)
+            .expect("langfuse exporter result should be Ok")
+            .expect("langfuse exporter should be derived");
         match exporter {
             Exporter::Otlp {
                 endpoint,
@@ -691,7 +899,9 @@ mod tests {
 
     #[test]
     fn langfuse_exporter_is_none_when_disabled_or_missing_keys() {
-        assert!(langfuse_otlp_exporter(&LangfuseExporterConfig::default()).is_none());
+        assert!(langfuse_otlp_exporter(&LangfuseExporterConfig::default())
+            .expect("disabled exporter should be Ok")
+            .is_none());
 
         let missing_secret = LangfuseExporterConfig {
             enabled: true,
@@ -699,7 +909,9 @@ mod tests {
             public_key: Some("pk-lf-abc".to_string()),
             secret_key: None,
         };
-        assert!(langfuse_otlp_exporter(&missing_secret).is_none());
+        assert!(langfuse_otlp_exporter(&missing_secret)
+            .expect("missing secret should be Ok(None)")
+            .is_none());
 
         let missing_host = LangfuseExporterConfig {
             enabled: true,
@@ -707,7 +919,30 @@ mod tests {
             public_key: Some("pk-lf-abc".to_string()),
             secret_key: Some("sk-lf-xyz".to_string()),
         };
-        assert!(langfuse_otlp_exporter(&missing_host).is_none());
+        assert!(langfuse_otlp_exporter(&missing_host)
+            .expect("missing host should be Ok(None)")
+            .is_none());
+    }
+
+    #[test]
+    fn langfuse_exporter_rejects_host_with_injected_path() {
+        // A host value with an embedded path must not silently redirect OTLP traffic.
+        let cfg = LangfuseExporterConfig {
+            enabled: true,
+            host: Some("https://legit.langfuse.com/injected-path".to_string()),
+            public_key: Some("pk-lf-abc".to_string()),
+            secret_key: Some("sk-lf-xyz".to_string()),
+        };
+        let exporter = langfuse_otlp_exporter(&cfg)
+            .expect("parse should succeed")
+            .expect("should produce an exporter");
+        // The endpoint must use only the origin — the injected path must be stripped.
+        match exporter {
+            Exporter::Otlp { endpoint, .. } => {
+                assert_eq!(endpoint, "https://legit.langfuse.com/api/public/otel");
+            }
+            Exporter::None => panic!("expected an OTLP exporter"),
+        }
     }
 
     #[test]
@@ -824,5 +1059,164 @@ mod tests {
         assert_eq!(sanitized.get("model.path"), Some(&json!("[REDACTED]")));
         assert_eq!(sanitized.get("route"), Some(&json!("/v1/chat/completions")));
         assert_eq!(sanitized.get("quota.allowed"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn inject_trace_context_is_noop_with_no_active_span() {
+        let client = reqwest::Client::new();
+        let builder = client.get("http://localhost/");
+        let result = inject_trace_context(builder);
+        // Should return without panic; we verify by successfully building the request.
+        let request = result
+            .build()
+            .expect("request builds after inject_trace_context");
+        assert!(!request.headers().contains_key("traceparent"));
+    }
+
+    #[test]
+    fn install_plan_with_no_exporter_succeeds_without_otel_layer() {
+        let plan = ObservabilityPlan {
+            service_name: "test".to_string(),
+            service_version: None,
+            environment: None,
+            traces_enabled: false,
+            metrics_enabled: false,
+            logs_enabled: false,
+            resource_attributes: BTreeMap::new(),
+            exporter: Exporter::None,
+        };
+        let runtime = TelemetryRuntime::from_plan(&plan).expect("from_plan with None exporter");
+        assert!(runtime.tracer_provider.is_none());
+        assert!(runtime.meter_provider.is_none());
+        assert!(runtime.logger_provider.is_none());
+    }
+
+    #[test]
+    fn validate_http_endpoint_accepts_http_and_https() {
+        assert!(validate_http_endpoint("http://otel-collector:4318").is_ok());
+        assert!(validate_http_endpoint("https://ingest.signoz.io:443").is_ok());
+        assert!(validate_http_endpoint("https://collector.internal:4318/v1/traces").is_ok());
+    }
+
+    #[test]
+    fn validate_http_endpoint_rejects_non_http_scheme() {
+        let err = validate_http_endpoint("file:///etc/secrets/dump").unwrap_err();
+        assert!(err.to_string().contains("file"), "error: {err}");
+
+        assert!(validate_http_endpoint("grpc://collector:4317").is_err());
+        assert!(validate_http_endpoint("ftp://collector:21").is_err());
+    }
+
+    #[test]
+    fn validate_http_endpoint_rejects_missing_scheme() {
+        assert!(validate_http_endpoint("collector.internal:4318").is_err());
+        assert!(validate_http_endpoint("/etc/otel.sock").is_err());
+    }
+
+    #[test]
+    fn validate_http_endpoint_blocks_aws_azure_gcp_imds() {
+        // 169.254.169.254 is link-local and is now blocked by IP range check.
+        let err = validate_http_endpoint("http://169.254.169.254/latest/meta-data").unwrap_err();
+        assert!(err.to_string().contains("169.254.169.254"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_http_endpoint_blocks_gcp_metadata_hostname() {
+        let err = validate_http_endpoint("http://metadata.google.internal/computeMetadata/v1/")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("metadata.google.internal"),
+            "error: {err}"
+        );
+
+        assert!(validate_http_endpoint("http://metadata.goog/").is_err());
+        assert!(validate_http_endpoint("http://instance-data/").is_err());
+    }
+
+    #[test]
+    fn validate_http_endpoint_block_is_case_insensitive() {
+        assert!(validate_http_endpoint("http://METADATA.GOOG/").is_err());
+        assert!(validate_http_endpoint("http://Metadata.Google.Internal/").is_err());
+        assert!(validate_http_endpoint("HTTP://169.254.169.254/").is_err());
+    }
+
+    #[test]
+    fn validate_http_endpoint_standalone_without_config() {
+        assert!(validate_http_endpoint("http://169.254.169.254/").is_err());
+        assert!(validate_http_endpoint("https://collector.internal:4318").is_ok());
+    }
+
+    #[test]
+    fn validate_http_endpoint_handles_ipv6_bracketed_address() {
+        // Loopback IPv6 must be rejected.
+        assert!(validate_http_endpoint("http://[::1]:4318").is_err());
+        // Non-special global unicast IPv6 must be accepted.
+        assert!(validate_http_endpoint("http://[2001:db8::1]:4318").is_ok());
+        // ULA (fc00::/7) must be rejected.
+        assert!(validate_http_endpoint("http://[fd00:ec2::254]/latest").is_err());
+        assert!(validate_http_endpoint("http://[fc00::1]/path").is_err());
+    }
+
+    #[test]
+    fn validate_http_endpoint_rejects_userinfo_in_url() {
+        // Userinfo can smuggle a blocked host as the "password" field.
+        assert!(validate_http_endpoint("https://x:@169.254.169.254/meta").is_err());
+        assert!(validate_http_endpoint("https://user:pass@internal.service/").is_err());
+        assert!(validate_http_endpoint("http://admin@localhost/").is_err());
+    }
+
+    #[test]
+    fn validate_http_endpoint_rejects_loopback_and_private_ips() {
+        assert!(validate_http_endpoint("http://127.0.0.1:4318").is_err());
+        assert!(validate_http_endpoint("http://[::1]:4318").is_err());
+        assert!(validate_http_endpoint("http://0.0.0.0:4318").is_err());
+        assert!(validate_http_endpoint("http://10.0.0.1:4318").is_err());
+        assert!(validate_http_endpoint("http://192.168.1.1:4318").is_err());
+        assert!(validate_http_endpoint("http://172.16.0.1:4318").is_err());
+        assert!(validate_http_endpoint("http://100.100.100.200:4318").is_err()); // Alibaba IMDS
+        assert!(validate_http_endpoint("http://169.254.1.1:4318").is_err()); // link-local (not just .169.254)
+        assert!(validate_http_endpoint("http://[fd00:ec2::254]:4318").is_err());
+        assert!(validate_http_endpoint("http://[fc00::1]:4318").is_err());
+        assert!(validate_http_endpoint("http://[fe80::1]:4318").is_err()); // IPv6 link-local
+    }
+
+    #[test]
+    fn from_config_rejects_blocked_langfuse_host() {
+        use crate::config::{
+            LangfuseExporterConfig, ObservabilityConfig, ObservabilityExporterConfig,
+        };
+        use std::collections::BTreeMap;
+
+        // Build a minimal Config with a Langfuse host that resolves to a blocked address.
+        // We use a host that starts with the metadata IP so the derived OTLP endpoint
+        // will be rejected by validate_http_endpoint.
+        let mut cfg = Config::default();
+        cfg.observability = ObservabilityConfig {
+            otlp_endpoint: None,
+            service_name: None,
+            service_version: None,
+            environment: None,
+            traces_enabled: true,
+            metrics_enabled: true,
+            logs_enabled: true,
+            resource_attributes: BTreeMap::new(),
+            exporter: ObservabilityExporterConfig {
+                endpoint: None,
+                ..ObservabilityExporterConfig::default()
+            },
+            langfuse: LangfuseExporterConfig {
+                enabled: true,
+                host: Some("http://169.254.169.254".to_string()),
+                public_key: Some("pk-lf-test".to_string()),
+                secret_key: Some("sk-lf-test".to_string()),
+            },
+            webhook: crate::config::WebhookExporterConfig::default(),
+        };
+
+        let result = ObservabilityPlan::from_config(&cfg);
+        assert!(
+            result.is_err(),
+            "expected SSRF block for langfuse host pointing to IMDS"
+        );
     }
 }
