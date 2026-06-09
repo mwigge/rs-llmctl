@@ -6,7 +6,8 @@ use crate::config::{
 use crate::guardrails;
 use crate::native;
 use crate::observability::{
-    emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
+    emit_runtime_telemetry, inject_trace_context, RuntimeTelemetryEvent, TelemetryEventName,
+    TelemetrySignal,
 };
 use crate::quota::{check_quota, matching_quota_policies, quota_is_subject_scoped, Principal};
 use crate::rag::{lexical_search, SearchDocument};
@@ -1391,6 +1392,7 @@ async fn native_embedding_response(
             latency_ms: elapsed_ms(started),
             status: usage_status,
             accounting_mode: token_accounting_label(&native_response.usage.accounting_mode),
+            gen_ai_system: gen_ai_system_for_provider(None),
         },
     )
     .await;
@@ -1812,6 +1814,7 @@ async fn chat_completions(
                         latency_ms: elapsed_ms(started),
                         status: usage_status,
                         accounting_mode: "none",
+                        gen_ai_system: gen_ai_system_for_provider(None),
                     },
                 )
                 .await;
@@ -1912,6 +1915,7 @@ async fn native_chat_response(
             latency_ms: elapsed_ms(context.started),
             status: "ok",
             accounting_mode: token_accounting_label(&native_response.usage.accounting_mode),
+            gen_ai_system: gen_ai_system_for_provider(None),
         },
     )
     .await;
@@ -1984,6 +1988,7 @@ async fn native_chat_stream_response(
             latency_ms: elapsed_ms(context.started),
             status: "ok",
             accounting_mode: token_accounting_label(&native_response.usage.accounting_mode),
+            gen_ai_system: gen_ai_system_for_provider(None),
         },
     )
     .await;
@@ -2091,6 +2096,7 @@ async fn native_chat_runtime_error(
             latency_ms: elapsed_ms(context.started),
             status: status_text,
             accounting_mode: "none",
+            gen_ai_system: gen_ai_system_for_provider(None),
         },
     )
     .await;
@@ -2129,6 +2135,7 @@ async fn native_chat_runtime_not_ready(
             latency_ms: elapsed_ms(context.started),
             status: "native_runtime_not_ready",
             accounting_mode: "none",
+            gen_ai_system: gen_ai_system_for_provider(None),
         },
     )
     .await;
@@ -2283,11 +2290,13 @@ async fn dispatch_chat_request(
             continue;
         }
         let upstream = format!("{upstream_base}/v1/chat/completions");
-        let mut request_builder = state
-            .client
-            .post(upstream)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body);
+        let mut request_builder = inject_trace_context(
+            state
+                .client
+                .post(upstream)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body),
+        );
         if let Some(api_key) = target.api_key {
             request_builder = request_builder.bearer_auth(api_key);
         }
@@ -2503,6 +2512,7 @@ async fn json_upstream(
             latency_ms,
             status: status_text,
             accounting_mode: "upstream",
+            gen_ai_system: gen_ai_system_for_provider(external_provider.as_ref()),
         },
     )
     .await;
@@ -2558,6 +2568,7 @@ async fn stream_upstream(
                 latency_ms: elapsed_ms(started),
                 status: "upstream_error",
                 accounting_mode: "none",
+                gen_ai_system: gen_ai_system_for_provider(external_provider.as_ref()),
             },
         )
         .await;
@@ -2612,6 +2623,7 @@ async fn stream_upstream(
                             latency_ms: elapsed_ms(started),
                             status: "timeout",
                             accounting_mode: "upstream",
+                            gen_ai_system: gen_ai_system_for_provider(external_provider.as_ref()),
                         },
                     )
                     .await;
@@ -2660,6 +2672,9 @@ async fn stream_upstream(
                                     latency_ms: elapsed_ms(started),
                                     status: "stream_error",
                                     accounting_mode: "upstream",
+                                    gen_ai_system: gen_ai_system_for_provider(
+                                        external_provider.as_ref(),
+                                    ),
                                 },
                             )
                             .await;
@@ -2701,6 +2716,7 @@ async fn stream_upstream(
                             latency_ms: elapsed_ms(started),
                             status: "stream_error",
                             accounting_mode: "upstream",
+                            gen_ai_system: gen_ai_system_for_provider(external_provider.as_ref()),
                         },
                     )
                     .await;
@@ -2741,6 +2757,7 @@ async fn stream_upstream(
                 latency_ms: elapsed_ms(started),
                 status: stream_status(input_tokens, output_tokens),
                 accounting_mode: "upstream",
+                gen_ai_system: gen_ai_system_for_provider(external_provider.as_ref()),
             },
         )
         .await;
@@ -2838,6 +2855,7 @@ async fn record_upstream_failure(
             latency_ms: elapsed_ms(started),
             status,
             accounting_mode: "none",
+            gen_ai_system: gen_ai_system_for_provider(None),
         },
     )
     .await;
@@ -3629,6 +3647,7 @@ struct UsageRecordInput<'a> {
     latency_ms: u64,
     status: &'a str,
     accounting_mode: &'a str,
+    gen_ai_system: &'a str,
 }
 
 async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
@@ -3647,22 +3666,29 @@ async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
     if let Err(err) = state.storage.insert_usage_event(&event).await {
         tracing::warn!(error = %err, "failed to record usage event");
     }
-    record_usage_telemetry(&event, input.accounting_mode);
+    record_usage_telemetry(&event, input.accounting_mode, input.gen_ai_system);
     dispatch_usage_webhook(state, &event, input.accounting_mode);
 }
 
-/// GenAI semantic-convention name for this service — surfaced as `gen_ai.system`
-/// on every usage span so downstream OTel consumers (Langfuse, generic GenAI
-/// dashboards) can group spans emitted by rs-llmctl regardless of which model
-/// served the request.
-const GEN_AI_SYSTEM: &str = "rs-llmctl";
+fn gen_ai_system_for_provider(provider: Option<&ResolvedExternalProvider>) -> &'static str {
+    match provider.map(|p| &p.kind) {
+        None => "llmctl.native",
+        Some(ExternalProviderKind::OpenAiCompatible) => "openai",
+        Some(ExternalProviderKind::VertexAi) => "vertex_ai",
+        Some(ExternalProviderKind::OpenRouter) => "openrouter",
+    }
+}
 
 /// Build the attribute set for a usage span: the existing `llmctl.*` attributes
 /// plus the OTel GenAI semantic-convention attributes
 /// (`gen_ai.system`, `gen_ai.operation.name`, `gen_ai.request.model`,
 /// `gen_ai.response.model`, `gen_ai.usage.*`) so traces align with the
 /// conventions Langfuse and other GenAI-aware OTel consumers expect.
-fn usage_span_attributes(event: &UsageEvent, accounting_mode: &str) -> BTreeMap<String, Value> {
+fn usage_span_attributes(
+    event: &UsageEvent,
+    accounting_mode: &str,
+    gen_ai_system: &str,
+) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
             "llmctl.request_id".to_string(),
@@ -3677,7 +3703,7 @@ fn usage_span_attributes(event: &UsageEvent, accounting_mode: &str) -> BTreeMap<
             "llmctl.token_accounting.mode".to_string(),
             json!(accounting_mode),
         ),
-        ("gen_ai.system".to_string(), json!(GEN_AI_SYSTEM)),
+        ("gen_ai.system".to_string(), json!(gen_ai_system)),
         ("gen_ai.operation.name".to_string(), json!("chat")),
         (
             "gen_ai.request.model".to_string(),
@@ -3736,6 +3762,11 @@ fn dispatch_usage_webhook(state: &ServerState, event: &UsageEvent, accounting_mo
         return;
     };
 
+    if let Err(err) = crate::observability::validate_http_endpoint(&url) {
+        tracing::warn!(url = %url, error = %err, "usage webhook URL rejected by SSRF guard");
+        return;
+    }
+
     let payload = webhook_payload(event, accounting_mode);
     let client = state.client.clone();
     let headers = webhook.headers.clone();
@@ -3762,12 +3793,12 @@ fn dispatch_usage_webhook(state: &ServerState, event: &UsageEvent, accounting_mo
     });
 }
 
-fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str) {
+fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str, gen_ai_system: &str) {
     emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
         TelemetrySignal::Span,
         TelemetryEventName::RequestRouting,
         Utc::now(),
-        usage_span_attributes(event, accounting_mode),
+        usage_span_attributes(event, accounting_mode, gen_ai_system),
     ));
     let attributes = [
         KeyValue::new("llmctl.model", event.model.clone()),
@@ -3807,6 +3838,9 @@ fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str) {
         .with_description("Output tokens reported by model workers")
         .build()
         .add(event.output_tokens, &attributes);
+    let genai_attributes = [KeyValue::new("gen_ai.system", gen_ai_system.to_string())];
+    crate::observability::genai_input_tokens_counter().add(event.input_tokens, &genai_attributes);
+    crate::observability::genai_output_tokens_counter().add(event.output_tokens, &genai_attributes);
     meter
         .u64_histogram("llmctl_request_latency_ms")
         .with_description("Model request latency in milliseconds")
@@ -4749,9 +4783,9 @@ data: [DONE]
             status: "ok".to_string(),
         };
 
-        let attrs = usage_span_attributes(&event, "estimated");
+        let attrs = usage_span_attributes(&event, "estimated", "openai");
 
-        assert_eq!(attrs["gen_ai.system"], json!("rs-llmctl"));
+        assert_eq!(attrs["gen_ai.system"], json!("openai"));
         assert_eq!(attrs["gen_ai.operation.name"], json!("chat"));
         assert_eq!(attrs["gen_ai.request.model"], json!("llama"));
         assert_eq!(attrs["gen_ai.response.model"], json!("llama"));
@@ -5337,5 +5371,68 @@ data: [DONE]
             family: Some("qwen3".to_string()),
             weight,
         }
+    }
+}
+
+#[cfg(test)]
+mod genai_semconv_tests {
+    use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn make_usage_event(input_tokens: u64, output_tokens: u64) -> UsageEvent {
+        UsageEvent {
+            id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            at: Utc::now(),
+            model: "test-model".to_string(),
+            actor: "test-actor".to_string(),
+            team: "test-team".to_string(),
+            input_tokens,
+            output_tokens,
+            latency_ms: 42,
+            status: "ok".to_string(),
+        }
+    }
+
+    #[test]
+    fn usage_span_attributes_include_genai_semconv_and_llmctl_attributes() {
+        let event = make_usage_event(100, 50);
+        let attrs = usage_span_attributes(&event, "exact", "vertex_ai");
+
+        // GenAI SemConv attributes present
+        assert_eq!(
+            attrs.get("gen_ai.system").and_then(|v| v.as_str()),
+            Some("vertex_ai")
+        );
+        assert_eq!(
+            attrs.get("gen_ai.request.model").and_then(|v| v.as_str()),
+            Some("test-model")
+        );
+        assert_eq!(
+            attrs
+                .get("gen_ai.usage.input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(100)
+        );
+        assert_eq!(
+            attrs
+                .get("gen_ai.usage.output_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(50)
+        );
+
+        // Existing llmctl attributes preserved (no regression)
+        assert!(attrs.contains_key("llmctl.model"));
+        assert!(attrs.contains_key("llmctl.request_id"));
+        assert!(attrs.contains_key("llmctl.latency_ms"));
+    }
+
+    #[test]
+    fn usage_span_attributes_has_no_cost_usd_when_pricing_unknown() {
+        let event = make_usage_event(100, 50);
+        let attrs = usage_span_attributes(&event, "exact", "vertex_ai");
+        // UsageEvent has no cost field; attribute must be absent, not zero
+        assert!(!attrs.contains_key("gen_ai.usage.cost_usd"));
     }
 }
