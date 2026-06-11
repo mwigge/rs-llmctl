@@ -225,12 +225,12 @@ else
   fi
 
   info "Downloading ${url}"
-  curl -fsSL "${url}" -o "${tmp}/rs-llmctl.tar.gz"
+  curl -fsSL "${url}" -o "${tmp}/rs-llmctl-${os}-${arch}.tar.gz"
   info "Downloading ${sums_url}"
   curl -fsSL "${sums_url}" -o "${tmp}/SHA256SUMS"
-  verify_archive_checksum "${tmp}/rs-llmctl.tar.gz" "${tmp}/SHA256SUMS"
+  verify_archive_checksum "${tmp}/rs-llmctl-${os}-${arch}.tar.gz" "${tmp}/SHA256SUMS"
   warn "verified archive checksum only; verify SHA256SUMS signature from the GitHub release before production installs when publisher authentication is required"
-  safe_extract_archive "${tmp}/rs-llmctl.tar.gz" "${extract_dir}"
+  safe_extract_archive "${tmp}/rs-llmctl-${os}-${arch}.tar.gz" "${extract_dir}"
 fi
 
 llmctl_bin=$(find_llmctl_binary "${extract_dir}")
