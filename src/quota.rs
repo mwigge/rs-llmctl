@@ -269,6 +269,22 @@ pub fn quota_is_subject_scoped(q: &QuotaConfig, principal: &Principal) -> bool {
     q.subject == principal.subject
 }
 
+/// The `Storage::with_quota_admission` lock scope for `principal`.
+///
+/// `check_quota` reads counts scoped to either `principal.team` or
+/// `principal.subject` depending on the matching policy. Keying the
+/// admission lock by team (falling back to subject when there is no team)
+/// keeps team-wide quotas correct under concurrent requests from different
+/// subjects in the same team, while letting unrelated teams admit requests
+/// fully in parallel instead of serializing on one global lock.
+pub fn quota_admission_scope(principal: &Principal) -> String {
+    if principal.team.is_empty() {
+        format!("subject:{}", principal.subject)
+    } else {
+        format!("team:{}", principal.team)
+    }
+}
+
 fn quota_scope_label(q: &QuotaConfig, principal: &Principal) -> String {
     if quota_is_subject_scoped(q, principal) {
         format!("subject {}", principal.subject)

@@ -9,7 +9,9 @@ use crate::observability::{
     emit_runtime_telemetry, inject_trace_context, RuntimeTelemetryEvent, TelemetryEventName,
     TelemetrySignal,
 };
-use crate::quota::{check_quota, matching_quota_policies, quota_is_subject_scoped, Principal};
+use crate::quota::{
+    check_quota, matching_quota_policies, quota_admission_scope, quota_is_subject_scoped, Principal,
+};
 use crate::rag::{lexical_search, SearchDocument};
 use crate::storage::{QuotaDecisionRecord, RequestLineageJoinRecord, Storage};
 use crate::worker::{
@@ -53,11 +55,13 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use uuid::Uuid;
 
+mod sse;
+use sse::{usage_tokens, SseUsageParser};
+
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 #[cfg(test)]
 const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_SLO_LATENCY_MS: u64 = 10_000;
-const MAX_SSE_USAGE_BUFFER_BYTES: usize = 1024 * 1024;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type NativeEngineRegistry = BTreeMap<String, Arc<dyn native::NativeEngine>>;
@@ -1046,69 +1050,35 @@ async fn native_embeddings(
         return response;
     }
     let started = Instant::now();
-    let principal = match authenticate_request(
+    let principal = match authenticate_with_chat_scope(
         &state,
         &headers,
-        auth_source_key(&state.cfg, &headers, connect_info),
-    ) {
+        connect_info,
+        request_id,
+        "embeddings",
+    )
+    .await
+    {
         Ok(principal) => principal,
-        Err(err) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                Principal::anonymous(),
-                "embeddings",
-                "unknown",
-                "denied",
-                json!({ "reason": err }),
-            )
-            .await;
-            return with_request_id(auth_error_response(err), request_id);
-        }
+        Err(response) => return response,
     };
-
-    if !principal.has_scope("chat") {
-        record_audit(
-            &state,
-            Some(request_id),
-            principal,
-            "embeddings",
-            "unknown",
-            "denied",
-            json!({ "reason": "missing chat scope" }),
-        )
-        .await;
-        return with_request_id(
-            error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "missing chat scope".to_string(),
-            ),
-            request_id,
-        );
-    }
 
     let request: EmbeddingRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
-            record_audit(
+            return audit_reject(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "embeddings",
                 "unknown",
                 "rejected",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "request body must be valid JSON".to_string(),
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    "bad_request",
-                    "request body must be valid JSON".to_string(),
-                ),
-                request_id,
-            );
         }
     };
 
@@ -1117,64 +1087,55 @@ async fn native_embeddings(
         .as_deref()
         .is_some_and(|format| format != "float")
     {
-        record_audit(
+        return audit_reject(
             &state,
-            Some(request_id),
+            request_id,
             principal,
             "embeddings",
             request.model,
             "rejected",
+            StatusCode::BAD_REQUEST,
+            "unsupported_encoding_format",
+            "native embeddings support only float encoding_format".to_string(),
             json!({ "reason": "native embeddings support only float encoding_format" }),
         )
         .await;
-        return with_request_id(
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "unsupported_encoding_format",
-                "native embeddings support only float encoding_format".to_string(),
-            ),
-            request_id,
-        );
     }
 
     let route = match resolve_model_route(&state.cfg, &request.model, request_id) {
         Ok(route) => route,
         Err(err) => {
-            record_audit(
+            let response = model_route_error_response(&err);
+            return audit_reject_response(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "embeddings",
                 request.model,
                 "rejected",
+                response,
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(model_route_error_response(&err), request_id);
         }
     };
 
     let embedding_selection = match native_embedding_selection(&state.cfg, &route) {
         Ok(selection) => selection,
         Err(err) => {
-            record_audit(
+            return audit_reject(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "embeddings",
                 route.requested_alias,
                 "rejected",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_embedding_model_unavailable",
+                err.clone(),
                 json!({ "reason": err }),
             )
             .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "native_embedding_model_unavailable",
-                    err,
-                ),
-                request_id,
-            );
         }
     };
 
@@ -1197,13 +1158,16 @@ async fn native_embeddings(
                 .get(&embedding_selection.model_alias)
                 .cloned()
             else {
-                record_audit(
+                return audit_reject(
                     &state,
-                    Some(request_id),
+                    request_id,
                     principal,
                     "embeddings",
                     route.requested_alias,
                     "error",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "native_embedding_model_unavailable",
+                    "semantic native embedding model is not loaded".to_string(),
                     json!({
                         "reason": "native_embedding_model_unavailable",
                         "runtime_backend": "candle-native",
@@ -1212,27 +1176,22 @@ async fn native_embeddings(
                     }),
                 )
                 .await;
-                return with_request_id(
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "native_embedding_model_unavailable",
-                        "semantic native embedding model is not loaded".to_string(),
-                    ),
-                    request_id,
-                );
             };
 
             match engine.embeddings(native_request).await {
                 Ok(response) => response,
                 Err(err) => {
                     tracing::warn!(error = %err, "native embedding runtime failed");
-                    record_audit(
+                    return audit_reject(
                         &state,
-                        Some(request_id),
+                        request_id,
                         principal,
                         "embeddings",
                         route.requested_alias,
                         "error",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "native_embedding_runtime_error",
+                        "native runtime failed to serve semantic embeddings".to_string(),
                         json!({
                             "reason": "native_embedding_runtime_error",
                             "runtime_backend": "candle-native",
@@ -1241,14 +1200,6 @@ async fn native_embeddings(
                         }),
                     )
                     .await;
-                    return with_request_id(
-                        error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "native_embedding_runtime_error",
-                            "native runtime failed to serve semantic embeddings".to_string(),
-                        ),
-                        request_id,
-                    );
                 }
             }
         }
@@ -1467,69 +1418,35 @@ async fn chat_completions(
         return response;
     }
     let started = Instant::now();
-    let principal = match authenticate_request(
+    let principal = match authenticate_with_chat_scope(
         &state,
         &headers,
-        auth_source_key(&state.cfg, &headers, connect_info),
-    ) {
+        connect_info,
+        request_id,
+        "chat.completions",
+    )
+    .await
+    {
         Ok(principal) => principal,
-        Err(err) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                Principal::anonymous(),
-                "chat.completions",
-                "unknown",
-                "denied",
-                json!({ "reason": err }),
-            )
-            .await;
-            return with_request_id(auth_error_response(err), request_id);
-        }
+        Err(response) => return response,
     };
-
-    if !principal.has_scope("chat") {
-        record_audit(
-            &state,
-            Some(request_id),
-            principal,
-            "chat.completions",
-            "unknown",
-            "denied",
-            json!({ "reason": "missing chat scope" }),
-        )
-        .await;
-        return with_request_id(
-            error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "missing chat scope".to_string(),
-            ),
-            request_id,
-        );
-    }
 
     let mut request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
-            record_audit(
+            return audit_reject(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "chat.completions",
                 "unknown",
                 "rejected",
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "request body must be valid JSON".to_string(),
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    "bad_request",
-                    "request body must be valid JSON".to_string(),
-                ),
-                request_id,
-            );
         }
     };
     let lineage = runtime_lineage_from_headers_and_metadata(&headers, request.metadata.as_ref());
@@ -1537,17 +1454,18 @@ async fn chat_completions(
     let route = match resolve_model_route(&state.cfg, &request.model, request_id) {
         Ok(route) => route,
         Err(err) => {
-            record_audit(
+            let response = model_route_error_response(&err);
+            return audit_reject_response(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "chat.completions",
                 request.model,
                 "rejected",
+                response,
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(model_route_error_response(&err), request_id);
         }
     };
     let model = route.requested_alias.clone();
@@ -1562,13 +1480,20 @@ async fn chat_completions(
         let verdict = guardrails::evaluate(&message_texts, &state.cfg.guardrails);
 
         if verdict.is_blocked() {
-            record_audit(
+            let message = format!(
+                "request blocked by guardrails: {}",
+                verdict.block_reasons.join(", ")
+            );
+            return audit_reject(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "chat.completions",
                 model,
                 "denied",
+                StatusCode::BAD_REQUEST,
+                "guardrail_blocked",
+                message,
                 json!({
                     "reason": "guardrail_violation",
                     "guardrails": verdict.block_reasons,
@@ -1576,17 +1501,6 @@ async fn chat_completions(
                 }),
             )
             .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    "guardrail_blocked",
-                    format!(
-                        "request blocked by guardrails: {}",
-                        verdict.block_reasons.join(", ")
-                    ),
-                ),
-                request_id,
-            );
         }
 
         if verdict.has_findings() {
@@ -1621,51 +1535,29 @@ async fn chat_completions(
         "chat.completions",
     )
     .await;
-    let quota_guard = match state.storage.quota_admission_guard().await {
-        Ok(guard) => guard,
-        Err(err) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                principal,
-                "chat.completions",
-                model,
-                "rejected",
-                json!({ "reason": err.to_string() }),
-            )
-            .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "quota_error",
-                    "quota admission is unavailable".to_string(),
-                ),
-                request_id,
-            );
-        }
-    };
-    let quota = match check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await {
+    let admission_scope = quota_admission_scope(&principal);
+    let quota = match state
+        .storage
+        .with_quota_admission(&admission_scope, || async {
+            check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await
+        })
+        .await
+    {
         Ok(decision) => decision,
         Err(err) => {
-            let _ = quota_guard.release().await;
-            record_audit(
+            return audit_reject(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "chat.completions",
                 model,
                 "rejected",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "quota_error",
+                "quota admission is unavailable".to_string(),
                 json!({ "reason": err.to_string() }),
             )
             .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "quota_error",
-                    "quota admission is unavailable".to_string(),
-                ),
-                request_id,
-            );
         }
     };
     record_quota_decision(
@@ -1677,29 +1569,22 @@ async fn chat_completions(
         json!({ "configured_quotas": state.cfg.quotas.len() }),
     )
     .await;
-    if let Err(err) = quota_guard.release().await {
-        tracing::warn!(error = %err, "failed to release quota admission lock");
-    }
 
     if !quota.allowed {
-        record_audit(
+        let reason = quota.reason.clone();
+        return audit_reject(
             &state,
-            Some(request_id),
+            request_id,
             principal,
             "chat.completions",
             model,
             "denied",
-            json!({ "reason": quota.reason }),
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota_exceeded",
+            quota.reason,
+            json!({ "reason": reason }),
         )
         .await;
-        return with_request_id(
-            error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "quota_exceeded",
-                quota.reason,
-            ),
-            request_id,
-        );
     }
 
     record_audit(
@@ -1724,24 +1609,19 @@ async fn chat_completions(
         Ok(permit) => permit,
         Err(AdmissionError::Busy) => {
             record_admission_busy_telemetry(&model, &principal, request.stream);
-            record_audit(
+            return audit_reject(
                 &state,
-                Some(request_id),
+                request_id,
                 principal,
                 "chat.completions",
                 model,
                 "denied",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_exceeded",
+                "server is busy; retry later".to_string(),
                 json!({ "reason": "admission_limit_exceeded" }),
             )
             .await;
-            return with_request_id(
-                error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limit_exceeded",
-                    "server is busy; retry later".to_string(),
-                ),
-                request_id,
-            );
         }
     };
 
@@ -3230,6 +3110,57 @@ fn auth_source_key(
         .unwrap_or_else(|| "unknown-source".to_string())
 }
 
+/// Shared prologue for `chat_completions` and `native_embeddings`:
+/// authenticates the request and checks for the `chat` scope, auditing and
+/// building the appropriate error response on either failure. Returns
+/// `Err(response)` so callers can `return` it directly.
+async fn authenticate_with_chat_scope(
+    state: &ServerState,
+    headers: &HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    request_id: Uuid,
+    action: &str,
+) -> std::result::Result<Principal, Response> {
+    let principal = match authenticate_request(
+        state,
+        headers,
+        auth_source_key(&state.cfg, headers, connect_info),
+    ) {
+        Ok(principal) => principal,
+        Err(err) => {
+            return Err(audit_reject_response(
+                state,
+                request_id,
+                Principal::anonymous(),
+                action,
+                "unknown",
+                "denied",
+                auth_error_response(err.clone()),
+                json!({ "reason": err }),
+            )
+            .await);
+        }
+    };
+
+    if !principal.has_scope("chat") {
+        return Err(audit_reject(
+            state,
+            request_id,
+            principal,
+            action,
+            "unknown",
+            "denied",
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "missing chat scope".to_string(),
+            json!({ "reason": "missing chat scope" }),
+        )
+        .await);
+    }
+
+    Ok(principal)
+}
+
 fn is_trusted_proxy(cfg: &Config, ip: IpAddr) -> bool {
     cfg.security
         .trusted_proxies
@@ -3238,9 +3169,13 @@ fn is_trusted_proxy(cfg: &Config, ip: IpAddr) -> bool {
 }
 
 fn trusted_proxy_matches(trusted: &str, ip: IpAddr) -> bool {
+    // Normalize IPv4-mapped IPv6 addresses (e.g. ::ffff:10.0.0.1) to their
+    // IPv4 form so a trusted proxy entry written as an IPv4 address/CIDR
+    // still matches connections reported via a dual-stack listener.
+    let ip = ip.to_canonical();
     let trusted = trusted.trim();
     if let Ok(exact) = trusted.parse::<IpAddr>() {
-        return exact == ip;
+        return exact.to_canonical() == ip;
     }
     let Some((network, prefix)) = trusted.split_once('/') else {
         return false;
@@ -3248,6 +3183,7 @@ fn trusted_proxy_matches(trusted: &str, ip: IpAddr) -> bool {
     let Ok(network) = network.parse::<IpAddr>() else {
         return false;
     };
+    let network = network.to_canonical();
     let Ok(prefix) = prefix.parse::<u8>() else {
         return false;
     };
@@ -3432,6 +3368,68 @@ async fn record_audit(
             ("llmctl.team".to_string(), json!(event.team.as_str())),
         ]),
     ));
+}
+
+/// Records an audit event for a rejected/denied request and turns it into the
+/// corresponding error response, in one call. This is the shared shape behind
+/// the many `record_audit(...).await; return with_request_id(error_response(...))`
+/// blocks in the chat and embeddings handlers.
+///
+/// The argument count is inherent to the data each audit entry + response
+/// needs (actor, action/resource/outcome triple, and status/code/message);
+/// splitting it into a config struct would just move the same fields one
+/// level up without making call sites clearer.
+#[allow(clippy::too_many_arguments)]
+async fn audit_reject(
+    state: &ServerState,
+    request_id: Uuid,
+    principal: Principal,
+    action: impl Into<String>,
+    resource: impl Into<String>,
+    outcome: impl Into<String>,
+    status: StatusCode,
+    code: &str,
+    message: String,
+    detail: Value,
+) -> Response {
+    audit_reject_response(
+        state,
+        request_id,
+        principal,
+        action,
+        resource,
+        outcome,
+        error_response(status, code, message),
+        detail,
+    )
+    .await
+}
+
+/// Like `audit_reject`, but for the rejection paths whose response is built by
+/// a helper other than `error_response` (e.g. `auth_error_response`,
+/// `model_route_error_response`).
+#[allow(clippy::too_many_arguments)]
+async fn audit_reject_response(
+    state: &ServerState,
+    request_id: Uuid,
+    principal: Principal,
+    action: impl Into<String>,
+    resource: impl Into<String>,
+    outcome: impl Into<String>,
+    response: Response,
+    detail: Value,
+) -> Response {
+    record_audit(
+        state,
+        Some(request_id),
+        principal,
+        action,
+        resource,
+        outcome,
+        detail,
+    )
+    .await;
+    with_request_id(response, request_id)
 }
 
 async fn record_swap_execution(
@@ -3872,84 +3870,6 @@ fn slo_status(status: &str) -> &'static str {
     } else {
         "error"
     }
-}
-
-fn usage_tokens(bytes: &[u8]) -> (u64, u64) {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return (0, 0);
-    };
-    usage_tokens_from_value(&value)
-}
-
-fn usage_tokens_from_value(value: &Value) -> (u64, u64) {
-    let Some(usage) = value.get("usage") else {
-        return (0, 0);
-    };
-    let input = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    (input, output)
-}
-
-#[derive(Debug, Default)]
-struct SseUsageParser {
-    buffer: String,
-}
-
-impl SseUsageParser {
-    fn push(&mut self, bytes: &[u8]) -> std::result::Result<(u64, u64), &'static str> {
-        let text = String::from_utf8_lossy(bytes);
-        self.buffer.push_str(&text);
-        if self.buffer.len() > MAX_SSE_USAGE_BUFFER_BYTES && !self.buffer.contains("\n\n") {
-            return Err("SSE usage parser buffer exceeded maximum frame size");
-        }
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-
-        while let Some(frame_end) = self.buffer.find("\n\n") {
-            if frame_end > MAX_SSE_USAGE_BUFFER_BYTES {
-                return Err("SSE usage parser buffer exceeded maximum frame size");
-            }
-            let frame = self.buffer[..frame_end].to_string();
-            self.buffer.drain(..frame_end + 2);
-            let (input, output) = sse_frame_usage_tokens(&frame);
-            input_tokens = input_tokens.saturating_add(input);
-            output_tokens = output_tokens.saturating_add(output);
-        }
-
-        Ok((input_tokens, output_tokens))
-    }
-}
-
-#[cfg(test)]
-fn sse_usage_tokens(bytes: &[u8]) -> (u64, u64) {
-    SseUsageParser::default().push(bytes).expect("valid SSE")
-}
-
-fn sse_frame_usage_tokens(frame: &str) -> (u64, u64) {
-    frame
-        .lines()
-        .filter_map(|line| line.trim_start().strip_prefix("data:"))
-        .map(str::trim)
-        .filter(|data| !data.is_empty() && *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-        .map(|value| usage_tokens_from_value(&value))
-        .fold(
-            (0u64, 0u64),
-            |(total_input, total_output), (input, output)| {
-                (
-                    total_input.saturating_add(input),
-                    total_output.saturating_add(output),
-                )
-            },
-        )
 }
 
 fn stream_status(input_tokens: u64, output_tokens: u64) -> &'static str {
@@ -4710,58 +4630,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_openai_usage_tokens() {
-        let body = br#"{"usage":{"prompt_tokens":11,"completion_tokens":13}}"#;
-        assert_eq!(usage_tokens(body), (11, 13));
-    }
-
-    #[test]
-    fn extracts_streaming_sse_usage_tokens() {
-        let chunk = br#"event: completion
-data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9}}
-
-data: [DONE]
-"#;
-
-        assert_eq!(sse_usage_tokens(chunk), (7, 9));
-        assert_eq!(stream_status(0, 0), "stream_unmetered");
-        assert_eq!(stream_status(7, 9), "ok");
-    }
-
-    #[test]
-    fn extracts_split_streaming_sse_usage_tokens() {
-        let mut parser = SseUsageParser::default();
-
-        assert_eq!(
-            parser.push(br#"data: {"choices":[],"usage":{"prompt_tokens":7"#),
-            Ok((0, 0))
-        );
-        assert_eq!(
-            parser.push(
-                br#","completion_tokens":9}}
-
-"#
-            ),
-            Ok((7, 9))
-        );
-    }
-
-    #[test]
-    fn sse_usage_parser_rejects_unbounded_partial_frames() {
-        let mut parser = SseUsageParser::default();
-        let oversized = vec![b'a'; MAX_SSE_USAGE_BUFFER_BYTES + 1];
-        assert!(parser.push(&oversized).is_err());
-    }
-
-    #[test]
-    fn sse_usage_parser_rejects_oversized_complete_frames() {
-        let mut parser = SseUsageParser::default();
-        let mut oversized = vec![b'a'; MAX_SSE_USAGE_BUFFER_BYTES + 1];
-        oversized.extend_from_slice(b"\n\n");
-        assert!(parser.push(&oversized).is_err());
-    }
-
-    #[test]
     fn readiness_status_reports_draining_as_not_ready() {
         let status = readiness_status_for(&Config::default(), true, true);
         assert_eq!(status["status"], "draining");
@@ -4895,6 +4763,49 @@ data: [DONE]
             &cfg,
             "203.0.113.1".parse::<IpAddr>().unwrap()
         ));
+        assert!(!is_trusted_proxy(
+            &cfg,
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn trusted_proxy_matching_normalizes_ipv4_mapped_ipv6() {
+        let mut cfg = Config::default();
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+
+        // A dual-stack listener may report an IPv4 peer as ::ffff:10.x.x.x.
+        assert!(is_trusted_proxy(
+            &cfg,
+            "::ffff:10.1.2.3".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_trusted_proxy(
+            &cfg,
+            "10.1.2.3".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_trusted_proxy(
+            &cfg,
+            "::ffff:192.0.2.1".parse::<IpAddr>().unwrap()
+        ));
+
+        // Exact-match form should normalize too.
+        cfg.security.trusted_proxies = vec!["10.1.2.3".to_string()];
+        assert!(is_trusted_proxy(
+            &cfg,
+            "::ffff:10.1.2.3".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn trusted_proxy_matching_rejects_out_of_range_prefix() {
+        let mut cfg = Config::default();
+        cfg.security.trusted_proxies = vec!["10.0.0.0/33".to_string()];
+        assert!(!is_trusted_proxy(
+            &cfg,
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+
+        cfg.security.trusted_proxies = vec!["2001:db8::/129".to_string()];
         assert!(!is_trusted_proxy(
             &cfg,
             "2001:db8::1".parse::<IpAddr>().unwrap()

@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::any::{install_default_drivers, AnyPoolOptions};
 use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyPool, Row};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
-
-const QUOTA_ADVISORY_LOCK_KEY: i64 = 0x6c6c_6d63_746c;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -158,18 +158,15 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
         SqlDialect::Sqlite => "REAL",
         SqlDialect::Postgres => "DOUBLE PRECISION",
     };
-    let id_type = match dialect {
-        SqlDialect::Sqlite => "TEXT",
-        SqlDialect::Postgres => "UUID",
-    };
-    let time_type = match dialect {
-        SqlDialect::Sqlite => "TEXT",
-        SqlDialect::Postgres => "TIMESTAMPTZ",
-    };
-    let json_type = match dialect {
-        SqlDialect::Sqlite => "TEXT",
-        SqlDialect::Postgres => "JSONB",
-    };
+    // IDs, timestamps, and JSON payloads are all serialized to/from strings
+    // by the application (`encode_time`, `parse_time`, `.to_string()` on
+    // `Uuid`, `parse_json`/`Value::to_string()`), so every dialect stores
+    // them as TEXT. Using native UUID/TIMESTAMPTZ/JSONB on Postgres would
+    // require the bound parameters to carry those types (or per-query
+    // casts), which the sqlx `Any` driver does not do for us.
+    let id_type = "TEXT";
+    let time_type = "TEXT";
+    let json_type = "TEXT";
     let bool_check = match dialect {
         SqlDialect::Sqlite => " CHECK (allowed IN (0, 1))",
         SqlDialect::Postgres => "",
@@ -305,19 +302,28 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
 pub struct Storage {
     pool: AnyPool,
     dialect: SqlDialect,
-    quota_admission_lock: Arc<AsyncMutex<()>>,
+    /// Per-scope admission locks (e.g. one per team), so that requests for
+    /// unrelated tenants don't serialize on a single global mutex. Created
+    /// lazily and never removed; the number of distinct scopes is bounded by
+    /// the number of configured teams/subjects, so this does not grow
+    /// unboundedly in practice.
+    quota_admission_locks: Arc<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 pub struct QuotaAdmissionGuard {
     _local: OwnedMutexGuard<()>,
     postgres_connection: Option<PoolConnection<Any>>,
+    advisory_lock_key: i64,
 }
 
 impl QuotaAdmissionGuard {
+    /// Releases the admission lock. Always call this when done with the
+    /// guard — prefer `Storage::with_quota_admission`, which calls this for
+    /// you on every code path. The `Drop` impl is only a safety net.
     pub async fn release(mut self) -> Result<()> {
         if let Some(mut connection) = self.postgres_connection.take() {
-            sqlx::query("SELECT pg_advisory_unlock(?)")
-                .bind(QUOTA_ADVISORY_LOCK_KEY)
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.advisory_lock_key)
                 .execute(&mut *connection)
                 .await?;
         }
@@ -328,14 +334,41 @@ impl QuotaAdmissionGuard {
 impl Drop for QuotaAdmissionGuard {
     fn drop(&mut self) {
         if let Some(mut connection) = self.postgres_connection.take() {
+            // Reaching here means `release()` was never called, which is a
+            // bug: the unlock below is a detached, fire-and-forget fallback
+            // whose outcome we can't observe.
+            tracing::warn!(
+                "quota admission guard dropped without release(); \
+                 unlocking advisory lock as a fallback"
+            );
+            record_quota_admission_release_failure_metric("dropped_without_release");
+            let advisory_lock_key = self.advisory_lock_key;
             tokio::spawn(async move {
-                let _ = sqlx::query("SELECT pg_advisory_unlock(?)")
-                    .bind(QUOTA_ADVISORY_LOCK_KEY)
+                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(advisory_lock_key)
                     .execute(&mut *connection)
                     .await;
             });
         }
     }
+}
+
+fn record_quota_admission_release_failure_metric(reason: &'static str) {
+    opentelemetry::global::meter(crate::SERVICE_NAME)
+        .u64_counter("llmctl_quota_admission_release_failures_total")
+        .with_description("Failures (or missed calls) releasing the quota admission lock")
+        .build()
+        .add(1, &[opentelemetry::KeyValue::new("reason", reason)]);
+}
+
+/// Derives a stable Postgres advisory lock key for an admission scope. A
+/// hash collision between two scopes only causes them to share an advisory
+/// lock (extra serialization), not a correctness problem.
+fn advisory_lock_key_for_scope(scope: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.hash(&mut hasher);
+    hasher.finish() as i64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -493,7 +526,7 @@ impl Storage {
         let storage = Self {
             pool,
             dialect,
-            quota_admission_lock: Arc::new(AsyncMutex::new(())),
+            quota_admission_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         storage.migrate().await?;
         Ok(storage)
@@ -534,7 +567,7 @@ impl Storage {
         let storage = Self {
             pool,
             dialect: SqlDialect::Sqlite,
-            quota_admission_lock: Arc::new(AsyncMutex::new(())),
+            quota_admission_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         storage.migrate().await?;
         Ok(storage)
@@ -544,12 +577,15 @@ impl Storage {
         &self.pool
     }
 
-    pub async fn quota_admission_guard(&self) -> Result<QuotaAdmissionGuard> {
-        let local = self.quota_admission_lock.clone().lock_owned().await;
+    /// Acquires the quota admission lock for `scope` (e.g. a team name).
+    /// Prefer `with_quota_admission`, which guarantees the lock is released.
+    pub async fn quota_admission_guard(&self, scope: &str) -> Result<QuotaAdmissionGuard> {
+        let local = self.scoped_admission_lock(scope).lock_owned().await;
+        let advisory_lock_key = advisory_lock_key_for_scope(scope);
         let postgres_connection = if self.dialect == SqlDialect::Postgres {
             let mut connection = self.pool.acquire().await?;
-            sqlx::query("SELECT pg_advisory_lock(?)")
-                .bind(QUOTA_ADVISORY_LOCK_KEY)
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(advisory_lock_key)
                 .execute(&mut *connection)
                 .await?;
             Some(connection)
@@ -559,28 +595,68 @@ impl Storage {
         Ok(QuotaAdmissionGuard {
             _local: local,
             postgres_connection,
+            advisory_lock_key,
         })
+    }
+
+    /// Runs `f` while holding the quota admission lock for `scope`,
+    /// releasing the lock on every path (success, error, or panic-via-Drop
+    /// fallback) so callers never need to remember to release it manually.
+    pub async fn with_quota_admission<T, F, Fut>(&self, scope: &str, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let guard = self.quota_admission_guard(scope).await?;
+        let result = f().await;
+        if let Err(err) = guard.release().await {
+            tracing::warn!(error = %err, scope, "failed to release quota admission lock");
+            record_quota_admission_release_failure_metric("release_error");
+        }
+        result
+    }
+
+    fn scoped_admission_lock(&self, scope: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .quota_admission_locks
+            .lock()
+            .expect("quota admission lock map poisoned");
+        locks
+            .entry(scope.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Rewrite `?` bind placeholders to Postgres's `$1, $2, ...` syntax when
+    /// running against Postgres. The sqlx `Any` driver passes SQL through
+    /// verbatim, so `?` placeholders only work as-is on SQLite.
+    fn sql<'a>(&self, query: &'a str) -> Cow<'a, str> {
+        rewrite_placeholders(self.dialect, query)
     }
 
     pub async fn migrate(&self) -> Result<()> {
         for statement in StorageMigrationPlan::new(self.dialect).statements() {
             sqlx::query(statement).execute(&self.pool).await?;
         }
-        if self.dialect == SqlDialect::Sqlite {
-            add_column_if_missing(&self.pool, "observation_events", "request_id TEXT").await?;
-        }
+        add_column_if_missing(
+            &self.pool,
+            self.dialect,
+            "observation_events",
+            "request_id TEXT",
+        )
+        .await?;
 
         Ok(())
     }
 
     pub async fn insert_audit_event(&self, event: &AuditEvent) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&self.sql(
             r#"
             INSERT INTO audit_events
                 (id, request_id, at, actor, team, action, resource, outcome, detail_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(event.id.to_string())
         .bind(event.request_id.map(|id| id.to_string()))
         .bind(encode_time(event.at))
@@ -610,7 +686,7 @@ impl Storage {
         limit: Option<usize>,
     ) -> Result<Vec<AuditEvent>> {
         let limit_clause = limit_clause(limit);
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&self.sql(&format!(
             r#"
             SELECT id, request_id, at, actor, team, action, resource, outcome, detail_json
             FROM audit_events
@@ -618,7 +694,7 @@ impl Storage {
             ORDER BY at ASC, id ASC
             {limit_clause}
             "#
-        ))
+        )))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -627,14 +703,14 @@ impl Storage {
     }
 
     pub async fn audit_events_for_request(&self, request_id: Uuid) -> Result<Vec<AuditEvent>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&self.sql(
             r#"
             SELECT id, request_id, at, actor, team, action, resource, outcome, detail_json
             FROM audit_events
             WHERE request_id = ?
             ORDER BY at ASC, id ASC
             "#,
-        )
+        ))
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -645,7 +721,7 @@ impl Storage {
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<AuditRetentionCounts> {
-        let row = sqlx::query(
+        let row = sqlx::query(&self.sql(
             r#"
             SELECT
                 COUNT(*) AS total,
@@ -653,7 +729,7 @@ impl Storage {
                 COALESCE(SUM(CASE WHEN at < ? THEN 1 ELSE 0 END), 0) AS outside_retention_window
             FROM audit_events
             "#,
-        )
+        ))
         .bind(encode_time(cutoff))
         .bind(encode_time(cutoff))
         .fetch_one(&self.pool)
@@ -673,7 +749,7 @@ impl Storage {
     }
 
     pub async fn delete_audit_events_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM audit_events WHERE at < ?")
+        let result = sqlx::query(&self.sql("DELETE FROM audit_events WHERE at < ?"))
             .bind(encode_time(cutoff))
             .execute(&self.pool)
             .await?;
@@ -681,13 +757,13 @@ impl Storage {
     }
 
     pub async fn insert_usage_event(&self, event: &UsageEvent) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&self.sql(
             r#"
             INSERT INTO usage_events
                 (id, request_id, at, model, actor, team, input_tokens, output_tokens, latency_ms, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(event.id.to_string())
         .bind(event.request_id.to_string())
         .bind(encode_time(event.at))
@@ -719,7 +795,7 @@ impl Storage {
     ) -> Result<Vec<UsageEvent>> {
         let limit_clause = limit_clause(limit);
         let rows = sqlx::query(
-            &format!(
+            &self.sql(&format!(
                 r#"
             SELECT id, request_id, at, model, actor, team, input_tokens, output_tokens, latency_ms, status
             FROM usage_events
@@ -727,7 +803,7 @@ impl Storage {
             ORDER BY at ASC, id ASC
             {limit_clause}
             "#
-            ),
+            )),
         )
         .bind(encode_time(from))
         .bind(encode_time(to))
@@ -737,14 +813,14 @@ impl Storage {
     }
 
     pub async fn usage_events_for_request(&self, request_id: Uuid) -> Result<Vec<UsageEvent>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&self.sql(
             r#"
             SELECT id, request_id, at, model, actor, team, input_tokens, output_tokens, latency_ms, status
             FROM usage_events
             WHERE request_id = ?
             ORDER BY at ASC, id ASC
             "#,
-        )
+        ))
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -771,13 +847,13 @@ impl Storage {
     }
 
     pub async fn insert_observation_event(&self, event: &ObservationEvent) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&self.sql(
             r#"
             INSERT INTO observation_events
                 (id, request_id, at, kind, model, source, value, unit, attributes_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(event.id.to_string())
         .bind(event.request_id.map(|id| id.to_string()))
         .bind(encode_time(event.at))
@@ -808,7 +884,7 @@ impl Storage {
         limit: Option<usize>,
     ) -> Result<Vec<ObservationEvent>> {
         let limit_clause = limit_clause(limit);
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&self.sql(&format!(
             r#"
             SELECT id, request_id, at, kind, model, source, value, unit, attributes_json
             FROM observation_events
@@ -816,7 +892,7 @@ impl Storage {
             ORDER BY at ASC, id ASC
             {limit_clause}
             "#
-        ))
+        )))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -828,14 +904,14 @@ impl Storage {
         &self,
         request_id: Uuid,
     ) -> Result<Vec<ObservationEvent>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&self.sql(
             r#"
             SELECT id, request_id, at, kind, model, source, value, unit, attributes_json
             FROM observation_events
             WHERE request_id = ?
             ORDER BY at ASC, id ASC
             "#,
-        )
+        ))
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -854,7 +930,7 @@ impl Storage {
     }
 
     pub async fn upsert_model_record(&self, model: &ModelInventoryRecord) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&self.sql(
             r#"
             INSERT INTO model_inventory (alias, path, role, weight, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -864,7 +940,7 @@ impl Storage {
                 weight = excluded.weight,
                 updated_at = excluded.updated_at
             "#,
-        )
+        ))
         .bind(&model.alias)
         .bind(&model.path)
         .bind(&model.role)
@@ -891,13 +967,13 @@ impl Storage {
     }
 
     pub async fn insert_quota_decision(&self, decision: &QuotaDecisionRecord) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&self.sql(
             r#"
             INSERT INTO quota_decisions
                 (id, request_id, at, actor, team, model, allowed, reason, policy_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(decision.id.to_string())
         .bind(decision.request_id.map(|id| id.to_string()))
         .bind(encode_time(decision.at))
@@ -927,7 +1003,7 @@ impl Storage {
         limit: Option<usize>,
     ) -> Result<Vec<QuotaDecisionRecord>> {
         let limit_clause = limit_clause(limit);
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&self.sql(&format!(
             r#"
             SELECT id, request_id, at, actor, team, model, allowed, reason, policy_json
             FROM quota_decisions
@@ -935,7 +1011,7 @@ impl Storage {
             ORDER BY at ASC, id ASC
             {limit_clause}
             "#
-        ))
+        )))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -947,14 +1023,14 @@ impl Storage {
         &self,
         request_id: Uuid,
     ) -> Result<Vec<QuotaDecisionRecord>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&self.sql(
             r#"
             SELECT id, request_id, at, actor, team, model, allowed, reason, policy_json
             FROM quota_decisions
             WHERE request_id = ?
             ORDER BY at ASC, id ASC
             "#,
-        )
+        ))
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -965,13 +1041,13 @@ impl Storage {
         &self,
         record: &RequestLineageJoinRecord,
     ) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&self.sql(
             r#"
             INSERT INTO request_lineage_joins
                 (id, request_id, at, lineage_id, model, corpus, source)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(record.id.to_string())
         .bind(record.request_id.to_string())
         .bind(encode_time(record.at))
@@ -1015,7 +1091,7 @@ impl Storage {
         limit: Option<usize>,
     ) -> Result<Vec<RequestLineageJoinRecord>> {
         let limit_clause = limit_clause(limit);
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&self.sql(&format!(
             r#"
             SELECT id, request_id, at, lineage_id, model, corpus, source
             FROM request_lineage_joins
@@ -1023,7 +1099,7 @@ impl Storage {
             ORDER BY at ASC, id ASC
             {limit_clause}
             "#
-        ))
+        )))
         .bind(encode_time(from))
         .bind(encode_time(to))
         .fetch_all(&self.pool)
@@ -1037,14 +1113,14 @@ impl Storage {
         &self,
         request_id: Uuid,
     ) -> Result<Vec<RequestLineageJoinRecord>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&self.sql(
             r#"
             SELECT id, request_id, at, lineage_id, model, corpus, source
             FROM request_lineage_joins
             WHERE request_id = ?
             ORDER BY at ASC, id ASC
             "#,
-        )
+        ))
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -1106,7 +1182,7 @@ impl Storage {
                 &principal.team,
             ),
         };
-        let row = sqlx::query(query)
+        let row = sqlx::query(&self.sql(query))
             .bind(encode_time(from))
             .bind(encode_time(to))
             .bind(scope_value)
@@ -1137,7 +1213,7 @@ impl Storage {
               AND {scope_column} = ?
             "#
         );
-        let row = sqlx::query(&query)
+        let row = sqlx::query(&self.sql(&query))
             .bind(encode_time(from))
             .bind(encode_time(to))
             .bind(scope_value)
@@ -1145,6 +1221,28 @@ impl Storage {
             .await?;
         i64_to_u64(row.try_get("tokens")?, "tokens")
     }
+}
+
+/// Rewrite `?` bind placeholders to Postgres's `$1, $2, ...` syntax for the
+/// Postgres dialect; left unchanged for SQLite. None of the queries in this
+/// module embed `?` inside string literals, so a simple sequential
+/// left-to-right replace is sufficient.
+fn rewrite_placeholders(dialect: SqlDialect, query: &str) -> Cow<'_, str> {
+    if dialect != SqlDialect::Postgres {
+        return Cow::Borrowed(query);
+    }
+    let mut rewritten = String::with_capacity(query.len() + 8);
+    let mut placeholder = 0u32;
+    for ch in query.chars() {
+        if ch == '?' {
+            placeholder += 1;
+            rewritten.push('$');
+            rewritten.push_str(&placeholder.to_string());
+        } else {
+            rewritten.push(ch);
+        }
+    }
+    Cow::Owned(rewritten)
 }
 
 fn encode_time(at: DateTime<Utc>) -> String {
@@ -1275,20 +1373,35 @@ fn row_to_observation_event(row: sqlx::any::AnyRow) -> Result<ObservationEvent> 
     })
 }
 
-async fn add_column_if_missing(pool: &AnyPool, table: &str, column_sql: &str) -> Result<()> {
-    let column = column_sql
-        .split_whitespace()
-        .next()
-        .context("column definition must include a name")?;
-    let pragma = format!("PRAGMA table_info({table})");
-    let rows = sqlx::query(&pragma).fetch_all(pool).await?;
-    let exists = rows.iter().any(|row| {
-        row.try_get::<String, _>("name")
-            .is_ok_and(|name| name == column)
-    });
-    if !exists {
-        let alter = format!("ALTER TABLE {table} ADD COLUMN {column_sql}");
-        sqlx::query(&alter).execute(pool).await?;
+async fn add_column_if_missing(
+    pool: &AnyPool,
+    dialect: SqlDialect,
+    table: &str,
+    column_sql: &str,
+) -> Result<()> {
+    match dialect {
+        // Postgres has supported `ADD COLUMN IF NOT EXISTS` since 9.6, so no
+        // separate existence check is needed.
+        SqlDialect::Postgres => {
+            let alter = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column_sql}");
+            sqlx::query(&alter).execute(pool).await?;
+        }
+        SqlDialect::Sqlite => {
+            let column = column_sql
+                .split_whitespace()
+                .next()
+                .context("column definition must include a name")?;
+            let pragma = format!("PRAGMA table_info({table})");
+            let rows = sqlx::query(&pragma).fetch_all(pool).await?;
+            let exists = rows.iter().any(|row| {
+                row.try_get::<String, _>("name")
+                    .is_ok_and(|name| name == column)
+            });
+            if !exists {
+                let alter = format!("ALTER TABLE {table} ADD COLUMN {column_sql}");
+                sqlx::query(&alter).execute(pool).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -1411,6 +1524,15 @@ mod tests {
     #[tokio::test]
     async fn persists_audit_usage_observation_model_and_quota_records() -> Result<()> {
         let storage = Storage::in_memory().await?;
+        assert_storage_round_trip(&storage).await
+    }
+
+    /// Exercises a full read/write round trip across every record type and
+    /// query variant (including the dialect-specific `allowed_quota_decision_count`
+    /// branches). Shared by the SQLite in-memory test and the Postgres
+    /// integration test so both dialects are checked against the same
+    /// assertions.
+    async fn assert_storage_round_trip(storage: &Storage) -> Result<()> {
         let request_id = Uuid::new_v4();
         let audit = AuditEvent::new(
             Some(request_id),
@@ -1556,6 +1678,18 @@ mod tests {
                 .await?,
             vec![lineage]
         );
+        assert_eq!(
+            storage
+                .usage_tokens_total(&principal, true, from, to)
+                .await?,
+            30
+        );
+        assert_eq!(
+            storage
+                .usage_tokens_total(&principal, false, from, to)
+                .await?,
+            30
+        );
         Ok(())
     }
 
@@ -1592,6 +1726,85 @@ mod tests {
         assert_eq!(counts.total, 2);
         assert_eq!(counts.in_retention_window, 1);
         assert_eq!(counts.outside_retention_window, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_placeholders_leaves_sqlite_queries_unchanged() {
+        let query = "INSERT INTO t (a, b, c) VALUES (?, ?, ?)";
+        assert_eq!(
+            rewrite_placeholders(SqlDialect::Sqlite, query),
+            Cow::Borrowed(query)
+        );
+    }
+
+    #[test]
+    fn rewrite_placeholders_numbers_postgres_placeholders_sequentially() {
+        let query = "INSERT INTO t (a, b, c) VALUES (?, ?, ?)";
+        assert_eq!(
+            rewrite_placeholders(SqlDialect::Postgres, query),
+            "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)"
+        );
+    }
+
+    #[test]
+    fn rewrite_placeholders_handles_repeated_where_clauses() {
+        let query = "SELECT * FROM t WHERE at >= ? AND at < ? AND actor = ?";
+        assert_eq!(
+            rewrite_placeholders(SqlDialect::Postgres, query),
+            "SELECT * FROM t WHERE at >= $1 AND at < $2 AND actor = $3"
+        );
+    }
+
+    #[test]
+    fn rewrite_placeholders_handles_advisory_lock_calls() {
+        assert_eq!(
+            rewrite_placeholders(SqlDialect::Postgres, "SELECT pg_advisory_lock(?)"),
+            "SELECT pg_advisory_lock($1)"
+        );
+    }
+
+    /// Exercises the storage layer against a real Postgres instance.
+    /// Run with: `TEST_DATABASE_URL=postgres://user:pass@host/db cargo test --lib -- --ignored storage_works_against_real_postgres`
+    #[tokio::test]
+    #[ignore = "requires a running Postgres instance via TEST_DATABASE_URL"]
+    async fn storage_works_against_real_postgres() -> Result<()> {
+        let database_url =
+            std::env::var("TEST_DATABASE_URL").context("set TEST_DATABASE_URL to run this test")?;
+        let storage = Storage::connect_any(&database_url, SqlDialect::Postgres, 2).await?;
+        assert_eq!(storage.dialect, SqlDialect::Postgres);
+
+        // Make this test repeatable against a persistent (non-ephemeral)
+        // Postgres instance by clearing out rows left over from a previous run.
+        for table in [
+            "audit_events",
+            "usage_events",
+            "observation_events",
+            "model_inventory",
+            "quota_decisions",
+            "request_lineage_joins",
+        ] {
+            sqlx::query(&format!("TRUNCATE TABLE {table}"))
+                .execute(&storage.pool)
+                .await?;
+        }
+
+        // Exercises the advisory-lock based quota admission path, which is
+        // only taken on Postgres.
+        let guard = storage.quota_admission_guard("team:platform").await?;
+        guard.release().await?;
+
+        // Same assertions as the SQLite in-memory test, including the
+        // `allowed_quota_decision_count` branches that use `allowed = TRUE`
+        // on Postgres vs `allowed = 1` on SQLite.
+        assert_storage_round_trip(&storage).await?;
+
+        let cutoff = Utc::now() + chrono::Duration::seconds(1);
+        let counts = storage.audit_retention_counts(cutoff).await?;
+        assert_eq!(counts.total, counts.outside_retention_window);
+        let deleted = storage.delete_audit_events_before(cutoff).await?;
+        assert_eq!(deleted, counts.total);
+
         Ok(())
     }
 }
