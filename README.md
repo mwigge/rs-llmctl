@@ -818,10 +818,8 @@ focused CRA Article 14, PCI DSS, release integrity, SBOM, and signing views.
 - [Data contracts](docs/data-contracts.md)
 - [AIOps/MLOps platform](docs/aiops-mlops-platform.md)
 - [Storage notes](docs/storage.md)
-- [Final acceptance review](docs/reviews/final-acceptance-review.md)
 - [Changelog](CHANGELOG.md)
 - [Blog: Running Local Models Like Real Infrastructure](docs/blog-local-model-operations.md)
-- [Blog: Rust Native Model Operations](docs/blog-rust-native-model-ops.md)
 
 ## License
 

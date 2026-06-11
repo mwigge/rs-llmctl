@@ -3,6 +3,38 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## 1.5.0 - 2026-06-11
+
+- Storage: Postgres deployments now work end-to-end. Query placeholders are
+  rewritten from `?` to `$1, $2, ...` for the Postgres dialect, and id/time/
+  JSON columns use `TEXT` on both dialects to match the values the
+  application binds (previously Postgres used native `UUID`/`TIMESTAMPTZ`/
+  `JSONB`, which rejected the application's string bindings). Schema patches
+  (`observation_events.request_id`) are now applied on Postgres as well as
+  SQLite, via `ADD COLUMN IF NOT EXISTS`.
+- Quota admission locking is now per-scope (per team, or per subject for
+  teamless principals) instead of one global lock, so unrelated
+  teams/subjects no longer serialize on the same admission check. The
+  Postgres advisory lock key is now derived per scope. Lock acquisition and
+  release are wrapped in a single `with_quota_admission` helper with a
+  `Drop`-based safety net and a metric for any release that doesn't go
+  through the normal path.
+- `chat.completions` and `embeddings` request handling: the repeated
+  audit-then-error-response blocks and the authentication/scope-check
+  prologue are now shared helpers (`audit_reject`, `audit_reject_response`,
+  `authenticate_with_chat_scope`), removing several hundred lines of
+  duplicated control flow with no behavior change.
+- `llmctl model install` no longer panics if a download plan is missing its
+  expected SHA-256; it now returns an error refusing the unverified
+  download.
+- Trusted-proxy CIDR matching now normalizes IPv4-mapped IPv6 addresses
+  (`::ffff:10.0.0.1`) to their IPv4 form before comparing against configured
+  trusted proxies/networks, so dual-stack listeners match IPv4 trusted-proxy
+  entries correctly.
+- Repo hygiene: removed committed build artifacts (`dist/`, including the
+  compiled `llmctl` binary and tarball) from version control; `dist/` is now
+  gitignored and produced only by the packaging scripts/CI.
+
 ## 1.3.0 - 2026-06-07
 
 - Guardrails: regex/phrase-based PII redaction and prompt-injection

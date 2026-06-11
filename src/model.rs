@@ -236,7 +236,9 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
                 .verification
                 .expected_sha256
                 .as_deref()
-                .expect("download plan requires expected sha256");
+                .ok_or_else(|| {
+                    anyhow!("download plan for '{}' is missing expected sha256 — refusing unverified download", req.alias)
+                })?;
             download_model(url, &req.cache_dir, &req.alias, expected).await?
         }
         ModelSource::HuggingFace {
@@ -249,7 +251,9 @@ pub async fn install_model(req: &ModelInstallRequest) -> Result<InstalledModel> 
                 .verification
                 .expected_sha256
                 .as_deref()
-                .expect("download plan requires expected sha256");
+                .ok_or_else(|| {
+                    anyhow!("download plan for '{}' is missing expected sha256 — refusing unverified download", req.alias)
+                })?;
             download_model(&url, &req.cache_dir, filename, expected).await?
         }
     };
