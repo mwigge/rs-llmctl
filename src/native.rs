@@ -1951,6 +1951,297 @@ fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_str(&raw).with_context(|| "failed to parse model config.json")
 }
 
+/// Builds a [`tokenizers::tokenizer::Tokenizer`] from GGUF metadata, dispatching on
+/// `tokenizer.ggml.model`.
+///
+/// Candle's own [`candle_core::quantized::tokenizer::TokenizerFromGguf`] only
+/// understands `tokenizer.ggml.model == "gpt2"` (byte-level BPE). Some model
+/// families — notably Gemma's `gemma4` GGUF exports — ship a SentencePiece-style
+/// BPE vocabulary (metaspace `▁` convention) tagged `tokenizer.ggml.model ==
+/// "gemma4"`. This function delegates `"gpt2"` to candle unchanged and adds a
+/// native `"gemma4"` code path; any other value is a hard error.
+///
+/// # Errors
+///
+/// Returns an error if `tokenizer.ggml.model` is missing or not a recognized
+/// value, or if the underlying tokenizer construction fails.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn tokenizer_from_gguf_content(
+    content: &candle_core::quantized::gguf_file::Content,
+) -> Result<tokenizers::tokenizer::Tokenizer> {
+    let model_kind = gemma4_gguf_tokenizer::metadata_value(content, "tokenizer.ggml.model")
+        .and_then(|value| value.to_string().map_err(candle_core::Error::wrap))
+        .map_err(|err| anyhow::anyhow!("failed to read GGUF tokenizer model kind: {err}"))?
+        .to_lowercase();
+
+    match model_kind.as_str() {
+        "gpt2" => {
+            <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(content)
+                .map_err(|err| anyhow::anyhow!("failed to build tokenizer from GGUF metadata: {err}"))
+        }
+        "gemma4" => gemma4_gguf_tokenizer::build(content)
+            .map_err(|err| anyhow::anyhow!("failed to build gemma4 tokenizer from GGUF metadata: {err}")),
+        other => bail!("unsupported tokenizer model `{other}` (supported: gpt2, gemma4)"),
+    }
+}
+
+/// Native (non-candle) construction of a SentencePiece-metaspace BPE tokenizer
+/// from `gemma4`-flavoured GGUF metadata.
+///
+/// Mirrors the structure of candle's `TokenizerFromGguf::from_gguf` for the
+/// `gpt2` case, but swaps the byte-level pre-tokenizer/decoder/post-processor
+/// for `SentencePiece` [`tokenizers::pre_tokenizers::metaspace::Metaspace`]
+/// equivalents, matching the `▁`-based vocabulary that `gemma4` GGUF exports use.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+mod gemma4_gguf_tokenizer {
+    use candle_core::quantized::gguf_file;
+    use candle_core::{Context as CandleContext, Error as CandleError, Result as CandleResult};
+    use std::collections::HashSet;
+    use tokenizers::models::bpe::{Vocab, BPE};
+    use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
+    use tokenizers::processors::template::TemplateProcessing;
+    use tokenizers::{AddedToken, PostProcessorWrapper, Tokenizer};
+
+    pub(super) fn metadata_value<'a>(
+        ct: &'a gguf_file::Content,
+        key: &str,
+    ) -> CandleResult<&'a gguf_file::Value> {
+        ct.metadata
+            .get(key)
+            .with_context(|| format!("missing GGUF metadata key `{key}`"))
+    }
+
+    fn gguf_value_to_u32(v: &gguf_file::Value) -> CandleResult<u32> {
+        let as_i64 = match v {
+            gguf_file::Value::U8(v) => i64::from(*v),
+            gguf_file::Value::I8(v) => i64::from(*v),
+            gguf_file::Value::U16(v) => i64::from(*v),
+            gguf_file::Value::I16(v) => i64::from(*v),
+            gguf_file::Value::U32(v) => i64::from(*v),
+            gguf_file::Value::I32(v) => i64::from(*v),
+            gguf_file::Value::U64(v) => i64::try_from(*v).map_err(CandleError::wrap)?,
+            gguf_file::Value::I64(v) => *v,
+            other => candle_core::bail!("expected numeric value for token type/id, got {other:?}"),
+        };
+        u32::try_from(as_i64)
+            .map_err(|_| CandleError::msg(format!("token type/id {as_i64} out of range for u32")))
+    }
+
+    fn value_to_string_array(v: &gguf_file::Value, name: &str) -> CandleResult<Vec<String>> {
+        let arr = v
+            .to_vec()
+            .with_context(|| format!("`{name}` is not an array"))?;
+        arr.iter()
+            .map(|v| {
+                v.to_string()
+                    .map(std::string::ToString::to_string)
+                    .with_context(|| format!("`{name}` element is not a string: {v:?}"))
+            })
+            .collect()
+    }
+
+    fn merges_from_value(v: &gguf_file::Value) -> CandleResult<Vec<(String, String)>> {
+        value_to_string_array(v, "tokenizer.ggml.merges")?
+            .into_iter()
+            .map(|m| {
+                m.split_once(' ')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .ok_or_else(|| CandleError::msg(format!("invalid merge entry `{m}`")))
+            })
+            .collect()
+    }
+
+    /// Looks up the unknown-token id, checking the `gemma4`-style
+    /// `tokenizer.ggml.unknown_token_id` key first and falling back to the
+    /// `gpt2`-style `tokenizer.ggml.unk_token_id` key.
+    fn unk_token_id(ct: &gguf_file::Content) -> Option<u32> {
+        metadata_value(ct, "tokenizer.ggml.unknown_token_id")
+            .or_else(|_| metadata_value(ct, "tokenizer.ggml.unk_token_id"))
+            .and_then(gguf_value_to_u32)
+            .ok()
+    }
+
+    /// Builds a BOS/EOS template post-processor, mirroring candle's private
+    /// `template_processor` helper for the `gpt2` GGUF tokenizer path.
+    fn template_processor(
+        tokens: &[String],
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Option<PostProcessorWrapper> {
+        if (!add_bos && !add_eos) || tokens.is_empty() {
+            return None;
+        }
+
+        let bos = bos_id.and_then(|id| tokens.get(id as usize)).cloned();
+        let eos = eos_id.and_then(|id| tokens.get(id as usize)).cloned();
+
+        let mut specials = Vec::new();
+        if add_bos {
+            let bos_id = bos_id?;
+            let bos_tok = bos.clone()?;
+            specials.push((bos_tok, bos_id));
+        }
+        if add_eos {
+            let eos_id = eos_id?;
+            let eos_tok = eos.clone()?;
+            specials.push((eos_tok, eos_id));
+        }
+
+        let mut single = Vec::new();
+        if add_bos {
+            single.push(bos.clone()?);
+        }
+        single.push("$0".to_string());
+        if add_eos {
+            single.push(eos.clone()?);
+        }
+
+        let mut pair = Vec::new();
+        if add_bos {
+            pair.push(format!("{}:0", bos.clone()?));
+        }
+        pair.push("$A:0".to_string());
+        if add_eos {
+            pair.push(format!("{}:0", eos.clone()?));
+        }
+        if add_bos {
+            pair.push(format!("{}:1", bos.clone()?));
+        }
+        pair.push("$B:1".to_string());
+        if add_eos {
+            pair.push(format!("{}:1", eos.clone()?));
+        }
+
+        let proc = TemplateProcessing::builder()
+            .try_single(single)
+            .ok()?
+            .try_pair(pair)
+            .ok()?
+            .special_tokens(specials)
+            .build()
+            .ok()?;
+
+        Some(PostProcessorWrapper::Template(proc))
+    }
+
+    /// Builds a SentencePiece-metaspace BPE [`Tokenizer`] from `gemma4`-flavoured
+    /// GGUF metadata (`tokenizer.ggml.model == "gemma4"`).
+    pub(super) fn build(ct: &gguf_file::Content) -> CandleResult<Tokenizer> {
+        let tokens = value_to_string_array(
+            metadata_value(ct, "tokenizer.ggml.tokens")?,
+            "tokenizer.ggml.tokens",
+        )?;
+        let vocab: Vocab = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| -> CandleResult<(String, u32)> {
+                let id = u32::try_from(i).map_err(|_| {
+                    CandleError::msg(format!("vocab index {i} out of range for u32"))
+                })?;
+                Ok((t.clone(), id))
+            })
+            .collect::<CandleResult<Vocab>>()?;
+        let merges = merges_from_value(metadata_value(ct, "tokenizer.ggml.merges")?)?;
+
+        let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
+
+        if let Some(token_id) = unk_token_id(ct) {
+            if let Some(token) = tokens.get(token_id as usize) {
+                builder = builder.unk_token(token.clone());
+            }
+        }
+
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.byte_fallback") {
+            builder = builder.byte_fallback(val.to_bool().map_err(CandleError::wrap)?);
+        }
+
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
+            builder = builder.ignore_merges(val.to_bool().map_err(CandleError::wrap)?);
+        }
+
+        let bpe = builder.build().map_err(CandleError::wrap)?;
+        let mut tokenizer = Tokenizer::new(bpe);
+
+        // SentencePiece convention: prepend a leading metaspace marker unless
+        // `tokenizer.ggml.add_space_prefix` is explicitly `false`.
+        let add_space_prefix = metadata_value(ct, "tokenizer.ggml.add_space_prefix")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(true);
+        let prepend_scheme = if add_space_prefix {
+            PrependScheme::Always
+        } else {
+            PrependScheme::Never
+        };
+        let metaspace = Metaspace::new('▁', prepend_scheme, true);
+        tokenizer.with_pre_tokenizer(Some(metaspace.clone()));
+        tokenizer.with_decoder(Some(metaspace));
+
+        let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(false);
+        let add_eos = metadata_value(ct, "tokenizer.ggml.add_eos_token")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(false);
+        let bos_id = metadata_value(ct, "tokenizer.ggml.bos_token_id")
+            .and_then(gguf_value_to_u32)
+            .ok();
+        let eos_id = metadata_value(ct, "tokenizer.ggml.eos_token_id")
+            .and_then(gguf_value_to_u32)
+            .ok();
+
+        if let Some(pp) = template_processor(&tokens, bos_id, eos_id, add_bos, add_eos) {
+            tokenizer.with_post_processor(Some(pp));
+        }
+
+        // Mark special tokens so decode(skip_special_tokens = true) behaves as expected.
+        if let Ok(gguf_file::Value::Array(arr)) = metadata_value(ct, "tokenizer.ggml.token_type") {
+            let mut specials = Vec::new();
+            for (idx, v) in arr.iter().enumerate() {
+                let ty = gguf_value_to_u32(v)?;
+                // Aligns with llama_token_type: treat non-normal/non-byte tokens as special.
+                let is_special = matches!(ty, 2..=5);
+                if is_special {
+                    if let Some(tok) = tokens.get(idx) {
+                        specials.push(AddedToken::from(tok.clone(), true));
+                    }
+                }
+            }
+            if !specials.is_empty() {
+                tokenizer.add_special_tokens(&specials);
+            }
+        }
+
+        let mut explicit_specials = HashSet::new();
+        for key in [
+            "tokenizer.ggml.bos_token_id",
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.pad_token_id",
+            "tokenizer.ggml.sep_token_id",
+        ] {
+            if let Ok(val) = metadata_value(ct, key) {
+                explicit_specials.insert(gguf_value_to_u32(val)?);
+            }
+        }
+        if let Some(id) = unk_token_id(ct) {
+            explicit_specials.insert(id);
+        }
+        if !explicit_specials.is_empty() {
+            let specials: Vec<_> = explicit_specials
+                .into_iter()
+                .filter_map(|id| tokens.get(id as usize))
+                .map(|tok| AddedToken::from(tok.clone(), true))
+                .collect();
+            if !specials.is_empty() {
+                tokenizer.add_special_tokens(&specials);
+            }
+        }
+
+        Ok(tokenizer)
+    }
+}
+
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 fn load_generation_tokenizer(
     model_path: &Path,
@@ -1967,8 +2258,7 @@ fn load_generation_tokenizer(
                 .with_context(|| "failed to open GGUF tokenizer metadata")?;
             let content = candle_core::quantized::gguf_file::Content::read(&mut file)
                 .with_context(|| "failed to read GGUF tokenizer metadata")?;
-            <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(&content)
-            .map_err(|err| anyhow::anyhow!("failed to build tokenizer from GGUF metadata: {err}"))
+            tokenizer_from_gguf_content(&content)
         }
         NativeModelFormat::Unknown => bail!("native artifact format is unsupported"),
     }
@@ -3931,5 +4221,240 @@ mod tests {
             .safe_telemetry_attributes()
             .values()
             .all(|value| !value.to_string().contains("/private")));
+    }
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers", test))]
+mod gguf_tokenizer_tests {
+    use super::*;
+    use candle_core::quantized::gguf_file::{Content, Value as GgufValue, VersionedMagic};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    /// Builds a tiny synthetic GGUF `Content` with a `gemma4`-style SentencePiece
+    /// metaspace vocabulary, suitable for exercising the tokenizer builder without
+    /// reading a real model file.
+    fn gemma4_content() -> Content {
+        let tokens = vec![
+            "<pad>".to_string(),  // 0
+            "<eos>".to_string(),  // 1
+            "<bos>".to_string(),  // 2
+            "<unk>".to_string(),  // 3
+            "<mask>".to_string(), // 4
+            "▁".to_string(),      // 5
+            "h".to_string(),      // 6
+            "i".to_string(),      // 7
+            "t".to_string(),      // 8
+            "e".to_string(),      // 9
+            "r".to_string(),      // 10
+            "hi".to_string(),     // 11
+            "▁hi".to_string(),    // 12
+            "th".to_string(),     // 13
+            "the".to_string(),    // 14
+            "ther".to_string(),   // 15
+            "there".to_string(),  // 16
+            "▁there".to_string(), // 17
+        ];
+        let token_type: Vec<GgufValue> = vec![
+            GgufValue::U32(3), // <pad> -> control
+            GgufValue::U32(3), // <eos> -> control
+            GgufValue::U32(3), // <bos> -> control
+            GgufValue::U32(2), // <unk> -> unknown
+            GgufValue::U32(3), // <mask> -> control
+            GgufValue::U32(1), // ▁ -> normal
+            GgufValue::U32(1), // h -> normal
+            GgufValue::U32(1), // i -> normal
+            GgufValue::U32(1), // t -> normal
+            GgufValue::U32(1), // e -> normal
+            GgufValue::U32(1), // r -> normal
+            GgufValue::U32(1), // hi -> normal
+            GgufValue::U32(1), // ▁hi -> normal
+            GgufValue::U32(1), // th -> normal
+            GgufValue::U32(1), // the -> normal
+            GgufValue::U32(1), // ther -> normal
+            GgufValue::U32(1), // there -> normal
+            GgufValue::U32(1), // ▁there -> normal
+        ];
+        let merges = vec![
+            "h i".to_string(),
+            "▁ hi".to_string(),
+            "t h".to_string(),
+            "th e".to_string(),
+            "the r".to_string(),
+            "ther e".to_string(),
+            "▁ there".to_string(),
+        ];
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("gemma4".to_string()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            GgufValue::Array(merges.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(token_type),
+        );
+        metadata.insert("tokenizer.ggml.bos_token_id".to_string(), GgufValue::U32(2));
+        metadata.insert("tokenizer.ggml.eos_token_id".to_string(), GgufValue::U32(1));
+        metadata.insert(
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            GgufValue::U32(3),
+        );
+        metadata.insert(
+            "tokenizer.ggml.padding_token_id".to_string(),
+            GgufValue::U32(0),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_space_prefix".to_string(),
+            GgufValue::Bool(false),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(true),
+        );
+
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    /// Builds a minimal gpt2-style GGUF `Content`, just enough metadata for
+    /// candle's `TokenizerFromGguf::from_gguf` to be reached and attempted.
+    fn gpt2_content() -> Content {
+        let tokens = vec![
+            "<|endoftext|>".to_string(),
+            "h".to_string(),
+            "i".to_string(),
+            "Ġthere".to_string(),
+            "hi".to_string(),
+        ];
+        let merges = vec!["h i".to_string()];
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("gpt2".to_string()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            GgufValue::Array(merges.into_iter().map(GgufValue::String).collect()),
+        );
+
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    fn unsupported_content() -> Content {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("made-up-model".to_string()),
+        );
+
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn gemma4_metaspace_tokenizer_builds_and_round_trips() {
+        let content = gemma4_content();
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("gemma4 metaspace tokenizer should build from synthetic GGUF metadata");
+
+        let encoding = tokenizer
+            .encode("hi there", false)
+            .expect("encoding should succeed");
+        let ids = encoding.get_ids();
+        assert!(!ids.is_empty(), "encoding should produce at least one id");
+
+        // With add_space_prefix = false (PrependScheme::Never), the first token
+        // must not gain a leading metaspace marker that wasn't in the input.
+        let first_token = tokenizer
+            .id_to_token(ids[0])
+            .expect("first id maps to a token");
+        assert!(
+            !first_token.starts_with('▁'),
+            "leading token `{first_token}` should not carry a metaspace prefix \
+             when add_space_prefix is false"
+        );
+
+        let decoded = tokenizer
+            .decode(ids, true)
+            .expect("decoding should succeed");
+        assert_eq!(decoded, "hi there");
+    }
+
+    #[test]
+    fn unsupported_tokenizer_model_is_rejected() {
+        let content = unsupported_content();
+        let err = tokenizer_from_gguf_content(&content)
+            .expect_err("unrecognized tokenizer.ggml.model must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("made-up-model"),
+            "error message `{message}` should mention the unsupported model kind"
+        );
+    }
+
+    #[test]
+    fn gpt2_tokenizer_model_delegates_to_candle() {
+        let content = gpt2_content();
+        // The gpt2 branch must delegate to candle's own
+        // `TokenizerFromGguf::from_gguf`, which builds successfully for this
+        // minimal-but-valid gpt2 metadata.
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("gpt2 metadata should be handled by candle's existing implementation");
+        assert!(tokenizer.get_vocab_size(false) >= 4);
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk"]
+    fn real_gemma4_gguf_round_trips_hello_world() {
+        let path =
+            Path::new("/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let mut file = fs::File::open(path).expect("open real gemma4 gguf");
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .expect("read real gemma4 gguf metadata");
+
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("build tokenizer from real gemma4 gguf metadata");
+
+        let encoding = tokenizer
+            .encode("Hello, world!", false)
+            .expect("encode real text");
+        let ids = encoding.get_ids().to_vec();
+        let decoded = tokenizer.decode(&ids, true).expect("decode real text");
+
+        eprintln!("ids: {ids:?}");
+        eprintln!("decoded: {decoded:?}");
+        assert_eq!(decoded, "Hello, world!");
     }
 }
