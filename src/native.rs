@@ -2427,10 +2427,29 @@ mod quantized_gemma4 {
     }
 
     impl RotaryEmbedding {
-        fn new(head_dim: usize, rope_frequency: f32, device: &Device) -> Result<Self> {
+        /// `freq_factors`, when present, divides each dimension-pair's
+        /// rotation rate (`gemma4`'s top-level `rope_freqs.weight`, applied
+        /// only to global/non-SWA layers in upstream llama.cpp). A factor of
+        /// `1e30` effectively freezes that dimension pair's rotation
+        /// (`cos` -> 1, `sin` -> 0 for all positions), which is how gemma4
+        /// extends context length without retraining the higher rotary
+        /// dimensions.
+        fn new(
+            head_dim: usize,
+            rope_frequency: f32,
+            freq_factors: Option<&[f32]>,
+            device: &Device,
+        ) -> Result<Self> {
             let theta: Vec<_> = (0..head_dim)
                 .step_by(2)
-                .map(|i| 1f32 / rope_frequency.powf(i as f32 / head_dim as f32))
+                .enumerate()
+                .map(|(j, i)| {
+                    let base = 1f32 / rope_frequency.powf(i as f32 / head_dim as f32);
+                    match freq_factors.and_then(|factors| factors.get(j)) {
+                        Some(factor) => base / factor,
+                        None => base,
+                    }
+                })
                 .collect();
             let theta = Tensor::new(theta.as_slice(), device)?;
             let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
@@ -2803,6 +2822,16 @@ mod quantized_gemma4 {
                 Err(_) => ct.tensor(reader, "token_embd.weight", device)?,
             };
 
+            // Shared rope frequency-scaling factors for global (non-SWA)
+            // layers, applied per dimension-pair (see `RotaryEmbedding::new`).
+            // Absent in synthetic/test GGUFs and some exports, in which case
+            // global layers fall back to unscaled RoPE.
+            let rope_freqs: Option<Vec<f32>> = ct
+                .tensor(reader, "rope_freqs.weight", device)
+                .ok()
+                .map(|tensor| tensor.dequantize(device)?.flatten_all()?.to_vec1::<f32>())
+                .transpose()?;
+
             let mut layers = Vec::with_capacity(block_count);
             for (layer_idx, layer_config) in layer_configs.into_iter().enumerate() {
                 let prefix = format!("blk.{layer_idx}");
@@ -2859,8 +2888,17 @@ mod quantized_gemma4 {
                     feed_forward_down: QMatMul::from_qtensor(feed_forward_down)?,
                 };
 
-                let rotary_embedding =
-                    RotaryEmbedding::new(layer_config.head_dim, layer_config.rope_freq, device)?;
+                let freq_factors = layer_config
+                    .sliding_window_size
+                    .is_none()
+                    .then_some(rope_freqs.as_deref())
+                    .flatten();
+                let rotary_embedding = RotaryEmbedding::new(
+                    layer_config.head_dim,
+                    layer_config.rope_freq,
+                    freq_factors,
+                    device,
+                )?;
 
                 let layer_output_scale = dequantize_scalar_f32(
                     ct.tensor(reader, &format!("{prefix}.layer_output_scale.weight"), device)?,
