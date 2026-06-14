@@ -2720,6 +2720,17 @@ mod quantized_gemma4 {
         x_normed.to_dtype(x.dtype())
     }
 
+    /// Applies a `tanh`-based softcap to the final logits:
+    /// `logits = tanh(logits / cap) * cap`.
+    ///
+    /// Matches upstream llama.cpp's `hparams.f_final_logit_softcapping`
+    /// handling (`ggml_scale` by `1/cap`, `ggml_tanh`, `ggml_scale` by
+    /// `cap`), which bounds the final logits to `(-cap, cap)`.
+    fn apply_final_logit_softcapping(logits: &Tensor, softcap: f32) -> Result<Tensor> {
+        let softcap = f64::from(softcap);
+        (logits / softcap)?.tanh()? * softcap
+    }
+
     /// Reads a required `gemma4.{suffix}` array with exactly `expected_len`
     /// elements, converting each element to `u32` via [`value_to_u32`].
     fn md_u32_array(
@@ -2750,6 +2761,11 @@ mod quantized_gemma4 {
         layers: Vec<LayerWeights>,
         norm: RmsNorm,
         output: QMatMul,
+        /// `tanh`-based softcap applied to the final logits
+        /// (`gemma4.final_logit_softcapping`), e.g. `logits =
+        /// tanh(logits / cap) * cap`. Absent in synthetic/test GGUFs and some
+        /// exports, in which case the final logits are left unscaled.
+        final_logit_softcapping: Option<f32>,
         span: tracing::Span,
         span_output: tracing::Span,
     }
@@ -2831,6 +2847,13 @@ mod quantized_gemma4 {
                 .ok()
                 .map(|tensor| tensor.dequantize(device)?.flatten_all()?.to_vec1::<f32>())
                 .transpose()?;
+
+            // `tanh`-based softcap applied to the final logits
+            // (`logits = tanh(logits / cap) * cap`), per upstream
+            // llama.cpp's `hparams.f_final_logit_softcapping`. Absent in
+            // synthetic/test GGUFs and some exports, in which case the
+            // final logits are left unscaled.
+            let final_logit_softcapping = md_f32(&ct, "final_logit_softcapping").ok();
 
             let mut layers = Vec::with_capacity(block_count);
             for (layer_idx, layer_config) in layer_configs.into_iter().enumerate() {
@@ -2944,6 +2967,7 @@ mod quantized_gemma4 {
                 layers,
                 norm,
                 output: QMatMul::from_qtensor(output)?,
+                final_logit_softcapping,
                 span,
                 span_output,
             })
@@ -3006,8 +3030,39 @@ mod quantized_gemma4 {
             let x = layer_in.i((.., seq_len - 1, ..))?;
             let x = self.norm.forward(&x)?;
             let output = self.output.forward(&x)?;
+            let output = match self.final_logit_softcapping {
+                Some(softcap) if softcap != 0.0 => apply_final_logit_softcapping(&output, softcap)?,
+                _ => output,
+            };
 
             Ok(output)
+        }
+    }
+
+    #[cfg(test)]
+    mod softcap_tests {
+        use super::apply_final_logit_softcapping;
+        use candle_core::{Device, Tensor};
+
+        #[test]
+        fn softcapping_bounds_logits_to_plus_minus_cap() {
+            let device = Device::Cpu;
+            let logits = Tensor::new(&[60.0f32, -60.0, 0.0], &device).expect("logits tensor");
+
+            let capped = apply_final_logit_softcapping(&logits, 30.0)
+                .expect("softcapping should succeed")
+                .to_vec1::<f32>()
+                .expect("capped logits");
+
+            assert!(
+                capped.iter().all(|v| v.abs() < 30.0),
+                "softcapped logits {capped:?} should be strictly within (-30, 30)"
+            );
+            assert!(
+                (capped[2] - 0.0).abs() < 1e-6,
+                "tanh(0) * cap should be 0, got {}",
+                capped[2]
+            );
         }
     }
 }
