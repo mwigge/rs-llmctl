@@ -114,6 +114,47 @@ discovery (sysfs + `rocm-smi`) is independently useful for reporting/capacity
 planning even before an AMD execution backend exists, and removing the enum
 variant would just have to be re-added for (b).
 
+### (e) Rust-native ROCm GEMM backend via FFI bindings (rocm-rs / oxicuda-rocm)
+
+Build a small custom compute backend for `quantized_gemma4`/`quantized_qwen3`
+that calls ROCm's GEMM/BLAS libraries directly from Rust via existing FFI
+crates, rather than waiting for huggingface/candle#3424 or shelling out to
+llama.cpp. Two Linux/AMD-only crates surfaced during research:
+
+- **rocm-rs** (MIT, v0.5.0, "early development"): raw FFI bindings to
+  rocBLAS, MIOpen, HIP runtime, rocRAND, rocSOLVER, rocSPARSE, rocFFT (safe
+  wrapper currently only for rocFFT). Requires ROCm 6.3+ dev headers/libs at
+  *build* time — the same "needs ROCm dev stack installed" cost as option
+  (b)'s HIP/hipBLAS variant. This is the same kind of FFI approach
+  candle#3424 itself takes (BERT-only, WIP).
+- **oxicuda-rocm** (Apache-2.0): pure-Rust HIP + hipBLAS bindings that
+  `dlopen` the ROCm runtime libraries at *runtime* via `libloading` — no
+  ROCm dev headers needed at build time, only the ROCm runtime installed on
+  the host. Provides hipRTC (runtime kernel compilation), hipBLAS GEMM,
+  device memory management, multi-GPU dispatch.
+
+| Pros | Cons |
+|---|---|
+| Stays pure-Rust/in-process — no second runtime, no subprocess management | Quantized (Q4_K_M etc.) GEMM isn't in rocBLAS/hipBLAS — would need Composable Kernel/rocWMMA or custom HIP kernels for dequant+matmul, which neither crate wraps yet |
+| oxicuda-rocm's dlopen approach avoids ROCm-dev-headers-at-build-time, lowering the CI/build burden vs (b)'s HIP/hipBLAS variant | Both crates are early-stage — significant integration work either way |
+| Reuses `resources.rs`'s existing AMD GPU discovery (sysfs + `rocm-smi`) for device selection | Duplicates the goal of candle#3424 (a ROCm candle backend) as a parallel, rs-llmctl-local effort — maintenance burden if candle lands its own backend later |
+| No new external process/binary to manage (vs (b)) | Neither crate's docs mention RDNA4/gfx12 (Navi 44) validation |
+
+Also considered: the `amdgcn-amd-amdhsa` rustc target (Tier 3, write raw GPU
+kernels in Rust, `no_std`, `-Zbuild-std=core`, loaded via HIP/ROCR).
+Discarded for now — Tier 3 means nightly-only plus manual `core` builds, and
+it would mean hand-writing dequantized-GEMM kernels from scratch, a much
+larger lift than wrapping rocBLAS/hipBLAS/MIOpen via FFI.
+
+Stack note: both rocm-rs and oxicuda-rocm sit on top of **HIP**, which in
+turn sits on **ROCR** (`github.com/ROCm/rocm-systems/.../rocr-runtime`) —
+the C/C++ user-mode HSA runtime that does agent discovery, queue/signal
+management, and memory allocation against the `amdgpu`/ROCk kernel driver.
+ROCR is not itself a separate option here: it's the foundation any HIP-based
+path (b or e) already depends on transitively, and it's part of why
+`rocm-smi`-based discovery in `resources.rs` works today even without a full
+ROCm dev/build stack installed.
+
 ### Other options considered and discarded
 
 - **ONNX Runtime + ROCm execution provider** — would require exporting/
@@ -155,6 +196,15 @@ variant would just have to be re-added for (b).
 
 4. **(c)** is explicitly out of scope.
 
+5. **Track (e) as a lighter-weight alternative to (a)**: when revisiting
+   candle#3424, also evaluate whether `oxicuda-rocm`'s dlopen-based
+   HIP/hipBLAS bindings (no ROCm dev headers at build time) are mature
+   enough to prototype a minimal in-process GEMM dispatch for
+   `quantized_gemma4`/`quantized_qwen3`, as a smaller-scope alternative to
+   either waiting on candle or building the (b) llama.cpp subprocess path.
+   Quantized-GEMM kernel coverage (Composable Kernel/rocWMMA) remains the
+   open question for this option.
+
 ### Effort sizing
 
 | Option | Effort | Outcome |
@@ -164,6 +214,7 @@ variant would just have to be re-added for (b).
 | (b) — HIP/hipBLAS FFI or subprocess | Multi-week: FFI crate evaluation (`llama-cpp-2`) or HIP build pipeline, ROCm dev stack install/CI, new parallel in-process runtime path if FFI, GGUF compat + sampling/streaming parity testing | Best AMD performance, highest build/maintenance cost |
 | (c) | Multi-month, upstream-controlled | Not recommended |
 | (d) | Trivial (doc comments only) | Removes misleading "AMD GPU supported" implication; preserves the planning hook |
+| (e) — Rust FFI (rocm-rs/oxicuda-rocm) GEMM backend | Multi-week, exploratory: prototype hipBLAS GEMM dispatch via oxicuda-rocm (no ROCm dev headers needed), then quantized-kernel coverage (Composable Kernel/rocWMMA) for Q4_K_M-style formats — largest unknown of any option | In-process, pure-Rust AMD GPU path if quantized kernel coverage works out; otherwise reduces to a GEMM-only speedup for non-quantized paths |
 
 ## Consequences
 
