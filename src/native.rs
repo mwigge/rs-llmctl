@@ -541,6 +541,50 @@ pub fn canonical_native_chat_input(messages: &[NativeChatMessage]) -> String {
     input
 }
 
+/// Renders `messages` using the Gemma chat template
+/// (`<start_of_turn>{role}\n{content}<end_of_turn>\n`), as Gemma 2/3/4 were
+/// instruction-tuned.
+///
+/// Gemma has no `system` role: any `system`-role messages are folded into the
+/// first `user` turn, separated from the user's own content by a blank line.
+/// All non-`assistant` roles (`user`, `tool`, etc.) map to `user`; `assistant`
+/// maps to `model`. The rendered prompt always ends with a trailing
+/// `<start_of_turn>model\n` (no closing `<end_of_turn>`) as the generation cue.
+#[must_use]
+pub fn gemma_chat_input(messages: &[NativeChatMessage]) -> String {
+    let system_preamble: String = messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut input = String::new();
+    let mut preamble_remaining = Some(system_preamble).filter(|preamble| !preamble.is_empty());
+
+    for message in messages.iter().filter(|message| message.role != "system") {
+        let role = if message.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
+        let content = message_content_text(message);
+
+        input.push_str("<start_of_turn>");
+        input.push_str(role);
+        input.push('\n');
+        if let Some(preamble) = preamble_remaining.take() {
+            input.push_str(&preamble);
+            input.push_str("\n\n");
+        }
+        input.push_str(&content);
+        input.push_str("<end_of_turn>\n");
+    }
+
+    input.push_str("<start_of_turn>model\n");
+    input
+}
+
 pub fn message_content_text(message: &NativeChatMessage) -> String {
     match &message.content {
         Some(Value::String(content)) => content.clone(),
@@ -1703,6 +1747,11 @@ fn load_real_candle_decoder(
 struct RealCandleDecoder {
     tokenizer: tokenizers::tokenizer::Tokenizer,
     model: Mutex<RealCandleModel>,
+    family: CandleModelFamily,
+    /// BOS token id to prepend to the generation prompt's `input_ids`, if the
+    /// GGUF tokenizer metadata configures `add_bos_token = true`. See
+    /// [`gguf_bos_token_to_prepend`] and [`prepend_bos_if_configured`].
+    bos_token_id: Option<u32>,
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -1744,7 +1793,7 @@ fn load_real_candle_decoder(
     }
 
     let device = candle_core::Device::Cpu;
-    let tokenizer = load_generation_tokenizer(model_path, artifacts)
+    let (tokenizer, bos_token_id) = load_generation_tokenizer(model_path, artifacts)
         .with_context(|| "failed to load native generation tokenizer")?;
     let model = match artifacts.model_format {
         NativeModelFormat::Safetensors => {
@@ -1836,6 +1885,8 @@ fn load_real_candle_decoder(
     Ok(NativeCandleDecoder::Real(RealCandleDecoder {
         tokenizer,
         model: Mutex::new(model),
+        family,
+        bos_token_id,
     }))
 }
 
@@ -1848,12 +1899,20 @@ impl RealCandleDecoder {
             .map_err(|_| anyhow::anyhow!("native Candle model lock is poisoned"))?;
         model.clear_kv_cache();
 
-        let prompt = canonical_native_chat_input(&request.messages);
+        let prompt = match self.family {
+            CandleModelFamily::Gemma4 => gemma_chat_input(&request.messages),
+            CandleModelFamily::Qwen3
+            | CandleModelFamily::DeepSeek
+            | CandleModelFamily::Kimi
+            | CandleModelFamily::Mistral
+            | CandleModelFamily::MiniMax => canonical_native_chat_input(&request.messages),
+        };
         let encoding = self
             .tokenizer
             .encode(prompt, false)
             .map_err(|err| anyhow::anyhow!("failed to tokenize native prompt: {err}"))?;
         let mut input_ids = encoding.get_ids().to_vec();
+        prepend_bos_if_configured(&mut input_ids, self.bos_token_id);
         if input_ids.is_empty() {
             bail!("native prompt tokenization produced no tokens");
         }
@@ -1983,6 +2042,47 @@ fn tokenizer_from_gguf_content(
     }
 }
 
+/// Returns the BOS token id that [`prepend_bos_if_configured`] should insert at
+/// the start of `input_ids` for the generation prompt, based on GGUF tokenizer
+/// metadata.
+///
+/// `encode(prompt, false)` bypasses the tokenizer's post-processor, so a
+/// `tokenizer.ggml.add_bos_token = true` configuration (as set by
+/// [`gemma4_gguf_tokenizer::build`]) never actually adds `<bos>` to the
+/// generation prompt. This function reads that intent directly from the GGUF
+/// metadata so callers can apply it manually.
+///
+/// Returns `None` for tokenizer kinds that don't carry this metadata (e.g.
+/// `gpt2`), which keeps this a no-op for the existing Qwen3/other native model
+/// paths.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn gguf_bos_token_to_prepend(content: &candle_core::quantized::gguf_file::Content) -> Option<u32> {
+    let model_kind = gemma4_gguf_tokenizer::metadata_value(content, "tokenizer.ggml.model")
+        .and_then(|value| value.to_string().map_err(candle_core::Error::wrap))
+        .ok()?
+        .to_lowercase();
+
+    match model_kind.as_str() {
+        "gemma4" => gemma4_gguf_tokenizer::bos_token_to_prepend(content),
+        _ => None,
+    }
+}
+
+/// Prepends `bos_token_id` to `input_ids` if it is configured and not already
+/// the first element.
+///
+/// No-op when `bos_token_id` is `None`, or when `input_ids` already starts with
+/// that id (e.g. because the tokenizer's post-processor already added it).
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn prepend_bos_if_configured(input_ids: &mut Vec<u32>, bos_token_id: Option<u32>) {
+    let Some(bos_token_id) = bos_token_id else {
+        return;
+    };
+    if input_ids.first() != Some(&bos_token_id) {
+        input_ids.insert(0, bos_token_id);
+    }
+}
+
 /// Native (non-candle) construction of a SentencePiece-metaspace BPE tokenizer
 /// from `gemma4`-flavoured GGUF metadata.
 ///
@@ -2055,6 +2155,28 @@ mod gemma4_gguf_tokenizer {
     fn unk_token_id(ct: &gguf_file::Content) -> Option<u32> {
         metadata_value(ct, "tokenizer.ggml.unknown_token_id")
             .or_else(|_| metadata_value(ct, "tokenizer.ggml.unk_token_id"))
+            .and_then(gguf_value_to_u32)
+            .ok()
+    }
+
+    /// Returns the BOS token id that callers should prepend to encoded prompts,
+    /// if `tokenizer.ggml.add_bos_token` is `true` and `tokenizer.ggml.bos_token_id`
+    /// is present.
+    ///
+    /// `encode(prompt, false)` (used for the generation prompt) skips the
+    /// tokenizer's post-processor entirely, so the post-processor configured by
+    /// [`build`] never has a chance to add `<bos>`. Callers must prepend it
+    /// manually via [`super::prepend_bos_if_configured`]. This is independent of
+    /// `tokenizer.ggml.add_eos_token`, which would otherwise also append `<eos>`
+    /// if `encode(prompt, true)` were used instead.
+    pub(super) fn bos_token_to_prepend(ct: &gguf_file::Content) -> Option<u32> {
+        let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(false);
+        if !add_bos {
+            return None;
+        }
+        metadata_value(ct, "tokenizer.ggml.bos_token_id")
             .and_then(gguf_value_to_u32)
             .ok()
     }
@@ -2796,22 +2918,35 @@ mod quantized_gemma4 {
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+/// Loads the generation tokenizer for `artifacts`, along with the BOS token id
+/// (if any) that [`RealCandleDecoder::generate`] must manually prepend to the
+/// generation prompt's `input_ids` via [`prepend_bos_if_configured`].
+///
+/// `encode(prompt, false)`, used for the generation prompt, bypasses the
+/// tokenizer's post-processor, so a GGUF-configured `add_bos_token = true`
+/// would otherwise have no effect. The safetensors path returns `None` here
+/// unchanged — its `tokenizer.json` is not inspected for this metadata, which
+/// keeps this a no-op for the existing Qwen3/other safetensors-backed paths.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 fn load_generation_tokenizer(
     model_path: &Path,
     artifacts: &CandleArtifactValidation,
-) -> Result<tokenizers::tokenizer::Tokenizer> {
+) -> Result<(tokenizers::tokenizer::Tokenizer, Option<u32>)> {
     match artifacts.model_format {
         NativeModelFormat::Safetensors => {
             let tokenizer_path = safetensors_artifact_dir(model_path).join("tokenizer.json");
-            tokenizers::tokenizer::Tokenizer::from_file(&tokenizer_path)
-                .map_err(|err| anyhow::anyhow!("failed to load tokenizer.json: {err}"))
+            let tokenizer = tokenizers::tokenizer::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|err| anyhow::anyhow!("failed to load tokenizer.json: {err}"))?;
+            Ok((tokenizer, None))
         }
         NativeModelFormat::Gguf => {
             let mut file = fs::File::open(model_path)
                 .with_context(|| "failed to open GGUF tokenizer metadata")?;
             let content = candle_core::quantized::gguf_file::Content::read(&mut file)
                 .with_context(|| "failed to read GGUF tokenizer metadata")?;
-            tokenizer_from_gguf_content(&content)
+            let tokenizer = tokenizer_from_gguf_content(&content)?;
+            let bos_token_id = gguf_bos_token_to_prepend(&content);
+            Ok((tokenizer, bos_token_id))
         }
         NativeModelFormat::Unknown => bail!("native artifact format is unsupported"),
     }
@@ -3848,6 +3983,67 @@ mod tests {
         assert_eq!(
             canonical_native_chat_input(&messages),
             "<|system|>\nanswer briefly\n<|user|>\nhello\n"
+        );
+    }
+
+    #[test]
+    fn gemma_chat_input_folds_system_into_first_user_turn() {
+        let messages = vec![
+            NativeChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("answer briefly".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("hello".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        assert_eq!(
+            gemma_chat_input(&messages),
+            "<start_of_turn>user\nanswer briefly\n\nhello<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn gemma_chat_input_maps_assistant_role_to_model_and_appends_generation_cue() {
+        let messages = vec![
+            NativeChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("be terse".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("hi".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String("hello there".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("how are you?".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        assert_eq!(
+            gemma_chat_input(&messages),
+            "<start_of_turn>user\nbe terse\n\nhi<end_of_turn>\n\
+             <start_of_turn>model\nhello there<end_of_turn>\n\
+             <start_of_turn>user\nhow are you?<end_of_turn>\n\
+             <start_of_turn>model\n"
         );
     }
 
@@ -4961,6 +5157,39 @@ mod gguf_tokenizer_tests {
     }
 
     #[test]
+    fn gguf_bos_token_to_prepend_reads_gemma4_add_bos_token_metadata() {
+        let content = gemma4_content();
+        assert_eq!(gguf_bos_token_to_prepend(&content), Some(2));
+    }
+
+    #[test]
+    fn gguf_bos_token_to_prepend_is_none_when_add_bos_token_is_absent() {
+        let content = gpt2_content();
+        assert_eq!(gguf_bos_token_to_prepend(&content), None);
+    }
+
+    #[test]
+    fn prepend_bos_if_configured_inserts_missing_bos() {
+        let mut input_ids = vec![10, 11, 12];
+        prepend_bos_if_configured(&mut input_ids, Some(2));
+        assert_eq!(input_ids, vec![2, 10, 11, 12]);
+    }
+
+    #[test]
+    fn prepend_bos_if_configured_is_noop_when_bos_already_present() {
+        let mut input_ids = vec![2, 10, 11, 12];
+        prepend_bos_if_configured(&mut input_ids, Some(2));
+        assert_eq!(input_ids, vec![2, 10, 11, 12]);
+    }
+
+    #[test]
+    fn prepend_bos_if_configured_is_noop_when_bos_token_id_is_none() {
+        let mut input_ids = vec![10, 11, 12];
+        prepend_bos_if_configured(&mut input_ids, None);
+        assert_eq!(input_ids, vec![10, 11, 12]);
+    }
+
+    #[test]
     fn unsupported_tokenizer_model_is_rejected() {
         let content = unsupported_content();
         let err = tokenizer_from_gguf_content(&content)
@@ -5009,6 +5238,102 @@ mod gguf_tokenizer_tests {
         eprintln!("ids: {ids:?}");
         eprintln!("decoded: {decoded:?}");
         assert_eq!(decoded, "Hello, world!");
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk"]
+    fn real_gemma4_gguf_chat_input_ids_begin_with_bos_token() {
+        let path =
+            Path::new("/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let mut file = fs::File::open(path).expect("open real gemma4 gguf");
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .expect("read real gemma4 gguf metadata");
+
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("build tokenizer from real gemma4 gguf metadata");
+        let bos_token_id = gguf_bos_token_to_prepend(&content);
+        assert_eq!(
+            bos_token_id,
+            Some(2),
+            "gemma4 GGUF should configure bos_token_id=2 with add_bos_token=true"
+        );
+
+        let messages = vec![NativeChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::String(
+                "Say hello in one short sentence.".to_string(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let prompt = gemma_chat_input(&messages);
+        let encoding = tokenizer.encode(prompt, false).expect("encode chat prompt");
+        let mut input_ids = encoding.get_ids().to_vec();
+        prepend_bos_if_configured(&mut input_ids, bos_token_id);
+
+        eprintln!("input_ids: {input_ids:?}");
+        assert_eq!(
+            input_ids.first().copied(),
+            Some(2),
+            "constructed input_ids should begin with the gemma BOS token id (2)"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk and runs a full 12B forward pass"]
+    fn real_gemma4_generation_produces_non_garbage_output() {
+        let model_path =
+            Path::new("/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf");
+        if !model_path.exists() {
+            eprintln!("skipping: {} not present", model_path.display());
+            return;
+        }
+
+        let artifacts = CandleArtifactValidation {
+            model_family: CandleModelFamily::Gemma4,
+            model_format: NativeModelFormat::Gguf,
+            layout: CandleArtifactLayout::for_format(NativeModelFormat::Gguf),
+            weight_files: vec![artifact_file_name(model_path)],
+            tokenizer_file: None,
+            config_file: None,
+        };
+
+        let decoder = load_real_candle_decoder(CandleModelFamily::Gemma4, model_path, &artifacts)
+            .expect("load real gemma4 candle decoder from GGUF");
+
+        let request = NativeChatRequest {
+            model: "gemma4:12b".to_string(),
+            messages: vec![NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String(
+                    "Say hello in one short sentence.".to_string(),
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            max_tokens: Some(32),
+            tools: None,
+            tool_choice: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let output = decoder
+            .generate(&request)
+            .expect("real gemma4 generation should succeed");
+
+        eprintln!("decoded output: {output:?}");
+        assert!(!output.is_empty(), "decoded output should be non-empty");
+        assert!(
+            output.chars().any(|ch| ch.is_ascii_alphabetic()),
+            "decoded output `{output}` should contain at least one ASCII letter, \
+             got what looks like garbage/replacement-character output"
+        );
     }
 }
 
