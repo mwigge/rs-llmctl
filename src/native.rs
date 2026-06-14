@@ -1042,6 +1042,10 @@ impl NativeModelFormat {
 pub enum NativeAcceleration {
     Cpu,
     NvidiaCuda,
+    /// Resource-planning hook only — no candle-native execution backend
+    /// implements AMD GPU execution yet (candle 0.10.2 has no ROCm/HIP/
+    /// Vulkan device backend). Selecting this still fails closed to CPU
+    /// via `NativeCandleEngineLoader::load`. See `docs/adr/0001-amd-gpu-acceleration.md`.
     AmdRocm,
     AppleMetal,
     Auto,

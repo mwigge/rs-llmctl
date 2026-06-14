@@ -36,6 +36,9 @@ impl WorkerId {
 pub enum WorkerBackend {
     Cpu,
     Nvidia { gpu_layers: u32 },
+    /// Resource-planning hook only — candle-native has no AMD execution
+    /// backend (candle 0.10.2 lacks ROCm/HIP/Vulkan). Selecting this still
+    /// fails closed to CPU. See `docs/adr/0001-amd-gpu-acceleration.md`.
     AmdVulkan { gpu_layers: u32 },
     Metal { gpu_layers: u32 },
 }

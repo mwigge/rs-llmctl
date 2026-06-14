@@ -313,6 +313,8 @@ fn artifact_validation_plan(
 }
 
 fn hardware_matrix() -> Vec<NativeHardwareValidationTarget> {
+    // "amd-vulkan" is a resource-planning target only — no candle-native
+    // execution backend implements it yet. See docs/adr/0001-amd-gpu-acceleration.md.
     [
         ("cpu", NativeAcceleration::Cpu, true),
         ("nvidia-cuda", NativeAcceleration::NvidiaCuda, false),
