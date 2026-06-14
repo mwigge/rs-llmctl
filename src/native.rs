@@ -2468,7 +2468,12 @@ mod quantized_gemma4 {
     struct LayerWeights {
         attention_wq: QMatMul,
         attention_wk: QMatMul,
-        attention_wv: QMatMul,
+        /// Value projection. Absent on global (non-sliding) layers, which
+        /// have no `attn_v.weight` tensor in the GGUF; on those layers the
+        /// raw key projection output is reused as the value projection
+        /// (`Vcur = Kcur` in upstream llama.cpp's gemma4 graph, before any
+        /// reshape/norm/RoPE is applied to `Kcur`).
+        attention_wv: Option<QMatMul>,
         attention_wo: QMatMul,
 
         attention_q_norm: RmsNorm,
@@ -2490,6 +2495,15 @@ mod quantized_gemma4 {
 
         rotary_embedding: RotaryEmbedding,
         neg_inf: Tensor,
+
+        /// `eps` used for the unweighted RMS normalization applied to the
+        /// value projection (see [`rms_norm_unweighted`]).
+        rms_norm_eps: f64,
+
+        /// Scalar multiplier applied to this block's full output (after both
+        /// the attention and feed-forward residual additions) before it is
+        /// passed to the next layer, read from `blk.N.layer_output_scale.weight`.
+        layer_output_scale: f32,
 
         kv_cache: Option<(Tensor, Tensor)>,
 
@@ -2545,7 +2559,13 @@ mod quantized_gemma4 {
 
             let q = self.attention_wq.forward(x)?;
             let k = self.attention_wk.forward(x)?;
-            let v = self.attention_wv.forward(x)?;
+            // Global (non-sliding) layers have no `attn_v.weight`; upstream
+            // llama.cpp reuses the raw key projection output as `Vcur` in
+            // that case (`Vcur = Kcur` before any reshape/norm/RoPE).
+            let v = match &self.attention_wv {
+                Some(wv) => wv.forward(x)?,
+                None => k.clone(),
+            };
 
             let q = q
                 .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
@@ -2559,6 +2579,11 @@ mod quantized_gemma4 {
 
             let q = self.attention_q_norm.forward(&q.contiguous()?)?;
             let k = self.attention_k_norm.forward(&k.contiguous()?)?;
+            // gemma4 applies an unweighted RMS norm to V on every layer
+            // (`ggml_rms_norm(Vcur, eps)` in upstream llama.cpp), unlike K
+            // which uses the learned `attn_k_norm` weight. V never receives
+            // RoPE.
+            let v = rms_norm_unweighted(&v.contiguous()?, self.rms_norm_eps)?;
 
             let (q, k) = self
                 .rotary_embedding
@@ -2650,6 +2675,34 @@ mod quantized_gemma4 {
         };
         u32::try_from(as_i64)
             .map_err(|_| candle_core::Error::msg(format!("value {as_i64} out of range for u32")))
+    }
+
+    /// Dequantizes a `[1]`-shaped GGUF tensor (e.g. `blk.N.layer_output_scale.weight`)
+    /// to a single `f32` scalar.
+    fn dequantize_scalar_f32(tensor: QTensor, device: &Device) -> Result<f32> {
+        let values = tensor.dequantize(device)?.flatten_all()?.to_vec1::<f32>()?;
+        match values.as_slice() {
+            [value] => Ok(*value),
+            other => candle_core::bail!(
+                "expected a single-element tensor, got {} elements",
+                other.len()
+            ),
+        }
+    }
+
+    /// Applies an unweighted RMS normalization (`x / sqrt(mean(x^2) + eps)`)
+    /// over the last dimension of `x`, with no learned scale.
+    ///
+    /// gemma4 applies this to the value projection on every layer (see
+    /// `ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)` in upstream
+    /// llama.cpp), in contrast to the key projection which uses the learned
+    /// `attn_k_norm` weight.
+    fn rms_norm_unweighted(x: &Tensor, eps: f64) -> Result<Tensor> {
+        let hidden_size = x.dim(D::Minus1)?;
+        let x32 = x.to_dtype(DType::F32)?;
+        let norm_x = (x32.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let x_normed = x32.broadcast_div(&(norm_x + eps)?.sqrt()?)?;
+        x_normed.to_dtype(x.dtype())
     }
 
     /// Reads a required `gemma4.{suffix}` array with exactly `expected_len`
@@ -2760,14 +2813,11 @@ mod quantized_gemma4 {
 
                 let attention_wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
                 let attention_wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
-                // Global (non-sliding) layers tie V to K (value_length == key_length
-                // for these layers), so `attn_v.weight` is absent in the GGUF; reread
-                // `attn_k.weight` as the value projection in that case.
+                // Global (non-sliding) layers have no `attn_v.weight` tensor in the
+                // GGUF at all; `forward_attn` reuses the raw key projection output
+                // as `Vcur` in that case, matching upstream llama.cpp.
                 let attention_wv =
-                    match ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device) {
-                        Ok(tensor) => tensor,
-                        Err(_) => ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?,
-                    };
+                    ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device).ok();
                 let attention_wo =
                     ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
@@ -2816,13 +2866,18 @@ mod quantized_gemma4 {
                 let rotary_embedding =
                     RotaryEmbedding::new(layer_config.head_dim, layer_config.rope_freq, device)?;
 
+                let layer_output_scale = dequantize_scalar_f32(
+                    ct.tensor(reader, &format!("{prefix}.layer_output_scale.weight"), device)?,
+                    device,
+                )?;
+
                 let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
                 let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
 
                 layers.push(LayerWeights {
                     attention_wq: QMatMul::from_qtensor(attention_wq)?,
                     attention_wk: QMatMul::from_qtensor(attention_wk)?,
-                    attention_wv: QMatMul::from_qtensor(attention_wv)?,
+                    attention_wv: attention_wv.map(QMatMul::from_qtensor).transpose()?,
                     attention_wo: QMatMul::from_qtensor(attention_wo)?,
                     attention_q_norm,
                     attention_k_norm,
@@ -2838,6 +2893,8 @@ mod quantized_gemma4 {
                     sliding_window_size: layer_config.sliding_window_size,
                     rotary_embedding,
                     neg_inf: neg_inf.clone(),
+                    rms_norm_eps,
+                    layer_output_scale,
                     kv_cache: None,
                     span_attn,
                     span_mlp,
@@ -2903,7 +2960,10 @@ mod quantized_gemma4 {
                 let x = (x + residual)?;
                 drop(_enter);
 
-                layer_in = x;
+                // `layer_output_scale` scales this block's entire output
+                // (i.e. the hidden state handed to the next layer), not just
+                // the attention or feed-forward delta.
+                layer_in = (x * f64::from(layer.layer_output_scale))?;
             }
 
             let _enter = self.span_output.enter();
@@ -5496,12 +5556,17 @@ mod quantized_gemma4_tests {
                 &format!("{prefix}.attn_k.weight"),
                 &[kv_dim, EMBEDDING_LENGTH],
             );
-            push_tensor(
-                &mut data,
-                &mut tensor_infos,
-                &format!("{prefix}.attn_v.weight"),
-                &[kv_dim, EMBEDDING_LENGTH],
-            );
+            // Global (non-sliding) layers have no `attn_v.weight` in the real
+            // GGUF; mirror that here so the fixture exercises the
+            // `Vcur = Kcur` fallback path.
+            if pattern == 1 {
+                push_tensor(
+                    &mut data,
+                    &mut tensor_infos,
+                    &format!("{prefix}.attn_v.weight"),
+                    &[kv_dim, EMBEDDING_LENGTH],
+                );
+            }
             push_tensor(
                 &mut data,
                 &mut tensor_infos,
@@ -5543,6 +5608,12 @@ mod quantized_gemma4_tests {
                 &mut tensor_infos,
                 &format!("{prefix}.post_ffw_norm.weight"),
                 &[EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.layer_output_scale.weight"),
+                &[1],
             );
             push_tensor(
                 &mut data,
