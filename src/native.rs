@@ -541,47 +541,36 @@ pub fn canonical_native_chat_input(messages: &[NativeChatMessage]) -> String {
     input
 }
 
-/// Renders `messages` using the Gemma chat template
-/// (`<start_of_turn>{role}\n{content}<end_of_turn>\n`), as Gemma 2/3/4 were
-/// instruction-tuned.
+/// Renders `messages` using Gemma 4's chat template turn format —
+/// `<|turn>{role}\n{content}<turn|>\n` — as embedded in this model's GGUF
+/// `tokenizer.chat_template`. The older Gemma 2/3
+/// `<start_of_turn>{role}\n{content}<end_of_turn>\n` format is NOT used here:
+/// those tokens are absent from this model's vocabulary and would otherwise
+/// be split into garbage sub-tokens, corrupting the prompt.
 ///
-/// Gemma has no `system` role: any `system`-role messages are folded into the
-/// first `user` turn, separated from the user's own content by a blank line.
-/// All non-`assistant` roles (`user`, `tool`, etc.) map to `user`; `assistant`
-/// maps to `model`. The rendered prompt always ends with a trailing
-/// `<start_of_turn>model\n` (no closing `<end_of_turn>`) as the generation cue.
+/// `assistant` maps to the `model` role; `system` is passed through
+/// unchanged; all other roles (`user`, `tool`, etc.) map to `user`. The
+/// rendered prompt always ends with the generation cue
+/// `<|turn>model\n<|channel>thought\n<channel|>` (no closing `<turn|>`).
 #[must_use]
 pub fn gemma_chat_input(messages: &[NativeChatMessage]) -> String {
-    let system_preamble: String = messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .map(message_content_text)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
     let mut input = String::new();
-    let mut preamble_remaining = Some(system_preamble).filter(|preamble| !preamble.is_empty());
 
-    for message in messages.iter().filter(|message| message.role != "system") {
-        let role = if message.role == "assistant" {
-            "model"
-        } else {
-            "user"
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" => "model",
+            "system" => "system",
+            _ => "user",
         };
-        let content = message_content_text(message);
 
-        input.push_str("<start_of_turn>");
+        input.push_str("<|turn>");
         input.push_str(role);
         input.push('\n');
-        if let Some(preamble) = preamble_remaining.take() {
-            input.push_str(&preamble);
-            input.push_str("\n\n");
-        }
-        input.push_str(&content);
-        input.push_str("<end_of_turn>\n");
+        input.push_str(message_content_text(message).trim());
+        input.push_str("<turn|>\n");
     }
 
-    input.push_str("<start_of_turn>model\n");
+    input.push_str("<|turn>model\n<|channel>thought\n<channel|>");
     input
 }
 
@@ -4051,7 +4040,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma_chat_input_folds_system_into_first_user_turn() {
+    fn gemma_chat_input_renders_system_as_its_own_turn() {
         let messages = vec![
             NativeChatMessage {
                 role: "system".to_string(),
@@ -4069,7 +4058,9 @@ mod tests {
 
         assert_eq!(
             gemma_chat_input(&messages),
-            "<start_of_turn>user\nanswer briefly\n\nhello<end_of_turn>\n<start_of_turn>model\n"
+            "<|turn>system\nanswer briefly<turn|>\n\
+             <|turn>user\nhello<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>"
         );
     }
 
@@ -4104,10 +4095,11 @@ mod tests {
 
         assert_eq!(
             gemma_chat_input(&messages),
-            "<start_of_turn>user\nbe terse\n\nhi<end_of_turn>\n\
-             <start_of_turn>model\nhello there<end_of_turn>\n\
-             <start_of_turn>user\nhow are you?<end_of_turn>\n\
-             <start_of_turn>model\n"
+            "<|turn>system\nbe terse<turn|>\n\
+             <|turn>user\nhi<turn|>\n\
+             <|turn>model\nhello there<turn|>\n\
+             <|turn>user\nhow are you?<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>"
         );
     }
 
