@@ -2939,6 +2939,7 @@ mod quantized_gemma4 {
                     Some(layer.mask(b_sz, seq_len, index_pos, x.dtype(), x.device())?)
                 };
 
+                let block_in = layer_in.clone();
                 let residual = &layer_in;
                 let x = layer.attention_norm.forward(&layer_in)?;
                 let x = layer.forward_attn(&x, attention_mask.as_ref(), index_pos)?;
@@ -2953,10 +2954,15 @@ mod quantized_gemma4 {
                 let x = (x + residual)?;
                 drop(_enter);
 
-                // `layer_output_scale` scales this block's entire output
-                // (i.e. the hidden state handed to the next layer), not just
-                // the attention or feed-forward delta.
-                layer_in = (x * f64::from(layer.layer_output_scale))?;
+                // `layer_output_scale` scales this block's contribution to the
+                // residual stream (the combined attention + feed-forward
+                // delta), not the residual stream itself — i.e.
+                // `h' = h + layer_output_scale * (block(h) - h)`. Scaling the
+                // whole accumulated stream at every layer compounds
+                // multiplicatively across 48 layers and washes out
+                // prompt-dependent information carried from earlier layers.
+                let delta = (&x - &block_in)?;
+                layer_in = (block_in + (delta * f64::from(layer.layer_output_scale))?)?;
             }
 
             let _enter = self.span_output.enter();
