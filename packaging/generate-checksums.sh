@@ -54,5 +54,9 @@ fi
 tar -C "${stage}" -czf "${tarball}" .
 (
   cd "${DIST_DIR}"
-  sha256sum rs-llmctl-*.tar.gz | sort -k2 > SHA256SUMS
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum rs-llmctl-*.tar.gz | sort -k2 > SHA256SUMS
+  else
+    shasum -a 256 rs-llmctl-*.tar.gz | sort -k2 > SHA256SUMS
+  fi
 )
