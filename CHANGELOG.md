@@ -3,6 +3,18 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## 1.6.2 - 2026-06-16
+
+- Native generation: Gemma4 GGUF models now load successfully. Previously the
+  engine failed at startup with `unsupported tokenizer model 'gemma4'` because
+  Candle's built-in GGUF tokenizer only handles GPT-2 style BPE. Gemma4 GGUF
+  stores BPE merges like GPT-2 but uses Metaspace (▁) whitespace escaping
+  instead of byte-level encoding. When Candle rejects the tokenizer model
+  identifier, the engine now falls back to building the tokenizer directly
+  from the same GGUF metadata (vocab + merges) with Metaspace as both
+  pre-tokenizer and decoder. This matches the fix merged into llama.cpp
+  (ggml-org/llama.cpp#21343). No configuration changes required.
+
 ## 1.5.0 - 2026-06-11
 
 - Storage: Postgres deployments now work end-to-end. Query placeholders are
