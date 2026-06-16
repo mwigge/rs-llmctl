@@ -1967,11 +1967,138 @@ fn load_generation_tokenizer(
                 .with_context(|| "failed to open GGUF tokenizer metadata")?;
             let content = candle_core::quantized::gguf_file::Content::read(&mut file)
                 .with_context(|| "failed to read GGUF tokenizer metadata")?;
-            <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(&content)
-            .map_err(|err| anyhow::anyhow!("failed to build tokenizer from GGUF metadata: {err}"))
+            let result = <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(&content);
+            match result {
+                Ok(tok) => Ok(tok),
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("unsupported tokenizer model") {
+                        tokenizer_from_gguf_spm(&content).with_context(|| {
+                            format!("failed to build SentencePiece tokenizer from GGUF ({msg})")
+                        })
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "failed to build tokenizer from GGUF metadata: {err}"
+                        ))
+                    }
+                }
+            }
         }
         NativeModelFormat::Unknown => bail!("native artifact format is unsupported"),
     }
+}
+
+// Fallback tokenizer for GGUF models that use SPM-style BPE (e.g. Gemma4).
+// These models store `tokenizer.ggml.model = "gemma4"` and carry BPE merges,
+// but use ▁ (U+2581) whitespace escaping rather than GPT-2 byte-level encoding.
+// Candle's TokenizerFromGguf only handles `"gpt2"`, so we build the tokenizer
+// manually from the same GGUF metadata.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn tokenizer_from_gguf_spm(
+    content: &candle_core::quantized::gguf_file::Content,
+) -> Result<tokenizers::tokenizer::Tokenizer> {
+    use tokenizers::{
+        decoders::DecoderWrapper,
+        models::bpe::{Vocab, BPE},
+        pre_tokenizers::{metaspace::Metaspace, metaspace::PrependScheme, PreTokenizerWrapper},
+        tokenizer::Tokenizer,
+        AddedToken,
+    };
+
+    let tokens_val = content
+        .metadata
+        .get("tokenizer.ggml.tokens")
+        .with_context(|| "missing tokenizer.ggml.tokens")?;
+    let tokens: Vec<String> = tokens_val
+        .to_vec()
+        .with_context(|| "tokenizer.ggml.tokens is not an array")?
+        .iter()
+        .map(|v| {
+            v.to_string()
+                .cloned()
+                .map_err(|e| anyhow::anyhow!("token is not a string: {e}"))
+        })
+        .collect::<Result<_>>()?;
+
+    let vocab: Vocab = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.clone(), i as u32))
+        .collect();
+
+    let merges: Vec<(String, String)> = content
+        .metadata
+        .get("tokenizer.ggml.merges")
+        .and_then(|v| v.to_vec().ok())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let s = v.to_string().ok()?;
+                    let (a, b) = s.split_once(' ')?;
+                    Some((a.to_string(), b.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
+
+    if let Some(v) = content.metadata.get("tokenizer.ggml.unk_token_id") {
+        let id = match v {
+            candle_core::quantized::gguf_file::Value::U32(n) => Some(*n as usize),
+            candle_core::quantized::gguf_file::Value::U64(n) => Some(*n as usize),
+            candle_core::quantized::gguf_file::Value::I32(n) => Some(*n as usize),
+            _ => None,
+        };
+        if let Some(idx) = id {
+            if let Some(tok) = tokens.get(idx) {
+                builder = builder.unk_token(tok.clone());
+            }
+        }
+    }
+
+    if let Some(v) = content.metadata.get("tokenizer.ggml.ignore_merges") {
+        if let Ok(flag) = v.to_bool() {
+            builder = builder.ignore_merges(flag);
+        }
+    }
+
+    let bpe = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build BPE model: {e}"))?;
+
+    let metaspace = Metaspace::new('▁', PrependScheme::Always, true);
+    let mut tokenizer = Tokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Metaspace(metaspace.clone())));
+    tokenizer.with_decoder(Some(DecoderWrapper::Metaspace(metaspace)));
+
+    if let Some(candle_core::quantized::gguf_file::Value::Array(type_arr)) =
+        content.metadata.get("tokenizer.ggml.token_type")
+    {
+        let specials: Vec<AddedToken> = type_arr
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, v)| {
+                let ty = match v {
+                    candle_core::quantized::gguf_file::Value::U32(n) => *n,
+                    candle_core::quantized::gguf_file::Value::I32(n) => *n as u32,
+                    _ => return None,
+                };
+                if matches!(ty, 2..=5) {
+                    tokens
+                        .get(idx)
+                        .map(|tok| AddedToken::from(tok.clone(), true))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !specials.is_empty() {
+            tokenizer.add_special_tokens(&specials);
+        }
+    }
+
+    Ok(tokenizer)
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
