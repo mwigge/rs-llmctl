@@ -255,6 +255,53 @@ enum ModelCommand {
     ImportManifest(ModelImportManifestArgs),
     Inventory,
     List,
+    Profile {
+        #[command(subcommand)]
+        command: ModelProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelProfileCommand {
+    List,
+    Inspect(ModelProfileAliasArgs),
+    ImportLocal(ModelProfileImportLocalArgs),
+    ImportCatalog(ModelProfileImportCatalogArgs),
+    Qualify(ModelProfileQualifyArgs),
+    Quarantine(ModelProfileQuarantineArgs),
+    Remove(ModelProfileAliasArgs),
+    Adapters,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileAliasArgs {
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileImportLocalArgs {
+    path: PathBuf,
+    #[arg(long)]
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileImportCatalogArgs {
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileQualifyArgs {
+    alias: String,
+    #[arg(long)]
+    available_vram_bytes: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileQuarantineArgs {
+    alias: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -301,6 +348,8 @@ enum RuntimeCommand {
     Heartbeat,
     Placement,
     Route(RuntimeRouteArgs),
+    AmdQualification(RuntimeAmdQualificationArgs),
+    Gemma4Readiness(RuntimeGemma4ReadinessArgs),
     ValidationPlan(RuntimeValidationPlanArgs),
     ValidationRun(RuntimeValidationRunArgs),
     Validate,
@@ -330,6 +379,26 @@ struct RuntimeValidationPlanArgs {
 struct RuntimeValidationRunArgs {
     #[arg(long)]
     evidence_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeGemma4ReadinessArgs {
+    #[arg(long)]
+    model_path: PathBuf,
+    #[arg(long, default_value = "gemma4")]
+    alias: String,
+    #[arg(long)]
+    evidence_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeAmdQualificationArgs {
+    #[arg(long)]
+    preview: bool,
+    #[arg(long, alias = "community-opt-in")]
+    arch_opt_in: bool,
+    #[arg(long)]
+    evidence: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1728,6 +1797,16 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             } else {
                 "running"
             };
+            let readiness = model
+                .family
+                .as_deref()
+                .filter(|family| family.eq_ignore_ascii_case("gemma4"))
+                .map(|_| {
+                    rs_llmctl::readiness::read_state(&rs_llmctl::readiness::evidence_path(
+                        &cfg.storage.model_dir,
+                        &model.alias,
+                    ))
+                });
 
             emit(
                 as_json,
@@ -1740,6 +1819,7 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
                     "runtime_backend": &cfg.runtime.backend,
                     "one_binary": true,
                     "entrypoint": one_binary_entrypoint(),
+                    "readiness": readiness,
                     "model": model,
                 }),
             )
@@ -1873,6 +1953,65 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             emit(as_json, &inventory)
         }
         ModelCommand::List => emit(as_json, &cfg.models),
+        ModelCommand::Profile { command } => {
+            model_profile_command(&cfg.storage.model_dir, command, as_json).await
+        }
+    }
+}
+
+async fn model_profile_command(
+    model_dir: &Path,
+    command: ModelProfileCommand,
+    as_json: bool,
+) -> Result<()> {
+    match command {
+        ModelProfileCommand::List => emit(as_json, &rs_llmctl::profiles::list_profiles(model_dir)?),
+        ModelProfileCommand::Inspect(args) => emit(
+            as_json,
+            &rs_llmctl::profiles::read_profile(model_dir, &args.alias)?,
+        ),
+        ModelProfileCommand::ImportLocal(args) => {
+            let profile =
+                rs_llmctl::profiles::import_local_candidate(&args.path, &args.alias).await?;
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": "candidate", "path": path, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::ImportCatalog(args) => {
+            let profile = rs_llmctl::profiles::import_catalog_candidate(&args.id)?;
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": "candidate", "path": path, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::Qualify(args) => {
+            let profile = rs_llmctl::profiles::read_profile(model_dir, &args.alias)?;
+            let (profile, policy) =
+                rs_llmctl::profiles::qualify_profile(profile, args.available_vram_bytes);
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": profile.qualification, "path": path, "policy": policy, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::Quarantine(args) => {
+            let mut profile = rs_llmctl::profiles::read_profile(model_dir, &args.alias)?;
+            profile.qualification = rs_llmctl::profiles::QualificationStatus::Quarantined;
+            profile.quarantine_reason = Some(args.reason);
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": "quarantined", "path": path, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::Remove(args) => {
+            rs_llmctl::profiles::remove_profile(model_dir, &args.alias)?;
+            emit(as_json, &json!({"status": "removed", "alias": args.alias}))
+        }
+        ModelProfileCommand::Adapters => emit(as_json, &rs_llmctl::profiles::backend_catalog()),
     }
 }
 
@@ -1940,6 +2079,25 @@ async fn runtime_command(path: &Path, command: RuntimeCommand, as_json: bool) ->
                 (Some(_), Some(_)) => unreachable!("clap enforces conflicts_with"),
             };
             emit(as_json, &selection)
+        }
+        RuntimeCommand::AmdQualification(args) => emit(
+            as_json,
+            &rs_llmctl::amd::qualification_report_with_evidence(
+                args.preview,
+                args.arch_opt_in,
+                args.evidence.as_deref(),
+            ),
+        ),
+        RuntimeCommand::Gemma4Readiness(args) => {
+            let evidence =
+                rs_llmctl::readiness::run_gemma4_readiness(&args.model_path, &args.alias).await?;
+            let evidence_path = args.evidence_output.unwrap_or_else(|| {
+                rs_llmctl::readiness::evidence_path(&cfg.storage.model_dir, &args.alias)
+            });
+            rs_llmctl::readiness::write_evidence(&evidence_path, &evidence)?;
+            let result = rs_llmctl::readiness::ensure_qualified(&evidence);
+            emit(as_json, &evidence)?;
+            result
         }
         RuntimeCommand::ValidationPlan(args) => emit(
             as_json,
@@ -2303,7 +2461,9 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                 return Ok(());
             }
             if !args.replace {
-                bail!("rotate-key requires --new-id for overlap rotation or --replace for in-place replacement");
+                bail!(
+                    "rotate-key requires --new-id for overlap rotation or --replace for in-place replacement"
+                );
             }
             let key = &mut cfg.security.api_keys[position];
             key.sha256 = sha256;
@@ -2608,7 +2768,9 @@ async fn read_api_key_secret(args: SecurityHashKeyArgs) -> Result<(String, &'sta
         return Ok((secret.trim_end_matches(['\r', '\n']).to_string(), "stdin"));
     }
 
-    bail!("security hash-key requires --stdin or --env NAME so secrets are not exposed in process arguments")
+    bail!(
+        "security hash-key requires --stdin or --env NAME so secrets are not exposed in process arguments"
+    )
 }
 
 async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) -> Result<()> {
@@ -4963,6 +5125,7 @@ struct ModelInventoryItem {
     weight: u32,
     path: String,
     updated_at: Option<chrono::DateTime<Utc>>,
+    readiness: Option<rs_llmctl::readiness::ReadinessState>,
 }
 
 async fn model_inventory(cfg: &Config, storage: &Storage) -> Result<ModelInventoryOutput> {
@@ -4984,6 +5147,16 @@ async fn model_inventory(cfg: &Config, storage: &Storage) -> Result<ModelInvento
                 weight: model.weight,
                 path: path_basename(&model.path),
                 updated_at: persisted.map(|record| record.updated_at),
+                readiness: model
+                    .family
+                    .as_deref()
+                    .filter(|family| family.eq_ignore_ascii_case("gemma4"))
+                    .map(|_| {
+                        rs_llmctl::readiness::read_state(&rs_llmctl::readiness::evidence_path(
+                            &cfg.storage.model_dir,
+                            &model.alias,
+                        ))
+                    }),
             }
         })
         .collect();

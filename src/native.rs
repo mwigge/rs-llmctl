@@ -1943,6 +1943,51 @@ impl RealCandleDecoder {
     }
 }
 
+#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+pub fn generate_gemma4_sources(
+    _model_path: &Path,
+    _prompts: &[String],
+    _max_tokens: u32,
+) -> Result<Vec<String>> {
+    bail!("generate_gemma4_sources requires the native-candle and native-tokenizers features")
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+pub fn generate_gemma4_sources(
+    model_path: &Path,
+    prompts: &[String],
+    max_tokens: u32,
+) -> Result<Vec<String>> {
+    let artifacts = CandleArtifactValidation {
+        model_family: CandleModelFamily::Gemma4,
+        model_format: NativeModelFormat::Gguf,
+        layout: CandleArtifactLayout::for_format(NativeModelFormat::Gguf),
+        weight_files: vec![artifact_file_name(model_path)],
+        tokenizer_file: None,
+        config_file: None,
+    };
+    let decoder = load_real_candle_decoder(CandleModelFamily::Gemma4, model_path, &artifacts)?;
+    prompts
+        .iter()
+        .map(|prompt| {
+            decoder.generate(&NativeChatRequest {
+                model: "gemma4-readiness".to_string(),
+                messages: vec![NativeChatMessage {
+                    role: "user".to_string(),
+                    content: Some(Value::String(prompt.clone())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                temperature: Some(0.0),
+                max_tokens: Some(max_tokens),
+                tools: None,
+                tool_choice: None,
+                metadata: BTreeMap::new(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 impl RealCandleModel {
     fn clear_kv_cache(&mut self) {
@@ -2414,8 +2459,9 @@ mod quantized_gemma4 {
         fn forward(&self, xs: &Tensor) -> Result<Tensor> {
             let gate = self.feed_forward_gate.forward(xs)?;
             let up = self.feed_forward_up.forward(xs)?;
-            let silu = candle_nn::ops::silu(&gate)?;
-            let gated = (silu * up)?;
+            // llama.cpp's Gemma 4 path uses plain GeGLU, whose GELU is the
+            // tanh approximation; Candle's Tensor::gelu() is the same variant.
+            let gated = (gate.gelu()? * up)?;
             self.feed_forward_down.forward(&gated)
         }
     }
@@ -2864,8 +2910,9 @@ mod quantized_gemma4 {
                 // Global (non-sliding) layers have no `attn_v.weight` tensor in the
                 // GGUF at all; `forward_attn` reuses the raw key projection output
                 // as `Vcur` in that case, matching upstream llama.cpp.
-                let attention_wv =
-                    ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device).ok();
+                let attention_wv = ct
+                    .tensor(reader, &format!("{prefix}.attn_v.weight"), device)
+                    .ok();
                 let attention_wo =
                     ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
@@ -2924,7 +2971,11 @@ mod quantized_gemma4 {
                 )?;
 
                 let layer_output_scale = dequantize_scalar_f32(
-                    ct.tensor(reader, &format!("{prefix}.layer_output_scale.weight"), device)?,
+                    ct.tensor(
+                        reader,
+                        &format!("{prefix}.layer_output_scale.weight"),
+                        device,
+                    )?,
                     device,
                 )?;
 
