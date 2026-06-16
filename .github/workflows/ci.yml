@@ -50,7 +50,9 @@ jobs:
 
   build-linux:
     name: Build linux/x86_64
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04 = glibc 2.35 — compatible with Debian bookworm (2.36),
+    # Fedora 39+ (2.38+), Arch Linux and CachyOS (rolling).
+    runs-on: ubuntu-22.04
     needs: rust
     steps:
       - name: Checkout
@@ -58,6 +60,11 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yqq libsqlite3-dev
 
       - name: Build release binary
         run: cargo build --release --bin llmctl
