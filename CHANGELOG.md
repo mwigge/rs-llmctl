@@ -5,15 +5,23 @@ operator behavior, packaging contents, service lifecycle, and verification.
 
 ## 1.6.2 - 2026-06-16
 
-- Native generation: Gemma4 GGUF models now load successfully. Previously the
-  engine failed at startup with `unsupported tokenizer model 'gemma4'` because
-  Candle's built-in GGUF tokenizer only handles GPT-2 style BPE. Gemma4 GGUF
-  stores BPE merges like GPT-2 but uses Metaspace (▁) whitespace escaping
-  instead of byte-level encoding. When Candle rejects the tokenizer model
-  identifier, the engine now falls back to building the tokenizer directly
-  from the same GGUF metadata (vocab + merges) with Metaspace as both
-  pre-tokenizer and decoder. This matches the fix merged into llama.cpp
+- Native generation: Gemma4 GGUF tokenizer now loads successfully. Previously
+  the engine failed at startup with `unsupported tokenizer model 'gemma4'`
+  because Candle's built-in GGUF tokenizer only handles GPT-2 style BPE.
+  Gemma4 GGUF stores BPE merges like GPT-2 but uses Metaspace (▁) whitespace
+  escaping instead of byte-level encoding. When Candle rejects the tokenizer
+  model identifier, the engine now falls back to building the tokenizer
+  directly from the GGUF vocab and merges with Metaspace as both pre-tokenizer
+  and decoder. This matches the fix merged into llama.cpp
   (ggml-org/llama.cpp#21343). No configuration changes required.
+
+  **Known limitation**: Gemma4 GGUF inference (forward pass) is not yet
+  functional with Candle 0.10.2. The `quantized_gemma3` model uses a single
+  `attention.key_length` for all layers, but Gemma4 has per-layer variable
+  head dimensions — global attention layers use head_dim=512 and sliding-window
+  attention layers use head_dim=256 (`attention.key_length_swa`). Requests to
+  a Gemma4 GGUF model will return a 503 error. Safetensors Gemma4 via the
+  non-quantized path is unaffected.
 
 ## 1.5.0 - 2026-06-11
 
