@@ -758,10 +758,15 @@ prompt template, document corpus, embedding index, model, or release.
 
 Runtime caveats are part of the product contract. Qwen3, Gemma-family, Mistral
 safetensors, and DeepSeek safetensors are the native runnable families where
-Candle exposes the needed model APIs. DeepSeek GGUF remains closed because
+Candle exposes the needed model APIs. Gemma4 GGUF tokenizer loads correctly
+but the forward pass is blocked by Candle 0.10.2's lack of per-layer variable
+head dimension support (global attention head_dim=512, SWA head_dim=256);
+Gemma4 safetensors is unaffected. DeepSeek GGUF remains closed because
 Candle 0.10.2 does not expose quantized DeepSeek2 weights. Kimi and MiniMax
 remain closed until Candle exposes reviewed architecture modules or rs-llmctl
-vendors maintained implementations. FIFO queue discipline is implemented for
+vendors maintained implementations. See `docs/native-gguf-internals.md` for
+tokenizer mechanics, dimension tables, key remapping rationale, and the path
+forward for Gemma4 GGUF inference. FIFO queue discipline is implemented for
 native chat requests with bounded per-engine concurrency and wait-time metadata.
 Prefill/decode phase scheduling metadata is emitted for every admitted native
 request, but continuous batching and low-level KV-cache scheduler controls are
