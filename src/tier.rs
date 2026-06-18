@@ -65,9 +65,9 @@ pub fn detect() -> HardwareTier {
     }
 
     // CUDA path covers both NVIDIA and AMD (via ROCm/HIP CUDA shim).
-    // Without a stable VRAM-introspection API in candle 0.10.2, we shell
-    // out to `nvidia-smi` for NVIDIA cards and fall back to a conservative
-    // mid-tier (Tier2Nv12) when the query fails.
+    // Without a stable VRAM-introspection API in candle 0.10.2, probe the
+    // platform tools/files exposed by each vendor and fall back to a
+    // conservative mid-tier (Tier2Nv12) when the query fails.
     #[cfg(feature = "gpu-cuda")]
     if candle_core::Device::new_cuda(0).is_ok() {
         return classify_cuda_vram_gib(probe_cuda_total_vram_gib());
@@ -135,6 +135,15 @@ fn classify_cuda_vram_gib(vram_gib: Option<f64>) -> HardwareTier {
 /// Returns None if the command is unavailable or output is unparseable.
 #[cfg(feature = "gpu-cuda")]
 fn probe_cuda_total_vram_gib() -> Option<f64> {
+    probe_nvidia_total_vram_gib()
+        .or_else(probe_amd_sysfs_total_vram_gib)
+        .or_else(probe_rocm_smi_total_vram_gib)
+}
+
+/// Shell out to `nvidia-smi` to probe total VRAM on device 0.
+/// Returns None if the command is unavailable or output is unparseable.
+#[cfg(feature = "gpu-cuda")]
+fn probe_nvidia_total_vram_gib() -> Option<f64> {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.total",
@@ -150,6 +159,77 @@ fn probe_cuda_total_vram_gib() -> Option<f64> {
     // nvidia-smi reports memory.total in MiB.
     let mib: f64 = s.parse().ok()?;
     Some(mib / 1024.0)
+}
+
+/// Probe AMD VRAM directly from Linux DRM sysfs. This works without ROCm CLI
+/// tools and is the most reliable path on developer workstations.
+#[cfg(feature = "gpu-cuda")]
+fn probe_amd_sysfs_total_vram_gib() -> Option<f64> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    let mut best = 0.0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device_dir = entry.path().join("device");
+        let Ok(vendor) = std::fs::read_to_string(device_dir.join("vendor")) else {
+            continue;
+        };
+        if vendor.trim() != "0x1002" {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read_to_string(device_dir.join("mem_info_vram_total")) else {
+            continue;
+        };
+        let Ok(bytes) = bytes.trim().parse::<f64>() else {
+            continue;
+        };
+        best = f64::max(best, bytes / 1024.0 / 1024.0 / 1024.0);
+    }
+    (best > 0.0).then_some(best)
+}
+
+/// Fall back to ROCm SMI output when sysfs is unavailable.
+#[cfg(feature = "gpu-cuda")]
+fn probe_rocm_smi_total_vram_gib() -> Option<f64> {
+    let output = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_first_vram_gib(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+#[allow(dead_code)]
+fn parse_first_vram_gib(text: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(bytes?|b|gib|gb|mib|mb)?").ok()?;
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        if !lower.contains("vram") || !(lower.contains("total") || lower.contains("memory")) {
+            continue;
+        }
+        let Some(caps) = re.captures_iter(line).last() else {
+            continue;
+        };
+        let value: f64 = caps.get(1)?.as_str().parse().ok()?;
+        let unit = caps
+            .get(2)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_else(|| "bytes".to_string());
+        let gib = match unit.as_str() {
+            "gib" | "gb" => value,
+            "mib" | "mb" => value / 1024.0,
+            _ => value / 1024.0 / 1024.0 / 1024.0,
+        };
+        if gib > 0.0 {
+            return Some(gib);
+        }
+    }
+    None
 }
 
 /// Log the detected tier and recommended model once at startup.
@@ -232,6 +312,13 @@ mod tests {
         // Conservative middle so unknown configurations don't catastrophically
         // misclassify; operators can override.
         assert_eq!(classify_cuda_vram_gib(None), HardwareTier::Tier2Nv12);
+    }
+
+    #[test]
+    fn parse_rocm_smi_vram_output() {
+        let gib = parse_first_vram_gib("GPU[0] : VRAM Total Memory (B): 17163091968")
+            .expect("parse vram");
+        assert!((gib - 15.98).abs() < 0.1);
     }
 
     /// End-to-end probe that exercises the actual `detect()` path on this host.
