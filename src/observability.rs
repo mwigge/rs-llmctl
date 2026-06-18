@@ -2,7 +2,7 @@ use crate::config::{Config, LangfuseExporterConfig, ObservabilityExporterConfig,
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
-use opentelemetry::metrics::{Counter, Gauge};
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::propagation::Injector;
 use opentelemetry::trace::{Span, Status, Tracer, TracerProvider as _};
 use opentelemetry::KeyValue;
@@ -765,6 +765,121 @@ pub fn genai_output_tokens_counter() -> &'static Counter<u64> {
             .with_description("Output tokens per GenAI semantic conventions")
             .build()
     })
+}
+
+/// Histogram of wall-clock time spent constructing a native model from a GGUF
+/// or safetensors artifact. Attributes: `model.family`, `model.quant`,
+/// `gpu.backend`. Recorded once per model load.
+pub fn native_model_load_duration_ms() -> &'static Histogram<f64> {
+    static H: OnceLock<Histogram<f64>> = OnceLock::new();
+    H.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .f64_histogram("native.model.load.duration_ms")
+            .with_description("Wall-clock time to load a native model artifact, in milliseconds")
+            .with_unit("ms")
+            .build()
+    })
+}
+
+/// Histogram of throughput in tokens-per-second for native inference, split
+/// by phase. Attributes: `model.family`, `phase` (`"prefill"` or `"generation"`).
+pub fn native_model_tokens_per_second() -> &'static Histogram<f64> {
+    static H: OnceLock<Histogram<f64>> = OnceLock::new();
+    H.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .f64_histogram("native.model.tokens_per_second")
+            .with_description("Native model throughput in tokens per second, split by phase")
+            .with_unit("token/s")
+            .build()
+    })
+}
+
+/// Gauge of peak resident memory observed after a native model load completes.
+/// Attribute: `model.family`. Sampled via `getrusage(RUSAGE_SELF).ru_maxrss`
+/// (macOS reports bytes; Linux reports KiB).
+pub fn native_model_peak_resident_mb() -> &'static Gauge<f64> {
+    static G: OnceLock<Gauge<f64>> = OnceLock::new();
+    G.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .f64_gauge("native.model.peak_resident_mb")
+            .with_description("Peak resident memory after native model load, in MB")
+            .with_unit("MB")
+            .build()
+    })
+}
+
+/// Sample the current process's peak resident memory in MB.
+/// Returns `None` if the syscall is unavailable or fails.
+///
+/// macOS `ru_maxrss` is in bytes; Linux `ru_maxrss` is in kilobytes (KiB).
+/// Other Unix platforms report bytes per BSD convention.
+#[must_use]
+pub fn process_peak_resident_mb() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getrusage is async-signal-safe; the rusage struct is POD;
+        // we zero-init it before the call.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        if rc != 0 {
+            return None;
+        }
+        let maxrss = usage.ru_maxrss as f64;
+        #[cfg(target_os = "linux")]
+        {
+            // Linux reports KiB.
+            return Some(maxrss / 1024.0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS and most BSDs report bytes.
+            return Some(maxrss / (1024.0 * 1024.0));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod native_observability_tests {
+    use super::*;
+
+    #[test]
+    fn peak_resident_mb_returns_a_positive_value_on_unix() {
+        // Sanity check the cross-platform sampler. The actual value depends on
+        // the test process; we just assert it's positive and plausible (< 32 GB
+        // for a unit-test process is a very loose upper bound).
+        #[cfg(unix)]
+        {
+            let mb = process_peak_resident_mb().expect("getrusage should succeed on Unix");
+            assert!(mb > 0.0, "expected positive RSS, got {mb}");
+            assert!(mb < 32_768.0, "implausibly large RSS for a test process: {mb} MB");
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(process_peak_resident_mb(), None);
+        }
+    }
+
+    #[test]
+    fn native_metric_instruments_share_a_single_global_meter() {
+        // The OnceLock initialisation pattern means calling each accessor
+        // twice should hand back the same instance — guards against accidental
+        // duplicate metric registration that would silently fan-out exports.
+        let load_a = native_model_load_duration_ms() as *const _;
+        let load_b = native_model_load_duration_ms() as *const _;
+        assert_eq!(load_a, load_b, "load duration histogram must be a OnceLock-cached singleton");
+
+        let tps_a = native_model_tokens_per_second() as *const _;
+        let tps_b = native_model_tokens_per_second() as *const _;
+        assert_eq!(tps_a, tps_b, "tokens/s histogram must be a OnceLock-cached singleton");
+
+        let rss_a = native_model_peak_resident_mb() as *const _;
+        let rss_b = native_model_peak_resident_mb() as *const _;
+        assert_eq!(rss_a, rss_b, "peak resident gauge must be a OnceLock-cached singleton");
+    }
 }
 
 fn telemetry_key_values(event: &RuntimeTelemetryEvent) -> Vec<KeyValue> {

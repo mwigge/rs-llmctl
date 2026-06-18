@@ -34,9 +34,74 @@ paths:
   /v1/models:
     get:
       summary: List configured local models
+      description: |
+        OpenAI-compatible model list. Each entry adds a `capabilities` object
+        with runtime metadata that external orchestrators can use to route
+        without out-of-band knowledge. The capability fields are additive —
+        clients that consume only the standard OpenAI Models fields
+        (`id`, `object`, `owned_by`) continue to work unchanged.
       responses:
         "200":
-          description: OpenAI-compatible model list.
+          description: OpenAI-compatible model list with capability metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data]
+                properties:
+                  object:
+                    type: string
+                    enum: [list]
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, object, owned_by, capabilities]
+                      properties:
+                        id:
+                          type: string
+                          description: Model alias as configured in `models[].alias`.
+                        object:
+                          type: string
+                          enum: [model]
+                        owned_by:
+                          type: string
+                          enum: [rs-llmctl]
+                        capabilities:
+                          type: object
+                          required:
+                            [context_window, tool_protocol, model_size_b, gpu_backend, tier]
+                          properties:
+                            context_window:
+                              type: integer
+                              description: |
+                                Maximum context window in tokens. `0` when the
+                                family is unknown.
+                            tool_protocol:
+                              type: string
+                              description: |
+                                Stable identifier for the model's native tool-call
+                                format. One of `qwen3-native`, `gemma4-native`,
+                                `none`.
+                              enum: [qwen3-native, gemma4-native, none]
+                            model_size_b:
+                              type: number
+                              description: |
+                                Approximate parameter count in billions, parsed
+                                from the alias (e.g. `qwen3-14b` → `14.0`). `0.0`
+                                when not derivable.
+                            gpu_backend:
+                              type: string
+                              description: |
+                                The compute backend bound at server startup. Always
+                                one of three values; does not vary per model.
+                              enum: [metal, cuda, cpu]
+                            tier:
+                              type: string
+                              description: |
+                                Hardware tier classification. See
+                                `runtime::tier::HardwareTier::as_str()`.
+                              enum: [tier1-nv6, tier2-nv12, tier3-amd16, tier3-mac, unknown]
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":

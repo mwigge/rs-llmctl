@@ -3,6 +3,76 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## 1.6.4 - 2026-06-17
+
+- Native generation: Qwen3 14B Q4_K_M is the new daily-driver tool-capable
+  model, replacing Gemma 4 E4B as the recommended Tier 3 model for
+  16-18 GB-usable hardware (Apple M-series 24 GB unified, AMD 16 GB VRAM).
+  Uses candle's existing `quantized_qwen3` path — no new architecture
+  wiring required.
+- A new `qwen3_runtime_python_counting_program` integration test exercises
+  both forward (`range(1, 11)`) and reverse (`range(10, 0, -1)`) iteration
+  on Metal to verify the model understands prompt direction rather than
+  memorising a single canned example.
+- Measured M1 baseline on Apple M-series with Metal (recorded as regression
+  baseline in `openspec/changes/add-tool-capable-tiered-runtime/tasks.md`):
+  - Model load: 7.3 s (no PLE dequant; contrast Gemma 4 E4B at 74 s)
+  - Prefill (~30 tokens): 53-236 ms
+  - Generation: ~19 tok/s
+  - Working-set / swap delta during full test: under 2 GB growth
+- This milestone (M1 of `add-tool-capable-tiered-runtime`) ships Qwen3 as
+  the primary native runtime. Gemma 4 E4B remains supported for users who
+  explicitly select it. Tier 1 (NV6) and Tier 2 (NV12) deployments,
+  Qwen3-Coder MoE wiring, capability advertisement on /v1/models, and
+  full observability spans are planned in milestones M2-M6.
+
+## 1.6.3 - 2026-06-17
+
+- Native generation: GPU acceleration is now available via two opt-in cargo
+  features:
+  - `gpu-metal`: Apple Metal on macOS (Apple Silicon).
+  - `gpu-cuda`: NVIDIA CUDA on Linux/Windows. Also covers AMD GPUs on Linux
+    when built against ROCm/HIP's CUDA shim (`HIP_PLATFORM=amd`).
+  At runtime, a new `best_device()` helper probes the compiled-in backends
+  in order (Metal → CUDA → CPU) and picks the first one that initialises.
+  Build commands:
+  ```
+  cargo build --release --features native-candle,native-tokenizers,gpu-metal   # macOS
+  cargo build --release --features native-candle,native-tokenizers,gpu-cuda    # NVIDIA / AMD ROCm
+  cargo build --release --features native-candle,native-tokenizers             # CPU only
+  ```
+  The default build remains CPU-only so the release binary stays portable.
+  Measured Metal speedup on Gemma 4 E4B (M-series 24 GB): prefill of 13 tokens
+  drops from 118 s on CPU to 115 ms on Metal (~1000×). Model load stays ~75 s
+  because the ~10.7 GB PLE table dequantisation is CPU-bound.
+  See `docs/native-gguf-internals.md` for the per-VRAM-tier model
+  recommendation matrix (6 GB / 12 GB / 24 GB targets) and the known
+  limitation that prevents `dequantize_f16` from being used to halve PLE
+  memory on Metal (Q4_K_M→F32→F16 cast collapses argmax onto punctuation).
+- Native generation: Gemma4 GGUF forward pass is now functional. A new
+  `src/gemma4_gguf.rs` module (gated behind `native-candle` +
+  `native-tokenizers`) re-implements the Gemma4 transformer in Candle with
+  every Gemma4-specific feature that `quantized_gemma3` lacks:
+  - per-layer variable head_dim (256 for SWA layers, 512 for global) derived
+    from the actual `attn_q` weight shape
+  - cross-layer KV sharing (`shared_kv_layers = 18`): the last 18 layers
+    skip K/V projection and reuse the cache from layer 22 (SWA source) or
+    layer 23 (Global source)
+  - Per-Layer Embedding (PLE) — `[262144, 10752]` lookup table dequantised to
+    F32 (~10.7 GB) at load time, projected through `1/sqrt(embedding_length)`
+    and combined with the input embedding scaled by `1/sqrt(2)` and
+    `sqrt(per_layer_dim)`
+  - per-layer `layer_output_scale` scalar applied to the complete layer
+    output (post-PLE, post-residual)
+  - `final_logit_softcapping = 30` applied after the LM head
+  - V tensor RMS-normalised without learnable weights before attention
+  - attention scaling = 1.0 (q_norm absorbs the `1/sqrt(head_dim)` factor)
+- Native generation: Gemma4 GGUF tokenizer (introduced in 1.6.2) is now
+  verified end-to-end with the new forward pass. The
+  `gemma4_gguf_forward_pass_produces_coherent_tokens` integration test
+  loads the E4B Q4_K_M model and asserts that prompting with "Say hello world"
+  produces decoded output containing ASCII alphabetic content.
+
 ## 1.6.2 - 2026-06-16
 
 - Native generation: Gemma4 GGUF tokenizer now loads successfully. Previously
@@ -14,14 +84,6 @@ operator behavior, packaging contents, service lifecycle, and verification.
   directly from the GGUF vocab and merges with Metaspace as both pre-tokenizer
   and decoder. This matches the fix merged into llama.cpp
   (ggml-org/llama.cpp#21343). No configuration changes required.
-
-  **Known limitation**: Gemma4 GGUF inference (forward pass) is not yet
-  functional with Candle 0.10.2. The `quantized_gemma3` model uses a single
-  `attention.key_length` for all layers, but Gemma4 has per-layer variable
-  head dimensions — global attention layers use head_dim=512 and sliding-window
-  attention layers use head_dim=256 (`attention.key_length_swa`). Requests to
-  a Gemma4 GGUF model will return a 503 error. Safetensors Gemma4 via the
-  non-quantized path is unaffected.
 
 ## 1.5.0 - 2026-06-11
 
