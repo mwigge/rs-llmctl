@@ -522,6 +522,38 @@ not extend `candle_transformers::quantized_gemma3` because the differences in
 attention, PLE, and KV sharing span enough call sites that the diff was larger
 than the rewrite.
 
+### Known limitation: Qwen3 MoE is CUDA-only in candle 0.10.2
+
+candle-nn 0.10.2's `moe_gemm` and `moe_gemm_gguf` kernels (in
+`candle-nn/src/moe.rs`) return a hard `bail!("moe_gemm[_gguf] is only
+implemented for the cuda backend")` on any non-CUDA device. There is no
+Metal kernel and no CPU fallback.
+
+Practical impact:
+
+| Tier / backend | Qwen3 dense | Qwen3-Coder MoE |
+|---|---|---|
+| Tier 3 Mac (Metal) | ✅ Works (default daily driver) | ❌ Bails at first forward pass |
+| Tier 3+ Linux NVIDIA (CUDA) | ✅ Works | ✅ Works |
+| Tier 3+ Linux AMD (ROCm/HIP CUDA shim) | ✅ Works | ⚠️ Untested — depends on whether the HIP shim implements the specific MoE gemm symbol |
+| Tier 1 / 2 CPU fallback | ✅ Works | ❌ Bails at first forward pass |
+
+The runtime's `CandleModelFamily::Qwen3Moe` variant and the
+`quantized_qwen3_moe::GGUFQWenMoE` load path are still wired and compile
+clean on all backends — the failure surfaces only when the first
+`forward()` is called. Operators on Mac / CPU receive a clear error
+referencing `moe_gemm_gguf` rather than a silent miscompile.
+
+This limitation is upstream-only. Resolving it requires either:
+
+- a Metal kernel implementation in candle-nn for `moe_gemm[_gguf]`, or
+- a generic CPU fallback (slow but correct) in the same module.
+
+Until candle ships either, the Mac tier 3+ premium model recommendation
+is effectively the same as Tier 3 (Qwen3 14B Q4_K_M dense). Linux users
+with NVIDIA hardware can use the MoE variant; AMD users should verify
+their ROCm/HIP install before relying on it.
+
 ### GPU acceleration
 
 The default build is CPU-only. To enable GPU inference, opt in via one of the

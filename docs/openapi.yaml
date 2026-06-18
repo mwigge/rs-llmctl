@@ -82,8 +82,8 @@ paths:
                               description: |
                                 Stable identifier for the model's native tool-call
                                 format. One of `qwen3-native`, `gemma4-native`,
-                                `none`.
-                              enum: [qwen3-native, gemma4-native, none]
+                                `mistral-instruct`, `none`.
+                              enum: [qwen3-native, gemma4-native, mistral-instruct, none]
                             model_size_b:
                               type: number
                               description: |
