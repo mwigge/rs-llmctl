@@ -67,8 +67,14 @@ pub const KNOWN_PROFILES: &[Gemma4Profile] = &[PROFILE_GEMMA4_E4B, PROFILE_GEMMA
 /// Pick a profile by matching `general.architecture` in the GGUF metadata.
 /// Returns `None` if the file declares an architecture we have not validated.
 #[must_use]
-pub fn detect_profile(content: &candle_core::quantized::gguf_file::Content) -> Option<&'static Gemma4Profile> {
-    let arch = content.metadata.get("general.architecture")?.to_string().ok()?;
+pub fn detect_profile(
+    content: &candle_core::quantized::gguf_file::Content,
+) -> Option<&'static Gemma4Profile> {
+    let arch = content
+        .metadata
+        .get("general.architecture")?
+        .to_string()
+        .ok()?;
     KNOWN_PROFILES.iter().find(|p| p.source_prefix == arch)
 }
 
@@ -144,7 +150,10 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((MAX_SEQ_LEN, 1))?
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        Ok(Self { cos: idx.cos()?, sin: idx.sin()? })
+        Ok(Self {
+            cos: idx.cos()?,
+            sin: idx.sin()?,
+        })
     }
 
     fn apply_one(&self, t: &Tensor, pos: usize) -> Result<Tensor> {
@@ -206,9 +215,7 @@ impl LayerWeights {
     ) -> Result<Tensor> {
         let mask: Vec<u32> = if let Some(w) = self.sliding_window {
             (0..seq)
-                .flat_map(|i| {
-                    (0..seq).map(move |j| if i < j || j + w < i { 0u32 } else { 1u32 })
-                })
+                .flat_map(|i| (0..seq).map(move |j| if i < j || j + w < i { 0u32 } else { 1u32 }))
                 .collect()
         } else {
             (0..seq)
@@ -238,7 +245,9 @@ impl LayerWeights {
         let (b, seq, _) = x.dims3()?;
 
         let q = self.wq.forward(x)?;
-        let q = q.reshape((b, seq, self.n_head, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b, seq, self.n_head, self.head_dim))?
+            .transpose(1, 2)?;
         let q = self.q_norm.forward(&q.contiguous()?)?;
         let q = self.rope.apply_one(&q, pos)?;
 
@@ -248,8 +257,12 @@ impl LayerWeights {
         } else {
             let k = self.wk.forward(x)?;
             let v = self.wv.forward(x)?;
-            let k = k.reshape((b, seq, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
-            let v = v.reshape((b, seq, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+            let k = k
+                .reshape((b, seq, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b, seq, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
             let k = self.k_norm.forward(&k.contiguous()?)?;
             // V gets plain RMS normalization (no learnable scale) per Gemma4 reference:
             //   v = v / sqrt(mean(v^2) + eps)
@@ -359,7 +372,12 @@ impl ModelWeights {
             .map(|v| v as usize)
             .unwrap_or(0);
         let n_own_kv = block_count.saturating_sub(shared_kv_layers);
-        tracing::info!(shared_kv_layers, n_own_kv, block_count, "cross-layer KV sharing");
+        tracing::info!(
+            shared_kv_layers,
+            n_own_kv,
+            block_count,
+            "cross-layer KV sharing"
+        );
 
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -390,7 +408,11 @@ impl ModelWeights {
 
             let is_swa = head_dim == key_length_swa;
             let sliding_window = is_swa.then_some(sliding_window_size);
-            let rope_freq = if is_swa { rope_freq_swa } else { rope_freq_global };
+            let rope_freq = if is_swa {
+                rope_freq_swa
+            } else {
+                rope_freq_global
+            };
             let q_dim = head_count * head_dim;
             // KV sharing mapping (matches llama.cpp gemma4 reuse callback):
             //   SWA sharing layer    → n_own_kv - 2  (last SWA layer with own K/V)
@@ -401,31 +423,74 @@ impl ModelWeights {
                 None
             };
 
-            let wq = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q.weight"), device)?)?;
-            let wk = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k.weight"), device)?)?;
-            let wv = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_v.weight"), device)?)?;
-            let wo = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_output.weight"), device)?)?;
-            let q_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q_norm.weight"), device)?, rms_norm_eps)?;
-            let k_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k_norm.weight"), device)?, rms_norm_eps)?;
-            let attn_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.attn_norm.weight"), device)?, rms_norm_eps)?;
-            let post_attn_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.post_attention_norm.weight"), device)?, rms_norm_eps)?;
-            let ffn_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_norm.weight"), device)?, rms_norm_eps)?;
-            let post_ffn_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.post_ffw_norm.weight"), device)?, rms_norm_eps)?;
+            let wq =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q.weight"), device)?)?;
+            let wk =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k.weight"), device)?)?;
+            let wv =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_v.weight"), device)?)?;
+            let wo = QMatMul::from_qtensor(ct.tensor(
+                reader,
+                &format!("{p}.attn_output.weight"),
+                device,
+            )?)?;
+            let q_norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, &format!("{p}.attn_q_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+            let k_norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, &format!("{p}.attn_k_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+            let attn_norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, &format!("{p}.attn_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+            let post_attn_norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, &format!("{p}.post_attention_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+            let ffn_norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, &format!("{p}.ffn_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+            let post_ffn_norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, &format!("{p}.post_ffw_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
 
             let mlp = Mlp {
-                gate: QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_gate.weight"), device)?)?,
-                up: QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_up.weight"), device)?)?,
-                down: QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_down.weight"), device)?)?,
+                gate: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    &format!("{p}.ffn_gate.weight"),
+                    device,
+                )?)?,
+                up: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    &format!("{p}.ffn_up.weight"),
+                    device,
+                )?)?,
+                down: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    &format!("{p}.ffn_down.weight"),
+                    device,
+                )?)?,
             };
 
             // PLE layer components
-            let inp_gate = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.inp_gate.weight"), device)?)?;
-            let proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.proj.weight"), device)?)?;
+            let inp_gate = QMatMul::from_qtensor(ct.tensor(
+                reader,
+                &format!("{p}.inp_gate.weight"),
+                device,
+            )?)?;
+            let proj =
+                QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.proj.weight"), device)?)?;
             let post_norm = RmsNorm::from_qtensor(
                 ct.tensor(reader, &format!("{p}.post_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let layer_scalar = ct.tensor(reader, &format!("{p}.layer_output_scale.weight"), device)
+            let layer_scalar = ct
+                .tensor(reader, &format!("{p}.layer_output_scale.weight"), device)
                 .and_then(|qt| qt.dequantize(device))
                 .and_then(|t| t.flatten_all())
                 .and_then(|t| t.to_vec1::<f32>())
@@ -527,9 +592,15 @@ impl ModelWeights {
         let per_layer_emb = (self.per_layer_token_embd.forward(&flat_ids)? * ple_emb_scale)?
             .reshape((b, seq, self.num_layers, self.per_layer_dim))?;
         let proj_scale = 1.0f64 / (self.embedding_length as f64).sqrt();
-        let per_layer_proj = (self.per_layer_model_proj.forward(&h)? * proj_scale)?
-            .reshape((b, seq, self.num_layers, self.per_layer_dim))?;
-        let per_layer_proj = self.per_layer_proj_norm.forward(&per_layer_proj.contiguous()?)?;
+        let per_layer_proj = (self.per_layer_model_proj.forward(&h)? * proj_scale)?.reshape((
+            b,
+            seq,
+            self.num_layers,
+            self.per_layer_dim,
+        ))?;
+        let per_layer_proj = self
+            .per_layer_proj_norm
+            .forward(&per_layer_proj.contiguous()?)?;
         let inv_sqrt2 = 1.0f64 / 2.0f64.sqrt();
         let per_layer_inputs = ((per_layer_emb + per_layer_proj)? * inv_sqrt2)?;
 
