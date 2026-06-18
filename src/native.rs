@@ -542,7 +542,10 @@ pub fn canonical_native_chat_input(messages: &[NativeChatMessage]) -> String {
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
-pub fn format_native_chat_prompt(family: CandleModelFamily, messages: &[NativeChatMessage]) -> String {
+pub fn format_native_chat_prompt(
+    family: CandleModelFamily,
+    messages: &[NativeChatMessage],
+) -> String {
     match family {
         // Qwen3 (dense + MoE) — native ChatML format <|im_start|>role\n...<|im_end|>
         CandleModelFamily::Qwen3 | CandleModelFamily::Qwen3Moe => {
@@ -2002,7 +2005,10 @@ fn load_real_candle_decoder(
     ];
     crate::observability::native_model_load_duration_ms().record(load_elapsed_ms, &load_attrs);
     if let Some(mb) = crate::observability::process_peak_resident_mb() {
-        let mem_attrs = [opentelemetry::KeyValue::new("model.family", family.as_str())];
+        let mem_attrs = [opentelemetry::KeyValue::new(
+            "model.family",
+            family.as_str(),
+        )];
         crate::observability::native_model_peak_resident_mb().record(mb, &mem_attrs);
     }
     tracing::info!(
@@ -2076,10 +2082,9 @@ impl RealCandleDecoder {
                         ],
                     );
                 }
-                return self
-                    .tokenizer
-                    .decode(&generated, true)
-                    .map_err(|err| anyhow::anyhow!("failed to decode native output tokens: {err}"));
+                return self.tokenizer.decode(&generated, true).map_err(|err| {
+                    anyhow::anyhow!("failed to decode native output tokens: {err}")
+                });
             }
         }
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
@@ -3399,21 +3404,31 @@ mod tests {
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     fn format_native_chat_prompt_gemma4_uses_turn_markers() {
-        let messages = vec![
-            NativeChatMessage {
-                role: "user".to_string(),
-                content: Some(Value::String("Say hello world".to_string())),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ];
+        let messages = vec![NativeChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::String("Say hello world".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
         let prompt = format_native_chat_prompt(CandleModelFamily::Gemma4, &messages);
-        assert!(prompt.starts_with("<bos>"), "Gemma4 prompt must start with <bos>, got: {prompt:?}");
-        assert!(prompt.contains("<|turn>user"), "must contain user turn marker");
+        assert!(
+            prompt.starts_with("<bos>"),
+            "Gemma4 prompt must start with <bos>, got: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("<|turn>user"),
+            "must contain user turn marker"
+        );
         assert!(prompt.contains("<turn|>"), "must close turn with <turn|>");
         assert!(prompt.contains("<|turn>model"), "must open model turn");
-        assert!(!prompt.contains("<|user|>"), "must not use generic role markers");
-        assert!(!prompt.contains("<start_of_turn>"), "must not use Gemma1/2/3 format");
+        assert!(
+            !prompt.contains("<|user|>"),
+            "must not use generic role markers"
+        );
+        assert!(
+            !prompt.contains("<start_of_turn>"),
+            "must not use Gemma1/2/3 format"
+        );
     }
 
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -3423,7 +3438,9 @@ mod tests {
         let gguf_path = std::path::Path::new(
             "/Users/w199447/.local/share/milliways/models/gemma-4-E4B-it-Q4_K_M.gguf",
         );
-        if !gguf_path.exists() { return; }
+        if !gguf_path.exists() {
+            return;
+        }
         let mut file = std::fs::File::open(gguf_path).unwrap();
         let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
 
@@ -3442,15 +3459,21 @@ mod tests {
             remap_gguf_arch_prefix(content, "gemma4", "gemma3"),
             &mut file,
             &device,
-        ).unwrap();
+        )
+        .unwrap();
         eprintln!("Model loaded in {:?}", load_start.elapsed());
 
         // Run prefill
         let input = candle_core::Tensor::new(input_ids.as_slice(), &device)
-            .and_then(|t| t.reshape((1, input_ids.len()))).unwrap();
+            .and_then(|t| t.reshape((1, input_ids.len())))
+            .unwrap();
         let prefill_start = std::time::Instant::now();
         let logits = model.forward(&input, 0).unwrap();
-        eprintln!("Prefill ({} tokens) in {:?}", input_ids.len(), prefill_start.elapsed());
+        eprintln!(
+            "Prefill ({} tokens) in {:?}",
+            input_ids.len(),
+            prefill_start.elapsed()
+        );
         eprintln!("Logits shape: {:?}", logits.dims());
 
         // Check logit stats before argmax
@@ -3471,9 +3494,14 @@ mod tests {
                 }
             }
             // Check common response words
-            for word in ["Hello", "hello", "Sure", "Of", "I", "Hi", "▁Hello", "▁Sure", "▁I"] {
+            for word in [
+                "Hello", "hello", "Sure", "Of", "I", "Hi", "▁Hello", "▁Sure", "▁I",
+            ] {
                 if let Some(id) = tokenizer.token_to_id(word) {
-                    eprintln!("  logit for {:?} (id {id}) = {:.3}", word, flat[id as usize]);
+                    eprintln!(
+                        "  logit for {:?} (id {id}) = {:.3}",
+                        word, flat[id as usize]
+                    );
                 } else {
                     eprintln!("  {:?} not in vocab", word);
                 }
@@ -3483,12 +3511,16 @@ mod tests {
         let next_token = logits
             .squeeze(0)
             .and_then(|t| t.argmax(candle_core::D::Minus1))
-            .and_then(|t| t.to_scalar::<u32>()).unwrap();
+            .and_then(|t| t.to_scalar::<u32>())
+            .unwrap();
         let next_str = tokenizer.id_to_token(next_token).unwrap_or_default();
         eprintln!("First generated token: {next_token} = {next_str:?}");
 
         assert!(next_token < 262144, "token ID should be within vocab range");
-        assert!(!next_str.contains('짤'), "model should not produce Korean garbage, got {next_token} = {next_str:?}");
+        assert!(
+            !next_str.contains('짤'),
+            "model should not produce Korean garbage, got {next_token} = {next_str:?}"
+        );
 
         // Generate 15 more tokens to verify ongoing coherence
         let mut all_tokens = vec![next_token];
@@ -3496,25 +3528,41 @@ mod tests {
         let mut prev_token = next_token;
         for _ in 0..15 {
             let next_input = candle_core::Tensor::new(&[prev_token], &device)
-                .and_then(|t| t.reshape((1, 1))).unwrap();
+                .and_then(|t| t.reshape((1, 1)))
+                .unwrap();
             let logits = model.forward(&next_input, cur_pos).unwrap();
-            let tok = logits.squeeze(0)
+            let tok = logits
+                .squeeze(0)
                 .and_then(|t| t.argmax(candle_core::D::Minus1))
-                .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                .and_then(|t| t.to_scalar::<u32>())
+                .unwrap();
             let tok_str = tokenizer.id_to_token(tok).unwrap_or_default();
-            assert!(!tok_str.contains('짤'), "garbage token at step {}: {tok} = {tok_str:?}", all_tokens.len());
+            assert!(
+                !tok_str.contains('짤'),
+                "garbage token at step {}: {tok} = {tok_str:?}",
+                all_tokens.len()
+            );
             all_tokens.push(tok);
             prev_token = tok;
             cur_pos += 1;
-            if tok_str == "<turn|>" { break; }
+            if tok_str == "<turn|>" {
+                break;
+            }
         }
         let decoded = tokenizer.decode(&all_tokens, true).unwrap_or_default();
         eprintln!("Generated: {decoded:?}");
         // At least some ASCII printable content expected (greeting response)
-        assert!(decoded.chars().any(|c| c.is_ascii_alphabetic()), "expected alphabetic output, got: {decoded:?}");
+        assert!(
+            decoded.chars().any(|c| c.is_ascii_alphabetic()),
+            "expected alphabetic output, got: {decoded:?}"
+        );
     }
 
-    #[cfg(all(feature = "native-candle", feature = "native-tokenizers", feature = "gpu-metal"))]
+    #[cfg(all(
+        feature = "native-candle",
+        feature = "native-tokenizers",
+        feature = "gpu-metal"
+    ))]
     #[test]
     fn gemma4_gguf_metal_device_init_works() {
         let device = match candle_core::Device::new_metal(0) {
@@ -3542,7 +3590,8 @@ mod tests {
                 "/Users/w199447/.local/share/milliways/models/gemma-4-E4B-it-Q4_K_M.gguf".into(),
             ]
         };
-        let gguf_path = candidates.iter()
+        let gguf_path = candidates
+            .iter()
             .map(std::path::PathBuf::from)
             .find(|p| p.exists());
         let Some(gguf_path) = gguf_path else { return };
@@ -3560,22 +3609,30 @@ mod tests {
         // otherwise falls back to CPU. See Cargo.toml `gpu-metal` / `gpu-cuda`.
         let device = crate::gemma4_gguf::best_device();
         eprintln!("Device: {device:?}");
-        let profile = crate::gemma4_gguf::detect_profile(&content)
-            .unwrap_or_else(|| panic!("unrecognised Gemma 4 profile: {:?}", content.metadata.get("general.architecture")));
+        let profile = crate::gemma4_gguf::detect_profile(&content).unwrap_or_else(|| {
+            panic!(
+                "unrecognised Gemma 4 profile: {:?}",
+                content.metadata.get("general.architecture")
+            )
+        });
         eprintln!("Profile: {}", profile.label);
         let mut model = crate::gemma4_gguf::ModelWeights::from_gguf(
             remap_gguf_arch_prefix(content, profile.source_prefix, "gemma3"),
             &mut file,
             &device,
-        ).unwrap();
+        )
+        .unwrap();
 
         let input = candle_core::Tensor::new(input_ids.as_slice(), &device)
-            .and_then(|t| t.reshape((1, input_ids.len()))).unwrap();
+            .and_then(|t| t.reshape((1, input_ids.len())))
+            .unwrap();
         let logits = model.forward(&input, 0).unwrap();
 
-        let next_token = logits.squeeze(0)
+        let next_token = logits
+            .squeeze(0)
             .and_then(|t| t.argmax(candle_core::D::Minus1))
-            .and_then(|t| t.to_scalar::<u32>()).unwrap();
+            .and_then(|t| t.to_scalar::<u32>())
+            .unwrap();
 
         // Greedy generation up to 80 tokens, stopping at <turn|> (token 106).
         let close_turn_id = tokenizer.token_to_id("<turn|>").unwrap_or(106);
@@ -3583,13 +3640,18 @@ mod tests {
         let mut cur_pos = input_ids.len();
         let mut prev_token = next_token;
         for _ in 0..80 {
-            if prev_token == close_turn_id { break; }
+            if prev_token == close_turn_id {
+                break;
+            }
             let next_input = candle_core::Tensor::new(&[prev_token], &device)
-                .and_then(|t| t.reshape((1, 1))).unwrap();
+                .and_then(|t| t.reshape((1, 1)))
+                .unwrap();
             let logits = model.forward(&next_input, cur_pos).unwrap();
-            let tok = logits.squeeze(0)
+            let tok = logits
+                .squeeze(0)
                 .and_then(|t| t.argmax(candle_core::D::Minus1))
-                .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                .and_then(|t| t.to_scalar::<u32>())
+                .unwrap();
             all_tokens.push(tok);
             prev_token = tok;
             cur_pos += 1;
@@ -3601,7 +3663,10 @@ mod tests {
             || decoded.contains("range")
             || decoded.contains("print")
             || decoded.chars().any(|c| c.is_ascii_digit());
-        assert!(has_code_markers, "expected Python code markers in output, got: {decoded:?}");
+        assert!(
+            has_code_markers,
+            "expected Python code markers in output, got: {decoded:?}"
+        );
     }
 
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -3611,8 +3676,9 @@ mod tests {
         // M1 acceptance test for the add-tool-capable-tiered-runtime change.
         // Verifies the model handles both forward AND reverse counting,
         // proving understanding rather than memorisation of one canned example.
-        let path_str = std::env::var("QWEN3_GGUF_PATH").unwrap_or_else(|_|
-            "/Users/w199447/.local/share/milliways/models/Qwen3-14B-Instruct-Q4_K_M.gguf".into());
+        let path_str = std::env::var("QWEN3_GGUF_PATH").unwrap_or_else(|_| {
+            "/Users/w199447/.local/share/milliways/models/Qwen3-14B-Instruct-Q4_K_M.gguf".into()
+        });
         let gguf_path = std::path::PathBuf::from(&path_str);
         if !gguf_path.exists() {
             eprintln!("skipping qwen3 test, no GGUF at {path_str}");
@@ -3635,43 +3701,52 @@ mod tests {
         let load_start = std::time::Instant::now();
         let mut model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
             content, &mut file, &device,
-        ).unwrap();
+        )
+        .unwrap();
         let load_elapsed = load_start.elapsed();
         eprintln!("Model loaded in {load_elapsed:?}");
 
         // Inner helper: greedy decode up to `max_tokens`, stopping at <|im_end|>.
         let run = |model: &mut candle_transformers::models::quantized_qwen3::ModelWeights,
                    user_prompt: &str,
-                   max_tokens: usize| -> (String, std::time::Duration, std::time::Duration) {
+                   max_tokens: usize|
+         -> (String, std::time::Duration, std::time::Duration) {
             model.clear_kv_cache();
-            let prompt = format!(
-                "<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
-            );
+            let prompt =
+                format!("<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n");
             let encoding = tokenizer.encode(prompt.as_str(), false).unwrap();
             let input_ids: Vec<u32> = encoding.get_ids().to_vec();
 
             let prefill_start = std::time::Instant::now();
             let input = candle_core::Tensor::new(input_ids.as_slice(), &device)
-                .and_then(|t| t.reshape((1, input_ids.len()))).unwrap();
+                .and_then(|t| t.reshape((1, input_ids.len())))
+                .unwrap();
             let logits = model.forward(&input, 0).unwrap();
             let prefill_elapsed = prefill_start.elapsed();
 
-            let next_token = logits.squeeze(0)
+            let next_token = logits
+                .squeeze(0)
                 .and_then(|t| t.argmax(candle_core::D::Minus1))
-                .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                .and_then(|t| t.to_scalar::<u32>())
+                .unwrap();
 
             let gen_start = std::time::Instant::now();
             let mut all_tokens = vec![next_token];
             let mut cur_pos = input_ids.len();
             let mut prev_token = next_token;
             for _ in 0..max_tokens {
-                if prev_token == im_end_id { break; }
+                if prev_token == im_end_id {
+                    break;
+                }
                 let next_input = candle_core::Tensor::new(&[prev_token], &device)
-                    .and_then(|t| t.reshape((1, 1))).unwrap();
+                    .and_then(|t| t.reshape((1, 1)))
+                    .unwrap();
                 let logits = model.forward(&next_input, cur_pos).unwrap();
-                let tok = logits.squeeze(0)
+                let tok = logits
+                    .squeeze(0)
                     .and_then(|t| t.argmax(candle_core::D::Minus1))
-                    .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                    .and_then(|t| t.to_scalar::<u32>())
+                    .unwrap();
                 all_tokens.push(tok);
                 prev_token = tok;
                 cur_pos += 1;
@@ -3685,43 +3760,61 @@ mod tests {
         // preamble so the test sees code directly rather than ~300 tokens
         // of "Okay, I need to write..." musing first.
         eprintln!("\n--- PROMPT 1: count from 1 to 10 ---");
-        let (forward_out, p1_prefill, p1_gen) =
-            run(&mut model, "/no_think Write a Python program that counts from 1 to 10.", 400);
+        let (forward_out, p1_prefill, p1_gen) = run(
+            &mut model,
+            "/no_think Write a Python program that counts from 1 to 10.",
+            400,
+        );
         eprintln!("Prefill: {p1_prefill:?}   Generation: {p1_gen:?}");
         eprintln!("=== FORWARD OUTPUT ===\n{forward_out}\n=== END ===");
 
-        assert!(forward_out.contains("print"),
-            "forward output missing print() call: {forward_out:?}");
+        assert!(
+            forward_out.contains("print"),
+            "forward output missing print() call: {forward_out:?}"
+        );
         let forward_has_iteration = forward_out.contains("range(1, 11)")
             || forward_out.contains("range(1,11)")
             || forward_out.contains("range(10)")
             || forward_out.contains("range(11)")
             || (forward_out.contains("range(") && forward_out.contains("11"))
             || forward_out.contains("for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
-        assert!(forward_has_iteration,
-            "forward output missing forward-iteration construct: {forward_out:?}");
-        assert!(forward_out.contains("1") && forward_out.contains("10"),
-            "forward output missing expected digits: {forward_out:?}");
+        assert!(
+            forward_has_iteration,
+            "forward output missing forward-iteration construct: {forward_out:?}"
+        );
+        assert!(
+            forward_out.contains("1") && forward_out.contains("10"),
+            "forward output missing expected digits: {forward_out:?}"
+        );
 
         // Test 2 — reverse counting.  clear_kv_cache happens inside run().
         eprintln!("\n--- PROMPT 2: count from 10 down to 1 ---");
-        let (reverse_out, p2_prefill, p2_gen) =
-            run(&mut model, "/no_think Write a Python program that counts from 10 down to 1.", 400);
+        let (reverse_out, p2_prefill, p2_gen) = run(
+            &mut model,
+            "/no_think Write a Python program that counts from 10 down to 1.",
+            400,
+        );
         eprintln!("Prefill: {p2_prefill:?}   Generation: {p2_gen:?}");
         eprintln!("=== REVERSE OUTPUT ===\n{reverse_out}\n=== END ===");
 
-        assert!(reverse_out.contains("print"),
-            "reverse output missing print() call: {reverse_out:?}");
+        assert!(
+            reverse_out.contains("print"),
+            "reverse output missing print() call: {reverse_out:?}"
+        );
         let reverse_has_iteration = reverse_out.contains("range(10, 0, -1)")
             || reverse_out.contains("range(10,0,-1)")
             || reverse_out.contains("range(10, -1, -1)")
             || reverse_out.contains("reversed(")
             || reverse_out.contains("for i in [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]")
             || (reverse_out.contains("range(") && reverse_out.contains("-1"));
-        assert!(reverse_has_iteration,
-            "reverse output missing reverse-iteration construct: {reverse_out:?}");
-        assert!(reverse_out.contains("1") && reverse_out.contains("10"),
-            "reverse output missing expected digits: {reverse_out:?}");
+        assert!(
+            reverse_has_iteration,
+            "reverse output missing reverse-iteration construct: {reverse_out:?}"
+        );
+        assert!(
+            reverse_out.contains("1") && reverse_out.contains("10"),
+            "reverse output missing expected digits: {reverse_out:?}"
+        );
 
         // End-to-end real-life check: extract the Python code block from each
         // model output, write it to a file, execute it via python3, and assert
@@ -3736,41 +3829,49 @@ mod tests {
             Some(after[..end].to_string())
         };
 
-        let exec_python_script = |code: &str, label: &str, fname: &str|
-            -> std::io::Result<String>
-        {
-            let path = std::env::temp_dir().join(fname);
-            std::fs::write(&path, code)?;
-            eprintln!(
-                "\n[{label}] wrote {} bytes of generated code to {}",
-                code.len(), path.display()
-            );
-            let out = std::process::Command::new("python3").arg(&path).output()?;
-            eprintln!(
-                "[{label}] python3 exit={}, stderr={:?}",
-                out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            Ok(String::from_utf8_lossy(&out.stdout).to_string())
-        };
+        let exec_python_script =
+            |code: &str, label: &str, fname: &str| -> std::io::Result<String> {
+                let path = std::env::temp_dir().join(fname);
+                std::fs::write(&path, code)?;
+                eprintln!(
+                    "\n[{label}] wrote {} bytes of generated code to {}",
+                    code.len(),
+                    path.display()
+                );
+                let out = std::process::Command::new("python3").arg(&path).output()?;
+                eprintln!(
+                    "[{label}] python3 exit={}, stderr={:?}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                Ok(String::from_utf8_lossy(&out.stdout).to_string())
+            };
 
         let forward_code = extract_python_block(&forward_out)
             .expect("forward output should contain a ```python``` fenced block");
-        let forward_stdout = exec_python_script(&forward_code, "forward", "rs_llmctl_count_forward.py")
-            .expect("python3 should run forward test.py successfully");
+        let forward_stdout =
+            exec_python_script(&forward_code, "forward", "rs_llmctl_count_forward.py")
+                .expect("python3 should run forward test.py successfully");
         eprintln!("[forward] stdout:\n{}", forward_stdout);
         let forward_lines: Vec<&str> = forward_stdout.lines().collect();
-        assert_eq!(forward_lines, vec!["1","2","3","4","5","6","7","8","9","10"],
-            "forward program must print 1..10 line by line; got {forward_stdout:?}");
+        assert_eq!(
+            forward_lines,
+            vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+            "forward program must print 1..10 line by line; got {forward_stdout:?}"
+        );
 
         let reverse_code = extract_python_block(&reverse_out)
             .expect("reverse output should contain a ```python``` fenced block");
-        let reverse_stdout = exec_python_script(&reverse_code, "reverse", "rs_llmctl_count_reverse.py")
-            .expect("python3 should run reverse test.py successfully");
+        let reverse_stdout =
+            exec_python_script(&reverse_code, "reverse", "rs_llmctl_count_reverse.py")
+                .expect("python3 should run reverse test.py successfully");
         eprintln!("[reverse] stdout:\n{}", reverse_stdout);
         let reverse_lines: Vec<&str> = reverse_stdout.lines().collect();
-        assert_eq!(reverse_lines, vec!["10","9","8","7","6","5","4","3","2","1"],
-            "reverse program must print 10..1 line by line; got {reverse_stdout:?}");
+        assert_eq!(
+            reverse_lines,
+            vec!["10", "9", "8", "7", "6", "5", "4", "3", "2", "1"],
+            "reverse program must print 10..1 line by line; got {reverse_stdout:?}"
+        );
 
         // Summary line for task 1.4 — regression-tracking baseline.
         eprintln!("\n=== M1 TIMING SUMMARY ===");
@@ -3798,8 +3899,9 @@ mod tests {
         //
         // No `/no_think` directive: we want to see the model reason about
         // which pattern to use.
-        let path_str = std::env::var("QWEN3_GGUF_PATH").unwrap_or_else(|_|
-            "/Users/w199447/.local/share/milliways/models/Qwen3-14B-Instruct-Q4_K_M.gguf".into());
+        let path_str = std::env::var("QWEN3_GGUF_PATH").unwrap_or_else(|_| {
+            "/Users/w199447/.local/share/milliways/models/Qwen3-14B-Instruct-Q4_K_M.gguf".into()
+        });
         let gguf_path = std::path::PathBuf::from(&path_str);
         if !gguf_path.exists() {
             eprintln!("skipping chaosotel tracing test, no GGUF at {path_str}");
@@ -3815,7 +3917,8 @@ mod tests {
         let load_start = std::time::Instant::now();
         let mut model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
             content, &mut file, &device,
-        ).unwrap();
+        )
+        .unwrap();
         eprintln!("Model loaded in {:?}", load_start.elapsed());
 
         // The three real chaostooling-otel patterns, taken verbatim from
@@ -3877,9 +3980,7 @@ with instrument_db_span(
         );
 
         // Run with thinking ON — no `/no_think` directive.
-        let chat = format!(
-            "<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
-        );
+        let chat = format!("<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n");
         eprintln!("\n========== PROMPT SENT TO MODEL ==========\n{user_prompt}\n========== END PROMPT ==========\n");
 
         let encoding = tokenizer.encode(chat.as_str(), false).unwrap();
@@ -3888,13 +3989,16 @@ with instrument_db_span(
 
         let prefill_start = std::time::Instant::now();
         let input = candle_core::Tensor::new(input_ids.as_slice(), &device)
-            .and_then(|t| t.reshape((1, input_ids.len()))).unwrap();
+            .and_then(|t| t.reshape((1, input_ids.len())))
+            .unwrap();
         let logits = model.forward(&input, 0).unwrap();
         eprintln!("Prefill in {:?}", prefill_start.elapsed());
 
-        let next_token = logits.squeeze(0)
+        let next_token = logits
+            .squeeze(0)
             .and_then(|t| t.argmax(candle_core::D::Minus1))
-            .and_then(|t| t.to_scalar::<u32>()).unwrap();
+            .and_then(|t| t.to_scalar::<u32>())
+            .unwrap();
 
         let gen_start = std::time::Instant::now();
         let mut all_tokens = vec![next_token];
@@ -3902,21 +4006,28 @@ with instrument_db_span(
         let mut prev_token = next_token;
         // Generous budget — thinking reasoning + code + explanation can be long.
         for _ in 0..1200 {
-            if prev_token == im_end_id { break; }
+            if prev_token == im_end_id {
+                break;
+            }
             let next_input = candle_core::Tensor::new(&[prev_token], &device)
-                .and_then(|t| t.reshape((1, 1))).unwrap();
+                .and_then(|t| t.reshape((1, 1)))
+                .unwrap();
             let logits = model.forward(&next_input, cur_pos).unwrap();
-            let tok = logits.squeeze(0)
+            let tok = logits
+                .squeeze(0)
                 .and_then(|t| t.argmax(candle_core::D::Minus1))
-                .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                .and_then(|t| t.to_scalar::<u32>())
+                .unwrap();
             all_tokens.push(tok);
             prev_token = tok;
             cur_pos += 1;
         }
         let gen_elapsed = gen_start.elapsed();
-        eprintln!("Generation in {gen_elapsed:?} ({} tokens, ~{:.1} tok/s)",
+        eprintln!(
+            "Generation in {gen_elapsed:?} ({} tokens, ~{:.1} tok/s)",
             all_tokens.len(),
-            all_tokens.len() as f64 / gen_elapsed.as_secs_f64());
+            all_tokens.len() as f64 / gen_elapsed.as_secs_f64()
+        );
 
         let full_output = tokenizer.decode(&all_tokens, false).unwrap_or_default();
 
@@ -3935,7 +4046,9 @@ with instrument_db_span(
         };
 
         eprintln!("\n========== MODEL THINKING ==========\n{thinking}\n========== END THINKING ==========\n");
-        eprintln!("\n========== MODEL ANSWER ==========\n{answer}\n========== END ANSWER ==========\n");
+        eprintln!(
+            "\n========== MODEL ANSWER ==========\n{answer}\n========== END ANSWER ==========\n"
+        );
 
         // Extract the Python block from the answer (or full output if no <think>).
         let extract_python_block = |out: &str| -> Option<String> {
@@ -3952,7 +4065,11 @@ with instrument_db_span(
         let out_path = std::env::temp_dir().join("rs_llmctl_count_traced.py");
         std::fs::write(&out_path, &traced_code).unwrap();
         eprintln!("\n========== EXTRACTED PROGRAM ==========");
-        eprintln!("Wrote {} bytes to {}", traced_code.len(), out_path.display());
+        eprintln!(
+            "Wrote {} bytes to {}",
+            traced_code.len(),
+            out_path.display()
+        );
         eprintln!("--- BEGIN traced program ---\n{traced_code}\n--- END traced program ---\n");
 
         // Soft assertions: the model should have recognised a tracing pattern
@@ -3969,8 +4086,10 @@ with instrument_db_span(
             "model output should reference one of the chaosotel tracing patterns, got: {traced_code:?}");
 
         // The counter loop should still be there.
-        assert!(traced_code.contains("range(") && traced_code.contains("print"),
-            "traced program should still contain the original counter loop, got: {traced_code:?}");
+        assert!(
+            traced_code.contains("range(") && traced_code.contains("print"),
+            "traced program should still contain the original counter loop, got: {traced_code:?}"
+        );
 
         // The model should have given some justification for its pattern choice.
         // We check `answer` rather than `full_output` so the <think> reasoning
@@ -3982,14 +4101,19 @@ with instrument_db_span(
             || lower_answer.contains("pattern 3")
             || lower_answer.contains("manual span")
             || lower_answer.contains("decorator");
-        assert!(answer_mentions_pattern_choice,
-            "user-visible answer should explain which pattern was chosen, got: {answer:?}");
+        assert!(
+            answer_mentions_pattern_choice,
+            "user-visible answer should explain which pattern was chosen, got: {answer:?}"
+        );
 
         eprintln!("=== chaosotel tracing test PASSED ===");
         eprintln!("  Model reasoning length:  {} chars", thinking.len());
         eprintln!("  Answer length:           {} chars", answer.len());
         eprintln!("  Extracted code length:   {} bytes", traced_code.len());
-        eprintln!("  Generation tokens/s:     {:.1}", all_tokens.len() as f64 / gen_elapsed.as_secs_f64());
+        eprintln!(
+            "  Generation tokens/s:     {:.1}",
+            all_tokens.len() as f64 / gen_elapsed.as_secs_f64()
+        );
     }
 
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -4023,43 +4147,62 @@ with instrument_db_span(
         drop(tokfile);
 
         // Helper that loads a FRESH MoE model, runs one prompt, returns output + timings.
-        let run = |user_prompt: &str, max_tokens: usize| -> (String, std::time::Duration, std::time::Duration, std::time::Duration) {
+        let run = |user_prompt: &str,
+                   max_tokens: usize|
+         -> (
+            String,
+            std::time::Duration,
+            std::time::Duration,
+            std::time::Duration,
+        ) {
             let load_start = std::time::Instant::now();
             let mut file = std::fs::File::open(&gguf_path).unwrap();
             let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
-            let mut model = candle_transformers::models::quantized_qwen3_moe::GGUFQWenMoE::from_gguf(
-                content, &mut file, &device, candle_core::DType::F32,
-            ).unwrap();
+            let mut model =
+                candle_transformers::models::quantized_qwen3_moe::GGUFQWenMoE::from_gguf(
+                    content,
+                    &mut file,
+                    &device,
+                    candle_core::DType::F32,
+                )
+                .unwrap();
             let load_elapsed = load_start.elapsed();
 
-            let prompt = format!(
-                "<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
-            );
+            let prompt =
+                format!("<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n");
             let encoding = tokenizer.encode(prompt.as_str(), false).unwrap();
             let input_ids: Vec<u32> = encoding.get_ids().to_vec();
 
             let prefill_start = std::time::Instant::now();
             let input = candle_core::Tensor::new(input_ids.as_slice(), &device)
-                .and_then(|t| t.reshape((1, input_ids.len()))).unwrap();
+                .and_then(|t| t.reshape((1, input_ids.len())))
+                .unwrap();
             let logits = model.forward(&input, 0).unwrap();
             let prefill_elapsed = prefill_start.elapsed();
 
-            let next_token = logits.squeeze(0)
+            let next_token = logits
+                .squeeze(0)
                 .and_then(|t| t.argmax(candle_core::D::Minus1))
-                .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                .and_then(|t| t.to_scalar::<u32>())
+                .unwrap();
 
             let gen_start = std::time::Instant::now();
             let mut all_tokens = vec![next_token];
             let mut cur_pos = input_ids.len();
             let mut prev_token = next_token;
             for _ in 0..max_tokens {
-                if prev_token == im_end_id { break; }
+                if prev_token == im_end_id {
+                    break;
+                }
                 let next_input = candle_core::Tensor::new(&[prev_token], &device)
-                    .and_then(|t| t.reshape((1, 1))).unwrap();
+                    .and_then(|t| t.reshape((1, 1)))
+                    .unwrap();
                 let logits = model.forward(&next_input, cur_pos).unwrap();
-                let tok = logits.squeeze(0)
+                let tok = logits
+                    .squeeze(0)
                     .and_then(|t| t.argmax(candle_core::D::Minus1))
-                    .and_then(|t| t.to_scalar::<u32>()).unwrap();
+                    .and_then(|t| t.to_scalar::<u32>())
+                    .unwrap();
                 all_tokens.push(tok);
                 prev_token = tok;
                 cur_pos += 1;
@@ -4070,42 +4213,58 @@ with instrument_db_span(
         };
 
         eprintln!("\n--- PROMPT 1: count from 1 to 10 ---");
-        let (forward_out, load1, p1_prefill, p1_gen) =
-            run("/no_think Write a Python program that counts from 1 to 10.", 400);
+        let (forward_out, load1, p1_prefill, p1_gen) = run(
+            "/no_think Write a Python program that counts from 1 to 10.",
+            400,
+        );
         eprintln!("Load: {load1:?}   Prefill: {p1_prefill:?}   Generation: {p1_gen:?}");
         eprintln!("=== FORWARD OUTPUT ===\n{forward_out}\n=== END ===");
 
-        assert!(forward_out.contains("print"),
-            "forward output missing print() call: {forward_out:?}");
+        assert!(
+            forward_out.contains("print"),
+            "forward output missing print() call: {forward_out:?}"
+        );
         let forward_has_iteration = forward_out.contains("range(1, 11)")
             || forward_out.contains("range(1,11)")
             || forward_out.contains("range(10)")
             || forward_out.contains("range(11)")
             || (forward_out.contains("range(") && forward_out.contains("11"))
             || forward_out.contains("for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
-        assert!(forward_has_iteration,
-            "forward output missing forward-iteration construct: {forward_out:?}");
-        assert!(forward_out.contains("1") && forward_out.contains("10"),
-            "forward output missing expected digits: {forward_out:?}");
+        assert!(
+            forward_has_iteration,
+            "forward output missing forward-iteration construct: {forward_out:?}"
+        );
+        assert!(
+            forward_out.contains("1") && forward_out.contains("10"),
+            "forward output missing expected digits: {forward_out:?}"
+        );
 
         eprintln!("\n--- PROMPT 2: count from 10 down to 1 ---");
-        let (reverse_out, load2, p2_prefill, p2_gen) =
-            run("/no_think Write a Python program that counts from 10 down to 1.", 400);
+        let (reverse_out, load2, p2_prefill, p2_gen) = run(
+            "/no_think Write a Python program that counts from 10 down to 1.",
+            400,
+        );
         eprintln!("Load: {load2:?}   Prefill: {p2_prefill:?}   Generation: {p2_gen:?}");
         eprintln!("=== REVERSE OUTPUT ===\n{reverse_out}\n=== END ===");
 
-        assert!(reverse_out.contains("print"),
-            "reverse output missing print() call: {reverse_out:?}");
+        assert!(
+            reverse_out.contains("print"),
+            "reverse output missing print() call: {reverse_out:?}"
+        );
         let reverse_has_iteration = reverse_out.contains("range(10, 0, -1)")
             || reverse_out.contains("range(10,0,-1)")
             || reverse_out.contains("range(10, -1, -1)")
             || reverse_out.contains("reversed(")
             || reverse_out.contains("for i in [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]")
             || (reverse_out.contains("range(") && reverse_out.contains("-1"));
-        assert!(reverse_has_iteration,
-            "reverse output missing reverse-iteration construct: {reverse_out:?}");
-        assert!(reverse_out.contains("1") && reverse_out.contains("10"),
-            "reverse output missing expected digits: {reverse_out:?}");
+        assert!(
+            reverse_has_iteration,
+            "reverse output missing reverse-iteration construct: {reverse_out:?}"
+        );
+        assert!(
+            reverse_out.contains("1") && reverse_out.contains("10"),
+            "reverse output missing expected digits: {reverse_out:?}"
+        );
 
         eprintln!("\n=== M2 TIMING SUMMARY (Qwen3-Coder-30B-A3B MoE) ===");
         eprintln!("  Load 1:               {load1:?}");
@@ -4121,10 +4280,13 @@ with instrument_db_span(
     #[test]
     #[ignore = "requires GGUF file on disk"]
     fn gemma4_gguf_tensor_shapes_match_expected_head_dims() {
-        let path_str = std::env::var("GEMMA4_GGUF_PATH").unwrap_or_else(|_|
-            "/Users/w199447/.local/share/milliways/models/gemma-4-E4B-it-Q4_K_M.gguf".into());
+        let path_str = std::env::var("GEMMA4_GGUF_PATH").unwrap_or_else(|_| {
+            "/Users/w199447/.local/share/milliways/models/gemma-4-E4B-it-Q4_K_M.gguf".into()
+        });
         let gguf_path = std::path::PathBuf::from(path_str);
-        if !gguf_path.exists() { return; }
+        if !gguf_path.exists() {
+            return;
+        }
         eprintln!("Inspecting: {}", gguf_path.display());
         let mut file = std::fs::File::open(&gguf_path).unwrap();
         let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
@@ -4135,7 +4297,9 @@ with instrument_db_span(
         eprintln!("  All metadata keys ({} total):", meta_keys.len());
         for k in &meta_keys {
             let v = &content.metadata[*k];
-            let display = v.to_u32().map(|n| format!("{n}"))
+            let display = v
+                .to_u32()
+                .map(|n| format!("{n}"))
                 .or_else(|_| v.to_f32().map(|f| format!("{f}")))
                 .unwrap_or_else(|_| format!("{v:?}"));
             eprintln!("    {k} = {display}");
@@ -4156,20 +4320,45 @@ with instrument_db_span(
         // Dump attn key/value shapes for blk.0 through blk.5 (first global at blk.5)
         eprintln!("  Per-layer attn shapes:");
         for n in 0..6 {
-            let q_shape = content.tensor_infos.get(&format!("blk.{n}.attn_q.weight")).map(|i| i.shape.dims().to_vec());
-            let k_shape = content.tensor_infos.get(&format!("blk.{n}.attn_k.weight")).map(|i| i.shape.dims().to_vec());
-            let v_shape = content.tensor_infos.get(&format!("blk.{n}.attn_v.weight")).map(|i| i.shape.dims().to_vec());
-            let out_shape = content.tensor_infos.get(&format!("blk.{n}.attn_output.weight")).map(|i| i.shape.dims().to_vec());
-            let qn_shape = content.tensor_infos.get(&format!("blk.{n}.attn_q_norm.weight")).map(|i| i.shape.dims().to_vec());
-            let kn_shape = content.tensor_infos.get(&format!("blk.{n}.attn_k_norm.weight")).map(|i| i.shape.dims().to_vec());
+            let q_shape = content
+                .tensor_infos
+                .get(&format!("blk.{n}.attn_q.weight"))
+                .map(|i| i.shape.dims().to_vec());
+            let k_shape = content
+                .tensor_infos
+                .get(&format!("blk.{n}.attn_k.weight"))
+                .map(|i| i.shape.dims().to_vec());
+            let v_shape = content
+                .tensor_infos
+                .get(&format!("blk.{n}.attn_v.weight"))
+                .map(|i| i.shape.dims().to_vec());
+            let out_shape = content
+                .tensor_infos
+                .get(&format!("blk.{n}.attn_output.weight"))
+                .map(|i| i.shape.dims().to_vec());
+            let qn_shape = content
+                .tensor_infos
+                .get(&format!("blk.{n}.attn_q_norm.weight"))
+                .map(|i| i.shape.dims().to_vec());
+            let kn_shape = content
+                .tensor_infos
+                .get(&format!("blk.{n}.attn_k_norm.weight"))
+                .map(|i| i.shape.dims().to_vec());
             eprintln!("    blk.{n}: q={q_shape:?} k={k_shape:?} v={v_shape:?} out={out_shape:?} q_norm={qn_shape:?} k_norm={kn_shape:?}");
         }
 
         // Count how many layers have attn_k.weight (vs. shared KV)
-        let kv_layers: Vec<usize> = (0..42).filter(|n| {
-            content.tensor_infos.contains_key(&format!("blk.{n}.attn_k.weight"))
-        }).collect();
-        eprintln!("  Layers with own attn_k.weight ({}/42): {kv_layers:?}", kv_layers.len());
+        let kv_layers: Vec<usize> = (0..42)
+            .filter(|n| {
+                content
+                    .tensor_infos
+                    .contains_key(&format!("blk.{n}.attn_k.weight"))
+            })
+            .collect();
+        eprintln!(
+            "  Layers with own attn_k.weight ({}/42): {kv_layers:?}",
+            kv_layers.len()
+        );
 
         // Read layer_output_scale values for first 5 layers
         let device = candle_core::Device::Cpu;
@@ -4177,7 +4366,8 @@ with instrument_db_span(
         let mut content2 = candle_core::quantized::gguf_file::Content::read(&mut file2).unwrap();
         for layer_idx in 0..5 {
             let key = format!("blk.{layer_idx}.layer_output_scale.weight");
-            let val = content2.tensor(&mut file2, &key, &device)
+            let val = content2
+                .tensor(&mut file2, &key, &device)
                 .and_then(|qt| qt.dequantize(&device))
                 .and_then(|t| t.flatten_all())
                 .and_then(|t| t.to_vec1::<f32>());
@@ -4206,7 +4396,10 @@ with instrument_db_span(
 
         assert_eq!(ids[0], 2, "first token must be BOS (ID 2)");
         assert_eq!(ids[1], 105, "<|turn> must be ID 105");
-        let end_pos = ids.iter().position(|&id| id == 106).expect("<turn|> (ID 106) must appear");
+        let end_pos = ids
+            .iter()
+            .position(|&id| id == 106)
+            .expect("<turn|> (ID 106) must appear");
         assert!(end_pos > 1, "<turn|> must follow the content");
     }
 

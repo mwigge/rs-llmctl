@@ -4259,7 +4259,9 @@ fn current_gpu_backend() -> &'static str {
 }
 
 #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
-fn current_gpu_backend() -> &'static str { "cpu" }
+fn current_gpu_backend() -> &'static str {
+    "cpu"
+}
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 fn current_tier_str() -> &'static str {
@@ -4267,7 +4269,9 @@ fn current_tier_str() -> &'static str {
 }
 
 #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
-fn current_tier_str() -> &'static str { "unknown" }
+fn current_tier_str() -> &'static str {
+    "unknown"
+}
 
 /// Default context window per family. Conservative defaults; overrides
 /// will land when ModelConfig grows a per-model `context_window` field.
@@ -4304,7 +4308,9 @@ fn tool_protocol_for_family(family_str: &str) -> &'static str {
 }
 
 #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
-fn tool_protocol_for_family(_family_str: &str) -> &'static str { "none" }
+fn tool_protocol_for_family(_family_str: &str) -> &'static str {
+    "none"
+}
 
 fn build_model_object(model: &ModelConfig, snap: CapabilitySnapshot) -> ModelObject {
     let family_str = model.family.as_deref().unwrap_or("");
@@ -4825,7 +4831,8 @@ mod tests {
             family: Some("qwen3".into()),
             weight: 1,
         };
-        let json = serde_json::to_value(build_model_object(&mc, CapabilitySnapshot::current())).unwrap();
+        let json =
+            serde_json::to_value(build_model_object(&mc, CapabilitySnapshot::current())).unwrap();
         let legacy: LegacyModelObject = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.id, "qwen3-8b");
         assert_eq!(legacy.object, "model");

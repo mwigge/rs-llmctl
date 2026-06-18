@@ -237,11 +237,19 @@ mod tests {
     fn detect_returns_a_supported_tier_on_this_host() {
         let t = detect();
         let r = recommend_model_for_tier(t);
-        eprintln!("detected: {} → recommended {} {}B ({}, {}k ctx)",
-            t.as_str(), r.family.as_str(), r.params_b,
-            r.recommended_quant, r.context_window / 1024);
+        eprintln!(
+            "detected: {} → recommended {} {}B ({}, {}k ctx)",
+            t.as_str(),
+            r.family.as_str(),
+            r.params_b,
+            r.recommended_quant,
+            r.context_window / 1024
+        );
         // Whatever tier we got, the recommendation should be a valid Qwen3 model.
-        assert!(matches!(r.family, CandleModelFamily::Qwen3 | CandleModelFamily::Qwen3Moe));
+        assert!(matches!(
+            r.family,
+            CandleModelFamily::Qwen3 | CandleModelFamily::Qwen3Moe
+        ));
         assert!(r.params_b > 0.0);
     }
 }
