@@ -1,6 +1,6 @@
 [package]
 name = "rs-llmctl"
-version = "1.5.0"
+version = "1.6.4"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -20,6 +20,13 @@ candle-transformers = ["dep:candle-transformers"]
 native-candle = ["candle-core", "candle-nn", "candle-transformers", "native-tokenizers"]
 native-tokenizers = ["tokenizers"]
 tokenizers = ["dep:tokenizers"]
+# GPU acceleration. Mutually exclusive in practice — enable one per build.
+# `gpu-metal`: Apple Silicon (Metal). Default GPU on macOS arm64.
+# `gpu-cuda`:  NVIDIA (CUDA) on Linux/Windows; also works with AMD GPUs on
+#              Linux via ROCm/HIP's CUDA shim (requires ROCm install and
+#              HIP_PLATFORM=amd at build time).
+gpu-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+gpu-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dependencies]
 anyhow = "1.0"
@@ -36,6 +43,7 @@ ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
+libc = "0.2"
 hyper = "1.9"
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }

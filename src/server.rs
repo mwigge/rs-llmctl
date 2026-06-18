@@ -708,12 +708,13 @@ async fn list_models(
     )
     .await;
 
+    let snap = CapabilitySnapshot::current();
     let response = with_request_id(
         Json(ModelList {
             object: "list",
             data: routed_models(&state.cfg)
                 .into_iter()
-                .map(ModelObject::from)
+                .map(|m| build_model_object(m, snap))
                 .collect(),
         })
         .into_response(),
@@ -4206,19 +4207,126 @@ struct ModelObject {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    /// Capability metadata. Additive over the OpenAI Models response shape;
+    /// strict clients that ignore unknown fields are unaffected.
+    capabilities: ModelCapabilities,
 }
 
-impl From<&ModelConfig> for ModelObject {
-    fn from(model: &ModelConfig) -> Self {
+/// Per-model capability advertisement consumed by external orchestrators
+/// (e.g. milliways sommelier) to route requests without out-of-band knowledge.
+/// All five fields are always present; unknowns surface as `0` or `"unknown"`
+/// rather than being omitted, so the schema stays stable.
+#[derive(Debug, Serialize)]
+struct ModelCapabilities {
+    /// Maximum context window in tokens. `0` when not known for the configured family.
+    context_window: u32,
+    /// Stable tool-call protocol identifier; see `CandleModelFamily::tool_protocol()`.
+    tool_protocol: &'static str,
+    /// Approximate model size in billions of parameters. `0.0` when unknown.
+    /// Heuristic: parsed from a `-{N}B` suffix in the alias if present.
+    model_size_b: f32,
+    /// The compute backend bound at startup: `"metal"`, `"cuda"`, or `"cpu"`.
+    gpu_backend: &'static str,
+    /// Hardware tier classification at startup; matches `HardwareTier::as_str()`.
+    tier: &'static str,
+}
+
+/// Snapshot of host-wide runtime facts that apply identically to every model
+/// in the response. Computed once per `list_models` request to avoid repeating
+/// the Metal/CUDA probe per model.
+#[derive(Debug, Clone, Copy)]
+struct CapabilitySnapshot {
+    gpu_backend: &'static str,
+    tier: &'static str,
+}
+
+impl CapabilitySnapshot {
+    fn current() -> Self {
         Self {
-            id: model.alias.clone(),
-            object: "model",
-            owned_by: "rs-llmctl",
+            gpu_backend: current_gpu_backend(),
+            tier: current_tier_str(),
         }
     }
 }
 
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn current_gpu_backend() -> &'static str {
+    match crate::gemma4_gguf::best_device() {
+        candle_core::Device::Metal(_) => "metal",
+        candle_core::Device::Cuda(_) => "cuda",
+        candle_core::Device::Cpu => "cpu",
+    }
+}
+
+#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+fn current_gpu_backend() -> &'static str { "cpu" }
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn current_tier_str() -> &'static str {
+    crate::tier::detect().as_str()
+}
+
+#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+fn current_tier_str() -> &'static str { "unknown" }
+
+/// Default context window per family. Conservative defaults; overrides
+/// will land when ModelConfig grows a per-model `context_window` field.
+fn default_context_window_for_family(family: &str) -> u32 {
+    match family {
+        "qwen3" | "qwen3-moe" => 131_072,
+        "gemma4" => 131_072,
+        "mistral" => 32_768,
+        "deepseek" => 32_768,
+        _ => 0,
+    }
+}
+
+/// Best-effort parse of "qwen3-14b-q4_k_m" → 14.0. Falls back to 0.0.
+fn parse_model_size_b_from_alias(alias: &str) -> f32 {
+    let lower = alias.to_lowercase();
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+        if let Some(num_part) = token.strip_suffix('b') {
+            if let Ok(v) = num_part.parse::<f32>() {
+                if v > 0.0 && v < 1_000.0 {
+                    return v;
+                }
+            }
+        }
+    }
+    0.0
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn tool_protocol_for_family(family_str: &str) -> &'static str {
+    crate::native::CandleModelFamily::from_kebab_str(family_str)
+        .map(|f| f.tool_protocol())
+        .unwrap_or("none")
+}
+
+#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+fn tool_protocol_for_family(_family_str: &str) -> &'static str { "none" }
+
+fn build_model_object(model: &ModelConfig, snap: CapabilitySnapshot) -> ModelObject {
+    let family_str = model.family.as_deref().unwrap_or("");
+    ModelObject {
+        id: model.alias.clone(),
+        object: "model",
+        owned_by: "rs-llmctl",
+        capabilities: ModelCapabilities {
+            context_window: default_context_window_for_family(family_str),
+            tool_protocol: tool_protocol_for_family(family_str),
+            model_size_b: parse_model_size_b_from_alias(&model.alias),
+            gpu_backend: snap.gpu_backend,
+            tier: snap.tier,
+        },
+    }
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
+    // Log hardware tier and recommended model once at startup. Advisory only —
+    // operator-selected models are honoured regardless of tier.
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+    crate::tier::log_startup_recommendation();
     serve_with_shutdown(cfg, shutdown_signal()).await
 }
 
@@ -4627,6 +4735,101 @@ mod tests {
             normalize_upstream("127.0.0.1:8080"),
             "http://127.0.0.1:8080"
         );
+    }
+
+    #[test]
+    fn model_capabilities_are_present_on_every_model_entry() {
+        let mc = ModelConfig {
+            alias: "qwen3-14b-q4_k_m".into(),
+            path: std::path::PathBuf::from("/tmp/none.gguf"),
+            role: "chat".into(),
+            family: Some("qwen3".into()),
+            weight: 1,
+        };
+        let snap = CapabilitySnapshot::current();
+        let obj = build_model_object(&mc, snap);
+        let json = serde_json::to_value(&obj).unwrap();
+
+        // Standard OpenAI Models fields preserved.
+        assert_eq!(json["id"], "qwen3-14b-q4_k_m");
+        assert_eq!(json["object"], "model");
+        assert_eq!(json["owned_by"], "rs-llmctl");
+
+        // New capability fields all present.
+        let caps = &json["capabilities"];
+        assert!(caps.is_object(), "capabilities must be an object");
+        assert!(caps["context_window"].is_number());
+        assert!(caps["tool_protocol"].is_string());
+        assert!(caps["model_size_b"].is_number());
+        assert!(caps["gpu_backend"].is_string());
+        assert!(caps["tier"].is_string());
+
+        // Qwen3 family advertises its native tool protocol.
+        assert_eq!(caps["tool_protocol"], "qwen3-native");
+        // Alias contained "14b" → size parser extracts 14.0.
+        assert_eq!(caps["model_size_b"], 14.0);
+        // Qwen3 default context is 128k.
+        assert_eq!(caps["context_window"], 131_072);
+    }
+
+    #[test]
+    fn unknown_family_still_renders_capabilities_with_defaults() {
+        let mc = ModelConfig {
+            alias: "experimental-model".into(),
+            path: std::path::PathBuf::from("/tmp/none.gguf"),
+            role: "chat".into(),
+            family: None,
+            weight: 1,
+        };
+        let snap = CapabilitySnapshot::current();
+        let obj = build_model_object(&mc, snap);
+        let json = serde_json::to_value(&obj).unwrap();
+        let caps = &json["capabilities"];
+        // Unknown family → tool_protocol = "none", context_window = 0, size = 0.0.
+        assert_eq!(caps["tool_protocol"], "none");
+        assert_eq!(caps["context_window"], 0);
+        assert_eq!(caps["model_size_b"], 0.0);
+        // gpu_backend and tier are always populated, even for unknown families.
+        assert!(caps["gpu_backend"].is_string());
+        assert!(caps["tier"].is_string());
+    }
+
+    #[test]
+    fn alias_size_parser_handles_common_shapes() {
+        assert_eq!(parse_model_size_b_from_alias("qwen3-14b-q4_k_m"), 14.0);
+        assert_eq!(parse_model_size_b_from_alias("Qwen3-Coder-30B-A3B"), 30.0);
+        assert_eq!(parse_model_size_b_from_alias("llama-3.1-8B-instruct"), 8.0);
+        assert_eq!(parse_model_size_b_from_alias("phi-3.5-mini-3.8b"), 3.8);
+        // No size suffix.
+        assert_eq!(parse_model_size_b_from_alias("custom"), 0.0);
+        // Implausible numbers are rejected.
+        assert_eq!(parse_model_size_b_from_alias("0b"), 0.0);
+        assert_eq!(parse_model_size_b_from_alias("99999b"), 0.0);
+    }
+
+    #[test]
+    fn backward_compat_legacy_openai_client_ignores_capabilities() {
+        // A strict OpenAI SDK client deserialises into a struct that only knows
+        // about id/object/owned_by. Confirm our payload still validates against
+        // that shape (additive — capabilities is an extra field).
+        #[derive(serde::Deserialize)]
+        struct LegacyModelObject {
+            id: String,
+            object: String,
+            owned_by: String,
+        }
+        let mc = ModelConfig {
+            alias: "qwen3-8b".into(),
+            path: std::path::PathBuf::from("/tmp/none.gguf"),
+            role: "chat".into(),
+            family: Some("qwen3".into()),
+            weight: 1,
+        };
+        let json = serde_json::to_value(build_model_object(&mc, CapabilitySnapshot::current())).unwrap();
+        let legacy: LegacyModelObject = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.id, "qwen3-8b");
+        assert_eq!(legacy.object, "model");
+        assert_eq!(legacy.owned_by, "rs-llmctl");
     }
 
     #[test]

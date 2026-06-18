@@ -18,6 +18,12 @@
 //! observability requirements before an externally bound production service can
 //! start.
 
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+mod gemma4_gguf;
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+pub mod tier;
+
 pub mod audit;
 pub mod config;
 pub mod contracts;

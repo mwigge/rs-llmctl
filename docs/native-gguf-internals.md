@@ -183,45 +183,309 @@ SWA KV:     W_K = W_V shape = [2560, 2 × 256] = [2560, 512]
 
 ---
 
-## Why Gemma4 GGUF forward pass fails in Candle 0.10.2
+## Gemma4 GGUF forward pass — vendored implementation
 
-`quantized_gemma3::ModelWeights::from_gguf` reads a single `attention.key_length`
-value and uses it as `head_dim` for every layer uniformly:
+`quantized_gemma3` in candle-transformers does not support Gemma4 because it
+hardcodes a single `head_dim` per model and lacks five Gemma4-specific
+architectural features. `src/gemma4_gguf.rs` is a self-contained re-implementation
+that reads the remapped `gemma3.*` metadata and exposes a `ModelWeights` with the
+same `forward(input, pos) -> logits` surface as the candle types.
+
+The Gemma4-specific features it implements are listed below; each one is required
+for the model to produce coherent output. Removing any single one produces
+garbage tokens or unstable logit distributions.
+
+### 1. Per-layer variable head dimension
+
+Each layer's `head_dim` is derived from its actual Q weight tensor shape rather
+than from a global metadata field:
 
 ```rust
-let head_count = md_get("attention.head_count")?.to_u32()? as usize;  // 8
-let key_length = md_get("attention.key_length")?.to_u32()? as usize;  // 512
+let head_dim = ct.tensor_infos.get(&format!("blk.{n}.attn_q.weight"))
+    .and_then(|info| info.shape.dims().first().copied())
+    .map(|q_out| q_out / head_count)
+    .unwrap_or(key_length_global);
+let is_swa = head_dim == key_length_swa;
+let rope_freq = if is_swa { rope_freq_swa } else { rope_freq_global };
 ```
 
-During the forward pass, the Q output tensor is reshaped as:
+- Global layer: `head_dim = 512`, `rope_freq = 1_000_000`
+- SWA layer:    `head_dim = 256`, `rope_freq = 10_000`
 
-```rust
-q.reshape((batch, seq_len, head_count, key_length))
-// = reshape([1, 7, 2048] → [1, 7, 8, 512])
-// 8 × 512 = 4096 ≠ 2048  →  shape mismatch error
+This makes the loader robust to changes in how `sliding_window_pattern` is
+encoded in the GGUF (the actual pattern is a Bool array of 42 entries).
+
+### 2. Cross-layer KV sharing (`shared_kv_layers = 18`)
+
+The last `shared_kv_layers` layers skip K/V projection entirely and reuse the
+K/V cache from an earlier layer. The mapping matches llama.cpp's reuse callback:
+
+```
+n_own_kv  = block_count - shared_kv_layers          = 42 - 18 = 24
+For layer L >= n_own_kv:
+  source = n_own_kv - 2  if L is SWA   (= 22, last own-K/V SWA layer)
+  source = n_own_kv - 1  if L is Global (= 23, last own-K/V Global layer)
+For layer L < n_own_kv:
+  source = None — layer computes and caches its own K/V
 ```
 
-The first layer encountered is an SWA layer (head_dim=256), so the Q tensor is
-`2048` elements wide. Candle tries to give it 4096 elements. The mismatch is
-fatal and immediate.
+Sharing layers compute their own Q (with their own `q_norm` + RoPE) but read K
+and V from `self.layers[source].kv_cache` directly. Because the source layer's
+cache already contains K with RoPE applied for the full sequence, sharing layers
+do **not** re-apply RoPE to K. The forward loop is index-based (not `iter_mut`)
+so the source's cache can be cloned before mutably borrowing the sharing layer.
 
-**This is not a metadata key issue.** The remap correctly surfaces all `gemma4.*`
-values under `gemma3.*`, so Candle reads the right numeric values. The problem is
-that Candle's model struct has a single `head_dim` field shared across all layers
-and no mechanism to switch it per-layer.
+### 3. Per-Layer Embedding (PLE)
 
-### What a correct implementation would require
+PLE provides per-token, per-layer conditioning via a dedicated 256-dim signal
+that gates each layer's hidden state. The pre-loop computation is:
 
-1. Read both `attention.key_length` and `attention.key_length_swa` from metadata.
-2. Read or derive `sliding_window_pattern` to determine which layer indices use
-   which dimension.
-3. Store per-layer head_dim in the `Block` struct (or derive it at forward time).
-4. Apply the correct reshape for each layer during the forward pass.
-5. Apply separate RoPE bases (`rope.freq_base` vs `rope.freq_base_swa`) per layer.
+```
+per_layer_emb  = embed_per_layer(token_ids) * sqrt(per_layer_dim)   # [B, T, 42, 256]
+per_layer_proj = reshape(W_proj(h) * 1/sqrt(embedding_length))      # [B, T, 42, 256]
+per_layer_proj = per_layer_proj_norm(per_layer_proj)                # RMSNorm over 256
+per_layer_inputs = (per_layer_proj + per_layer_emb) * 1/sqrt(2)     # [B, T, 42, 256]
+```
 
-This is architecturally possible within the existing `quantized_gemma3` framework
-but requires changes to candle-transformers that go beyond what rs-llmctl can
-patch externally without vendoring the crate.
+The `per_layer_token_embd` tensor has shape `[262144, 42 * 256] = [262144, 10752]`
+and dequantises to roughly 10.7 GB of F32 — paid once at load time.
+
+Inside each layer, after the FFN residual:
+
+```
+ple_in   = per_layer_inputs[:, :, layer_idx, :]      # [B, T, 256]
+x_gated  = GELU(inp_gate(h)) * ple_in                # [B, T, 256]
+x_proj   = post_norm(proj(x_gated))                  # [B, T, 2560]
+h        = h + x_proj                                # residual
+```
+
+### 4. `layer_output_scale` — per-layer scalar applied to full layer output
+
+Each layer has a trained scalar (`blk.N.layer_output_scale.weight`, shape `[1]`)
+applied to the layer's complete output **after** PLE and all residuals:
+
+```
+h = h * layer_scalar          # scalar values e.g. 0.061 (layer 0), 0.840 (layer 2)
+```
+
+The final RmsNorm at the output rescales the cumulative magnitude. Applying
+this scalar to sub-block deltas instead of the full output produces wrong
+distributions because that interpretation breaks the model's quantisation-aware
+training calibration.
+
+### 5. Final logit softcap (`final_logit_softcapping = 30`)
+
+After the LM head projection, logits are bounded by:
+
+```
+logits = tanh(logits / 30) * 30
+```
+
+This is the same final softcap used in Gemma2/3 and is read from
+`gemma3.final_logit_softcapping` (post-remap).
+
+### 6. Attention details specific to Gemma4 text attention
+
+- **`scaling = 1.0`** (not `1/sqrt(head_dim)`). The learnable `q_norm` (RMSNorm
+  with weight) absorbs the magnitude scaling. Applying `1/sqrt(head_dim)` on
+  top would over-attenuate softmax and bias argmax toward outlier tokens.
+- **V is RMS-normalised** without a learnable weight before attention:
+  `v = v / sqrt(mean(v^2) + eps)` per-head.
+- Q and K are RMS-normalised with their learned weights (`attn_q_norm`,
+  `attn_k_norm`) **before** RoPE.
+- Q-norm shape `[head_dim]`: per-layer scale dimension matches the layer's own
+  head_dim (256 or 512), not a global constant.
+
+### 7. Embedding scale
+
+Input embeddings are scaled by `sqrt(embedding_length) = sqrt(2560) ≈ 50.6` at
+lookup time, matching Gemma3/4's `ScaledWordEmbedding`. The per-layer embedding
+table uses a separate scale: `sqrt(per_layer_dim) = sqrt(256) = 16`.
+
+### Layer execution order (each of 42 layers)
+
+```
+residual = h
+h = attn_norm(h)                                 # pre-norm (RMSNorm, learned)
+h = forward_attn(h, mask, pos, ext_kv)            # ext_kv = None for own K/V,
+                                                  # Some(src_cache) for sharing
+h = post_attention_norm(h)                       # post-norm (RMSNorm, learned)
+h = h + residual
+
+residual = h
+h = ffn_norm(h)                                  # pre-norm
+h = mlp(h)                                       # SiLU(gate) * up → down
+h = post_ffw_norm(h)                             # post-norm
+h = h + residual
+
+pe_in = h
+h = inp_gate(h)                                  # [B, T, 2560] → [B, T, 256]
+h = GELU(h)
+h = h * per_layer_inputs[:, :, layer_idx, :]
+h = proj(h)                                      # [B, T, 256] → [B, T, 2560]
+h = post_norm(h)                                 # RMSNorm
+h = pe_in + h
+
+h = h * layer_scalar                             # per-layer scalar (e.g. 0.061)
+```
+
+After 42 layers:
+
+```
+h = output_norm(h)
+logits = lm_head(h)                              # weight-tied to token_embd
+logits = tanh(logits / 30) * 30                  # final logit softcap
+```
+
+---
+
+## Qwen3 dense family (current daily-driver path)
+
+The native runtime's default tool-capable workload is the Qwen3 dense family.
+The 14 B variant at Q4_K_M is the baseline recommendation for Apple Silicon
+24 GB unified memory and Linux 16 GB-class discrete GPUs; see the tier matrix
+in "GPU acceleration" below.
+
+Unlike Gemma 4, Qwen3 GGUF loading goes through candle's stock
+`candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf` — no
+vendored module, no metadata-prefix remap, no PLE/AltUp/Laurel surgery. This
+section documents what the runtime expects so that load/inference failures
+can be diagnosed without re-reading candle internals.
+
+### Qwen3 14B Q4_K_M GGUF metadata reference
+
+Read directly from `unsloth/Qwen3-14B-GGUF::Qwen3-14B-Q4_K_M.gguf`:
+
+| Metadata key                            | Value     | Meaning                                      |
+|-----------------------------------------|-----------|----------------------------------------------|
+| `general.architecture`                  | `qwen3`   | No remap needed — candle reads `qwen3.*` natively. |
+| `qwen3.block_count`                     | 40        | Number of decoder layers                     |
+| `qwen3.embedding_length`                | 5 120     | Residual stream / hidden dimension           |
+| `qwen3.feed_forward_length`             | 17 408    | FFN intermediate width                       |
+| `qwen3.attention.head_count`            | 40        | Query heads                                  |
+| `qwen3.attention.head_count_kv`         | 8         | KV heads (GQA factor = 5)                    |
+| `qwen3.attention.key_length`            | 128       | Per-head dim — **uniform across all layers** |
+| `qwen3.attention.value_length`          | 128       | Same as key_length; no SWA split             |
+| `qwen3.attention.layer_norm_rms_epsilon`| 1e-6      | RMS norm epsilon                             |
+| `qwen3.context_length`                  | 131 072   | 128 k native context                         |
+| `qwen3.rope.freq_base`                  | 5 000 000 | Single RoPE base (no SWA-specific)           |
+| `tokenizer.ggml.model`                  | `gpt2`    | Standard GPT-2 BPE — candle's `TokenizerFromGguf::from_gguf` handles it directly. |
+
+What is **absent** versus Gemma 4 (important for understanding why the load
+path is so much simpler):
+
+- No `attention.key_length_swa` / `value_length_swa` — head_dim is uniform.
+- No `attention.sliding_window_pattern` — all layers are full attention.
+- No `attention.shared_kv_layers` — every layer computes its own K/V.
+- No `embedding_length_per_layer_input` / `per_layer_*` tensors — no PLE.
+- No `altup.*` / `laurel_*` / `activation_sparsity_scale` — no Gemma 3n features.
+- No `final_logit_softcapping` — no logit softcap.
+- No `layer_output_scale` — no per-layer scalar.
+
+### Qwen3 tensor inventory
+
+Tensor names follow candle's standard transformer naming convention. For each
+layer `N ∈ [0, block_count)`:
+
+| Tensor name (GGUF)                  | Shape (Q4_K_M packs the data)   | Notes                                          |
+|-------------------------------------|----------------------------------|------------------------------------------------|
+| `blk.N.attn_q.weight`               | `[head_count × key_length, embedding_length]` = `[5120, 5120]` | Q projection |
+| `blk.N.attn_k.weight`               | `[head_count_kv × key_length, embedding_length]` = `[1024, 5120]` | K projection |
+| `blk.N.attn_v.weight`               | `[head_count_kv × value_length, embedding_length]` = `[1024, 5120]` | V projection |
+| `blk.N.attn_output.weight`          | `[embedding_length, head_count × key_length]` = `[5120, 5120]` | Output projection |
+| `blk.N.attn_q_norm.weight`          | `[key_length]` = `[128]`         | Q RMSNorm (learnable scale, per-head)         |
+| `blk.N.attn_k_norm.weight`          | `[key_length]` = `[128]`         | K RMSNorm (learnable scale, per-head)         |
+| `blk.N.attn_norm.weight`            | `[embedding_length]` = `[5120]`  | Pre-attention RMSNorm                          |
+| `blk.N.ffn_norm.weight`             | `[embedding_length]` = `[5120]`  | Pre-FFN RMSNorm                                |
+| `blk.N.ffn_gate.weight`             | `[feed_forward_length, embedding_length]` = `[17408, 5120]` | Gate (SwiGLU) |
+| `blk.N.ffn_up.weight`               | `[feed_forward_length, embedding_length]` = `[17408, 5120]` | Up |
+| `blk.N.ffn_down.weight`             | `[embedding_length, feed_forward_length]` = `[5120, 17408]` | Down |
+
+Model-level (one each):
+
+| Tensor name                  | Shape                          | Notes                                |
+|------------------------------|--------------------------------|--------------------------------------|
+| `token_embd.weight`          | `[vocab, embedding_length]`    | Token embedding table                |
+| `output_norm.weight`         | `[embedding_length]` = `[5120]`| Final RMSNorm                        |
+| `output.weight`              | `[vocab, embedding_length]` *or absent* | LM head — weight-tied to `token_embd.weight` when absent in the file. |
+
+### Qwen3 chat template and tool-call protocol
+
+Qwen3 uses the ChatML prompt format. The runtime's
+`format_native_chat_prompt(CandleModelFamily::Qwen3, ...)` emits:
+
+```
+<|im_start|>system
+{system_message}<|im_end|>
+<|im_start|>user
+{user_message}<|im_end|>
+<|im_start|>assistant
+```
+
+EOS / end-of-turn token: `<|im_end|>` (ID 151645). Open-turn token:
+`<|im_start|>` (ID 151644).
+
+The model has two response modes:
+
+- **Thinking mode** (default): the model emits `<think>...</think>` then the
+  user-visible answer. Useful for hard reasoning; costs ~200-800 extra tokens
+  per turn.
+- **Fast mode** (`/no_think` directive in the user message): skips the
+  thinking block. Recommended for short tool-use turns.
+
+Native tool-calling protocol is `qwen3-native` (advertised in `/v1/models`
+under `capabilities.tool_protocol`). Tool invocations are emitted between
+`<tool_call>...</tool_call>` markers as a single JSON object per call.
+Orchestrators using OpenAI-style `tool_calls` arrays need to translate;
+those using the Qwen native shape can consume it directly.
+
+### Setup checklist for the Qwen3 family
+
+1. Download the GGUF into `~/.local/share/milliways/models/`. Recommended
+   per tier (matches `tier::recommend_model_for_tier`):
+   - Tier 1 (6 GB VRAM): `unsloth/Qwen3-4B-GGUF :: Qwen3-4B-Q4_K_M.gguf` (~2.5 GB on disk)
+   - Tier 2 (12 GB VRAM): `unsloth/Qwen3-8B-GGUF :: Qwen3-8B-Q4_K_M.gguf` (~5 GB on disk)
+   - Tier 3 (16-18 GB): `unsloth/Qwen3-14B-GGUF :: Qwen3-14B-Q4_K_M.gguf` (~9 GB on disk)
+2. Build rs-llmctl with the matching GPU feature:
+   `cargo build --release --features native-candle,native-tokenizers,gpu-metal`
+   (or `gpu-cuda` for NVIDIA / AMD ROCm).
+3. The runtime probes the device with `gemma4_gguf::best_device()` at startup
+   and emits an info-level log: `detected hardware tier=tier3-mac
+   family=qwen3 params_b=14 recommended_quant=Q4_K_M context_window=131072`.
+4. No metadata remap, no profile detection — the file loads directly through
+   `candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf`.
+
+### Measured baseline on Apple M-series 24 GB unified, Metal
+
+Captured 2026-06-17 with `qwen3_runtime_python_counting_program`:
+
+| Phase | Value |
+|---|---|
+| Model load (~9 GB file) | 7.3 s |
+| Prefill (30-token chat prompt) | 53-236 ms |
+| Generation, greedy (140 tokens, /no_think) | 7.4 s → **~19 tok/s** |
+| Working-set peak resident | ~11 GB |
+| Swap growth during full forward + reverse test | < 2 GB |
+
+Contrast with Gemma 4 E4B on the same hardware (74 s load, dominated by
+F32 PLE dequantisation). Qwen3 is the daily-driver path; Gemma 4 remains
+available for users who explicitly select it on 24 GB+ deployments.
+
+### Agentic capability sanity test
+
+The `qwen3_runtime_adds_chaosotel_tracing_to_counter_program` integration
+test exercises the full read-context-then-modify pipeline:
+
+1. Feeds the model three real chaostooling-otel tracing patterns + the
+   counter program from a prior test.
+2. Captures the model's `<think>` block separately from the user-visible
+   answer.
+3. Extracts the regenerated Python and writes it to
+   `/tmp/rs_llmctl_count_traced.py`.
+4. Asserts the model (a) picked one of the three patterns and (b)
+   justified the choice in the user-visible answer.
+
+Typical execution on Metal: 76 s total wall time, 17 tok/s generation.
 
 ---
 
@@ -237,23 +501,113 @@ patch externally without vendoring the crate.
 | Head dim             | Uniform                  | Uniform              | Per-layer (512 global / 256 SWA)  |
 | KV sharing           | No                       | No                   | Yes (`shared_kv_layers`)          |
 | SWA                  | No                       | Yes (uniform)        | Yes (with separate head dim)      |
-| Candle 0.10.2 status | Fully supported          | Fully supported      | Tokenizer ✓, forward pass ✗      |
+| Candle 0.10.2 status | Fully supported          | Fully supported      | Vendored module in rs-llmctl     |
 
 ---
 
 ## Current status and path forward
 
-| Component              | Status                                                       |
-|------------------------|--------------------------------------------------------------|
-| Tokenizer loading      | Working — SPM-BPE fallback in `tokenizer_from_gguf_spm`     |
-| Metadata key probe     | Working — `remap_gguf_arch_prefix("gemma4", "gemma3")`       |
-| Model weight loading   | Working — tensors load via standard `blk.{n}.*` names       |
-| Forward pass (GGUF)    | Blocked — per-layer variable head_dim not in Candle 0.10.2  |
-| Forward pass (safetensors) | Working — `gemma3::Model` reads config.json directly    |
+| Component              | Status                                                          |
+|------------------------|-----------------------------------------------------------------|
+| Tokenizer loading      | Working — SPM-BPE fallback in `tokenizer_from_gguf_spm`        |
+| Metadata key probe     | Working — `remap_gguf_arch_prefix("gemma4", "gemma3")`          |
+| Model weight loading   | Working — tensors load via standard `blk.{n}.*` names          |
+| Forward pass (GGUF)    | **Working** — vendored `gemma4_gguf::ModelWeights` in `src/`   |
+| Forward pass (safetensors) | Working — `gemma3::Model` reads config.json directly        |
 
-To unblock GGUF forward pass without vendoring candle, the most targeted option
-is a thin `quantized_gemma4` model implementation in `src/` that replicates
-`quantized_gemma3` with per-layer head_dim selection, reading both
-`attention.key_length` and `attention.key_length_swa` from the remapped metadata.
-The tensor names (`blk.{n}.attn_q.weight`) are identical between Gemma3 and
-Gemma4, so only the reshape and RoPE configuration logic needs to change.
+The forward pass is implemented in `src/gemma4_gguf.rs` (~480 LoC, gated behind
+the `native-candle` + `native-tokenizers` feature flags). The vendored module
+re-implements the seven Gemma4-specific features above. It deliberately does
+not extend `candle_transformers::quantized_gemma3` because the differences in
+attention, PLE, and KV sharing span enough call sites that the diff was larger
+than the rewrite.
+
+### GPU acceleration
+
+The default build is CPU-only. To enable GPU inference, opt in via one of the
+mutually-exclusive cargo features:
+
+| Platform                    | Feature       | Build command (release)                                                          |
+|-----------------------------|---------------|----------------------------------------------------------------------------------|
+| macOS (Apple Silicon)       | `gpu-metal`   | `cargo build --release --features native-candle,native-tokenizers,gpu-metal`     |
+| Linux NVIDIA                | `gpu-cuda`    | `cargo build --release --features native-candle,native-tokenizers,gpu-cuda`      |
+| Linux AMD (via ROCm/HIP)    | `gpu-cuda`    | `HIP_PLATFORM=amd cargo build --release --features native-candle,native-tokenizers,gpu-cuda` |
+
+#### Measured Metal speedup (Gemma 4 E4B Q4_K_M, Apple M-series 24 GB)
+
+| Phase                  | CPU         | Metal       | Speedup       |
+|------------------------|-------------|-------------|---------------|
+| Model load (dequant)   | ~75 s       | ~73 s       | ~1× (CPU-bound) |
+| Prefill (13 tokens)    | 118 s       | 115 ms      | ~1000×        |
+| Per-token (greedy)     | ~3 s        | sub-100 ms (extrapolated) | ~30×+ |
+
+The model load is bandwidth-bound on the ~10.7 GB F32 PLE dequantization and
+runs on the CPU regardless of the target device — moving the load to the GPU
+would require streaming dequantization, which candle 0.10.2 does not provide.
+
+#### Recommended model per VRAM tier
+
+| Tier | VRAM budget       | Best Gemma 4 variant            | Best non-Gemma alternative | Notes                                                                 |
+|------|-------------------|---------------------------------|----------------------------|-----------------------------------------------------------------------|
+| 1    | 6 GB              | **(none)**                      | Qwen3 4B Q4_K_M (~2.5 GB)  | E2B's PLE table dequant peaks at ~10 GB on CPU before settling to F32 |
+| 2    | 12 GB             | Gemma 4 E2B Q4_K_M              | Qwen3 8B Q4_K_M (~5 GB)    | E2B working set ~7-8 GB once loaded                                   |
+| 3    | 24 GB Mac unified | Gemma 4 E4B Q4_K_M (this build) | Qwen3 14B Q4_K_M (~9 GB)   | E4B needs ~17 GB total — fits on Mac but only with the OS idle        |
+
+#### Known limitations
+
+- **F16 PLE dequantisation breaks correctness on Metal.** Calling
+  `dequantize_f16` instead of `dequantize` for `per_layer_token_embd` cuts
+  resident memory from ~10.7 GB to ~5.4 GB and works correctly on the CPU
+  backend, but on Metal the argmax collapses onto punctuation tokens (`()`
+  instead of `Hello world`). Root cause is the candle 0.10.2 Metal dequant
+  path that goes `Q4_K_M → F32 → F16` — the F32→F16 cast loses enough
+  fidelity in the per-layer embedding magnitudes to bias the model. Until
+  candle ships a direct Q4_K_M→F16 Metal kernel, the PLE table stays F32.
+  For 12 GB GPUs this means **only E2B fits**; E4B is Mac/24 GB+ only.
+
+- **Repeated test runs on a memory-constrained Mac trigger swap thrashing.**
+  Each model load reserves ~10 GB for the F32 PLE table. macOS reclaims
+  this lazily after the process exits, so back-to-back test runs may
+  hang waiting for swap. Mitigation: idle for ~60-120 s between runs, or
+  reboot for a clean memory state.
+
+`gpu-cuda` reaches AMD GPUs because ROCm ships a HIP-based CUDA shim that
+satisfies candle's CUDA dependencies — no rs-llmctl code change. The ROCm
+install is responsible for providing the matching `hipBLAS`/`hipBLASLt`
+libraries at link time.
+
+Device selection is centralised in `gemma4_gguf::best_device()`:
+
+```rust
+pub fn best_device() -> Device {
+    #[cfg(feature = "gpu-metal")]
+    if let Ok(d) = Device::new_metal(0) { return d; }
+    #[cfg(feature = "gpu-cuda")]
+    if let Ok(d) = Device::new_cuda(0) { return d; }
+    Device::Cpu
+}
+```
+
+Compiled-in backends are probed in Metal → CUDA → CPU order. The first one
+that initialises successfully wins, so a `gpu-metal` build on a non-Metal box
+silently falls back to CPU.
+
+**Memory note.** The Gemma4 `per_layer_token_embd` table is dequantised to F32
+at load time (~10.7 GB). On a unified-memory Mac the table lives in shared
+memory; on a discrete GPU it has to fit in VRAM alongside the rest of the
+model. A future optimisation is on-demand row dequantisation, keeping the
+quantised table resident and only converting the rows touched by the current
+batch.
+
+### Verifying coherent output
+
+```bash
+cargo test --features native-candle,native-tokenizers \
+  gemma4_gguf_forward_pass_produces_coherent_tokens -- --ignored
+```
+
+The test loads `~/.local/share/milliways/models/gemma-4-E4B-it-Q4_K_M.gguf`,
+runs a `<bos><|turn>user\nSay hello world<turn|>\n<|turn>model\n` prompt
+through 13-token prefill + 15-token greedy generation on CPU, and asserts that
+the decoded output contains ASCII alphabetic content. End-to-end on an M-series
+Mac the prefill takes ~80 s and per-token generation ~3 s.

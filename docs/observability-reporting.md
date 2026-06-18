@@ -87,6 +87,32 @@ Sensitive attributes are redacted before emission. Prompts, messages, bearer
 tokens, API keys, passwords, collector authorization headers, and local file
 paths are not exported as span/log attributes.
 
+### Native model load and inference metrics
+
+The native runtime emits three OTel instruments specifically for the in-process
+Candle path. They are gated behind the `native-candle` + `native-tokenizers`
+feature set and are inert in CPU-only / no-native builds.
+
+| Instrument | Kind | Unit | Attributes | Emitted by |
+|---|---|---|---|---|
+| `native.model.load.duration_ms` | Histogram (f64) | ms | `model.family`, `model.quant`, `gpu.backend` | Recorded once per `load_real_candle_decoder()` call after the model finishes constructing. |
+| `native.model.tokens_per_second` | Histogram (f64) | token/s | `model.family`, `phase` (`prefill` or `generation`) | Recorded twice per request: once after the prefill forward pass, once at the end of the generation loop. |
+| `native.model.peak_resident_mb` | Gauge (f64) | MB | `model.family` | Sampled via `getrusage(RUSAGE_SELF).ru_maxrss` immediately after model load. macOS reports bytes natively, Linux reports KiB — both normalised to MB. |
+
+Three OTel spans wrap these phases:
+
+| Span | Attributes | Wraps |
+|---|---|---|
+| `native.model.load` | `model.family`, `model.quant`, `gpu.backend`, `gguf.path` | The body of `load_real_candle_decoder` (tokenizer load + model construction). |
+| `native.model.prefill` | `model.family`, `input_tokens`, `context_pos` (always 0) | The first `forward_next` call in `RealCandleDecoder::generate()`. |
+| `native.model.generation` | `model.family`, `output_tokens` (set on span exit) | The per-token loop after prefill in `RealCandleDecoder::generate()`. |
+
+These are advisory diagnostics, not request-routing metadata; the
+`/v1/models` capability advertisement (`tier`, `gpu_backend`) is a separate
+mechanism for orchestrator-side routing. See
+`openspec/changes/add-tool-capable-tiered-runtime/specs/native-model-load-observability/spec.md`
+for the formal contract.
+
 ## Reports
 
 Reports focus on:
