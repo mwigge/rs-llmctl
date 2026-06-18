@@ -3,6 +3,56 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## 1.6.5 - 2026-06-18
+
+- Native generation: new `mistral-rs` cargo feature wires the `mistralrs`
+  0.8.1 crate as an opt-in second inference backend. The feature is off
+  by default; when enabled together with `gpu-metal` or `gpu-cuda`, the
+  matching mistralrs backend feature propagates automatically via
+  `mistralrs?/metal` / `mistralrs?/cuda`. Stage-1 spike confirmed the
+  backend loads Devstral 24B's GGUF in 26 s — handling the non-canonical
+  head_dim that breaks candle 0.10.2's `quantized_llama`. macOS Metal
+  runs require full Xcode (mistralrs-paged-attn invokes `xcrun metal`
+  in build.rs); Linux NVIDIA / AMD ROCm users build cleanly with just
+  the standard CUDA toolchain.
+- Native generation: Mistral-family GGUF support added through candle's
+  existing `quantized_llama` path. `CandleModelFamily::Mistral` GGUF
+  loading is now wired (previously bailed); the `RealCandleModel`
+  enum gains a `MistralGguf(quantized_llama::ModelWeights)` variant
+  and `format_native_chat_prompt(Mistral, _)` emits the classic
+  `<s>[INST] ... [/INST]` template. Works for Llama-arch GGUFs that
+  follow canonical head_dim (Mistral 7B v0.3, Llama 3.1 8B Instruct,
+  CodeLlama 13B). Non-canonical Mistrals (Devstral 24B, Mistral Small
+  3.1 24B) fail at the first forward pass — documented under "Variant
+  decision log" in `docs/native-gguf-internals.md`.
+- Native generation: new `"mistral-instruct"` `tool_protocol`
+  identifier returned by `CandleModelFamily::Mistral::tool_protocol()`
+  and advertised under `/v1/models` `capabilities.tool_protocol`. The
+  `tool_protocol` enum in `docs/openapi.yaml` extended accordingly.
+- Tier detection: AMD VRAM is now probed via Linux DRM sysfs
+  (`/sys/class/drm/cardN/device/mem_info_vram_total`) with ROCm SMI
+  fallback, alongside the existing NVIDIA path. Probe-failure default
+  remains `Tier2Nv12` (advisory only).
+- Documentation:
+  - `docs/native-gguf-internals.md` — new "Variant decision log" section
+    explains why Gemma 4 E4B is no longer the daily driver, why
+    Qwen3-Coder MoE isn't the Mac premium, why Devstral 24B isn't the
+    Mac premium, and lists the net per-tier deployment recommendation
+    pointing macOS premium users at `llama-server` (Homebrew install,
+    Metal works without Xcode).
+  - `docs/native-operating-modes.md` — Mode A (hybrid cloud-planner +
+    local-executor), Mode B (offline-only), Mode C (educational
+    verbose-observability), with the orchestrator setup recipes per
+    mode.
+  - `docs/blog-qwen3-learns-to-trace-itself.md` — narrative blog post
+    on the Qwen3 14B local Metal setup and the agentic
+    chaostooling-otel demo where the model read three real OTel
+    instrumentation patterns and rewrote its own counter program with
+    tracing on each iteration.
+  - `examples/qwen3-tier1.toml` and `examples/qwen3-tier3.toml` —
+    opinionated single-binary serve configs for the 6 GB NVIDIA tier
+    and the 16-18 GB Mac / discrete-GPU tier.
+
 ## 1.6.4 - 2026-06-17
 
 - Native generation: Qwen3 14B Q4_K_M is the new daily-driver tool-capable

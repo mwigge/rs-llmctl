@@ -5249,7 +5249,7 @@ dependencies = [
 
 [[package]]
 name = "rs-llmctl"
-version = "1.6.4"
+version = "1.6.5"
 dependencies = [
  "anyhow",
  "arrow",
