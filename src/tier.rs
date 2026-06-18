@@ -109,7 +109,11 @@ pub const fn recommend_model_for_tier(tier: HardwareTier) -> ModelDescriptor {
 }
 
 /// Map a probed VRAM size (in GiB) to a tier. Pure data — easy to unit test.
+/// Reachable from `detect()` only when `gpu-cuda` is compiled in; also
+/// exercised by `tier::tests`. `#[allow(dead_code)]` keeps clippy quiet on
+/// CPU-only / metal-only builds where the gpu-cuda branch isn't compiled.
 #[must_use]
+#[allow(dead_code)]
 fn classify_cuda_vram_gib(vram_gib: Option<f64>) -> HardwareTier {
     let Some(gib) = vram_gib else {
         // Query failed — log a warning and default to mid-tier as a
