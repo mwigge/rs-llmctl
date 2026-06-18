@@ -1,0 +1,79 @@
+# Tier 3 (16-18 GB usable) — Qwen3 14B Q4_K_M on Apple Silicon Metal or
+# AMD 16 GB / NVIDIA 16 GB+ discrete GPUs via gpu-cuda. This profile matches
+# `tier::recommend_model_for_tier(Tier3Mac|Tier3Amd16)` in 1.6.4.
+#
+# Place the model file at the path below before starting:
+#   curl -L -o ~/.local/share/milliways/models/Qwen3-14B-Q4_K_M.gguf \
+#     https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf
+#
+# Then build + run with the matching GPU feature:
+#   cargo build --release --features native-candle,native-tokenizers,gpu-metal
+#   llmctl --config examples/qwen3-tier3.toml serve
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+# Qwen3 14B supports 128 k native context; keep it modest here so the KV
+# cache fits comfortably alongside other apps on a 24 GB Mac.
+context_size = 32768
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+
+[[security.api_keys]]
+id = "qwen3-tier3-placeholder"
+sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
+subject = "tier3-user"
+team = "platform"
+scopes = ["chat", "models"]
+
+[resources]
+budget = 0.80
+cpu_only = false
+# `metal` for Apple Silicon; switch to `amd` or `nvidia` when running the
+# same model on a discrete 16 GB+ GPU (rebuild with --features gpu-cuda).
+gpu_vendor = "metal"
+
+[storage]
+db_path = "~/.local/share/milliways/rs-llmctl/llmctl.db"
+model_dir = "~/.local/share/milliways/models"
+
+[observability]
+service_name = "rs-llmctl-tier3"
+environment = "local"
+traces_enabled = true
+metrics_enabled = true
+logs_enabled = true
+
+[observability.exporter]
+# Defaults to a local OTLP collector — point this at SigNoz / Tempo / Jaeger
+# as needed. See docs/native-operating-modes.md "Mode C" for educational
+# verbose-observability setups.
+endpoint = "http://127.0.0.1:4318"
+protocol = "http-protobuf"
+timeout_ms = 5000
+
+[audit]
+retention-days = 180
+report-directory = "~/.local/share/milliways/rs-llmctl/reports"
+report-formats = ["json"]
+monthly-reports = true
+
+[[models]]
+alias = "qwen3-14b"
+path = "~/.local/share/milliways/models/Qwen3-14B-Q4_K_M.gguf"
+role = "chat"
+family = "qwen3"
+weight = 1
+
+[[quotas]]
+subject = "tier3-user"
+team = "platform"
+requests_per_minute = 120
+tokens_per_day = 2000000
+max_concurrency = 4
+allowed_models = ["qwen3-14b"]

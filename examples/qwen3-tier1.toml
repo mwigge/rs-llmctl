@@ -1,0 +1,85 @@
+# Tier 1 (6 GB VRAM, NVIDIA consumer) — Qwen3 4B Q4_K_M. Matches
+# `tier::recommend_model_for_tier(Tier1Nv6)` in 1.6.4. Designed for laptop
+# / mid-range desktop deployments where the model has to share VRAM with
+# other GPU workloads (driver, compositor, occasionally a browser).
+#
+# Place the model file at the path below before starting:
+#   curl -L -o ~/.local/share/milliways/models/Qwen3-4B-Q4_K_M.gguf \
+#     https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf
+#
+# Then build + run with CUDA (or ROCm/HIP for AMD via the CUDA shim):
+#   cargo build --release --features native-candle,native-tokenizers,gpu-cuda
+#   llmctl --config examples/qwen3-tier1.toml serve
+#
+# Mode A (hybrid) is the recommended operating mode for this tier — see
+# docs/native-operating-modes.md. The 4B model is fast and reliable for
+# tool-use turns but should be paired with a cloud planner for whole-repo
+# reasoning.
+mode = "single"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+worker_base_port = 18765
+# 6 GB VRAM only affords ~32 k of context with INT8 KV-cache quantisation,
+# so the context_size below is the realistic ceiling. Going higher risks
+# OOM during inference. See docs/native-gguf-internals.md tier matrix.
+context_size = 32768
+
+[security]
+production = false
+require_auth = true
+bind_external = false
+
+[[security.api_keys]]
+id = "qwen3-tier1-placeholder"
+sha256 = "9999999999999999999999999999999999999999999999999999999999999999"
+subject = "tier1-user"
+team = "platform"
+scopes = ["chat", "models"]
+
+[resources]
+budget = 0.70
+cpu_only = false
+# `nvidia` covers both NVIDIA CUDA and AMD via ROCm's HIP CUDA shim
+# (export HIP_PLATFORM=amd at build time for AMD targets).
+gpu_vendor = "nvidia"
+
+[storage]
+db_path = "~/.local/share/milliways/rs-llmctl/llmctl.db"
+model_dir = "~/.local/share/milliways/models"
+
+[observability]
+service_name = "rs-llmctl-tier1"
+environment = "local"
+traces_enabled = true
+metrics_enabled = true
+logs_enabled = true
+
+[observability.exporter]
+endpoint = "http://127.0.0.1:4318"
+protocol = "http-protobuf"
+timeout_ms = 5000
+
+[audit]
+retention-days = 180
+report-directory = "~/.local/share/milliways/rs-llmctl/reports"
+report-formats = ["json"]
+monthly-reports = true
+
+[[models]]
+alias = "qwen3-4b"
+path = "~/.local/share/milliways/models/Qwen3-4B-Q4_K_M.gguf"
+role = "chat"
+family = "qwen3"
+weight = 1
+
+[[quotas]]
+subject = "tier1-user"
+team = "platform"
+requests_per_minute = 60
+# Lower per-day budget reflects the 6 GB tier being a fast tool executor
+# rather than a primary cognitive workhorse.
+tokens_per_day = 500000
+max_concurrency = 2
+allowed_models = ["qwen3-4b"]
