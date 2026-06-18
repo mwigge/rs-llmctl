@@ -554,6 +554,131 @@ is effectively the same as Tier 3 (Qwen3 14B Q4_K_M dense). Linux users
 with NVIDIA hardware can use the MoE variant; AMD users should verify
 their ROCm/HIP install before relying on it.
 
+### Variant decision log — why some "obvious" alternatives are NOT the default
+
+This section is the institutional memory for why specific model variants
+and inference engines were investigated and **rejected** (or deferred)
+as defaults. It exists so that the next person who asks "why don't we
+just use X" gets the answer in one place instead of re-litigating it
+from scratch.
+
+#### Why Gemma 4 E4B (vendored) is no longer the daily driver
+
+Gemma 4 E4B Q4_K_M was the first model the native runtime supported.
+The vendored `src/gemma4_gguf.rs` module implements seven Gemma 4-specific
+features (PLE, shared_kv_layers, per-layer head_dim, layer_output_scale,
+F32→F16 attention scaling at 1.0, final_logit_softcap, embedding scale)
+and produces correct output on Metal end-to-end.
+
+It stays in the codebase but is **no longer recommended** because:
+
+- **Memory profile is hostile on shared-memory Macs.** The Per-Layer
+  Embedding (PLE) tensor is dequantised to F32 at load time (~10.7 GB),
+  which on a 24 GB unified-memory Mac leaves only 6-8 GB for the OS
+  and other apps. Repeated test runs in the same session trigger swap
+  thrashing.
+- **Slow cold start.** F32 PLE dequantisation takes ~74 s on M-series
+  vs ~7 s for the equivalent-class Qwen3 14B. Operators feel this
+  every restart.
+- **F16 PLE optimisation breaks on Metal.** Attempting to dequantise
+  the PLE table to F16 (cutting resident memory to ~5.4 GB) collapses
+  the argmax distribution onto punctuation tokens — the model emits
+  `()` instead of coherent text. Root-caused to the candle 0.10.2
+  Metal F32→F16 cast losing fidelity in the per-layer embedding
+  magnitudes. Until candle ships a direct Q4_K_M→F16 Metal kernel
+  the PLE stays F32.
+- **No quality advantage over Qwen3 14B on the agentic workload.**
+  Both models pass the same dual-direction Python counting test and
+  the chaostooling-otel pattern-application test. Qwen3 14B is faster
+  per-token, has a cleaner tool-call protocol, and uses 60 % less
+  resident memory.
+
+The vendored loader still ships so operators on 24 GB+ hardware with
+the OS quiesced can opt in via `family = "gemma4"` in their model
+config. Gemma 4 E2B (the smaller variant) was NOT vendored: it has
+materially different architecture (AltUp + Laurel + per-layer
+activation sparsity) requiring another full vendoring session, with
+no compensating benefit over Qwen3 4B which serves the same tier.
+
+#### Why Qwen3-Coder-30B-A3B MoE is not the Mac premium model
+
+Qwen3-Coder-30B-A3B is the obvious "premium" pick for a 24 GB Mac
+(MoE with ~3 B active parameters per token, agentic-trained, supports
+the `qwen3-native` tool protocol). The wiring landed in
+`CandleModelFamily::Qwen3Moe`, including the `quantized_qwen3_moe`
+load path with `DType::F32` activations.
+
+**It cannot run on Mac in candle 0.10.2.** The forward pass bails at
+`candle-nn-0.10.2/src/moe.rs:351`:
+
+```rust
+candle::bail!("moe_gemm_gguf is only implemented for the cuda backend")
+```
+
+There is no Metal kernel and no CPU fallback for `moe_gemm_gguf` in
+this candle version. Linux NVIDIA / AMD-via-ROCm users with `gpu-cuda`
+can use the MoE path; macOS users cannot, regardless of available
+VRAM. Resolving this requires an upstream candle Metal MoE kernel or
+CPU fallback. Tracked as a known limitation in this document under
+"Known limitation: Qwen3 MoE is CUDA-only".
+
+#### Why Devstral Small 24B isn't the Mac premium model
+
+Devstral Small 2505 (Mistral AI's agentic-tuned 24 B Mistral) was the
+next candidate. It's already on disk (~14 GB) and shares the Mistral
+architecture, which means GGUFs with `general.architecture = "llama"`
+should route through `candle_transformers::models::quantized_llama`.
+
+**Two cumulative blockers ruled it out as default:**
+
+1. **Candle's `quantized_llama` hardcodes head_dim wrong.** At
+   `quantized_llama.rs:458`, candle derives
+   `head_dim = embedding_length / head_count` and ignores the
+   `llama.attention.key_length` metadata field. Devstral's GGUF
+   declares `embedding_length=5120`, `head_count=32`,
+   `key_length=128` — i.e. non-canonical 128 ≠ 5120/32 = 160. The
+   forward pass fails with a reshape mismatch
+   (`[1, N, 4096]` vs `[1, N, 32, 160]`).
+
+2. **The mistralrs alternative needs Xcode on macOS.** mistralrs
+   0.8.1 handles Devstral's head_dim correctly (Stage 1 spike loaded
+   it cleanly in 26 s) and would have been the cross-platform Rust
+   answer. But its `metal` feature transitively pulls in
+   `mistralrs-paged-attn`, whose `build.rs` invokes `xcrun metal` to
+   compile Metal shader sources. The metal shader compiler ships
+   ONLY with full Xcode.app, not with Xcode Command Line Tools.
+   In environments where corporate policy forbids installing full
+   Xcode, the mistralrs Metal path cannot be built. The mistralrs
+   feature flag is kept in `Cargo.toml` as opt-in for Linux CUDA
+   users and macOS users who do have Xcode; it's not enabled by
+   default and not part of the daily driver.
+
+The candle `Mistral` GGUF path still ships and works for **canonical
+Llama-arch GGUFs** (Mistral 7B v0.3, Llama 3.1 8B Instruct,
+CodeLlama 13B Instruct). The Devstral / Mistral Small 24B variants
+specifically need either an upstream candle patch reading
+`key_length`, a vendored Mistral-aware GGUF loader, or external
+serving via `llama-server` (Homebrew already ships this binary with
+working Metal MoE and non-canonical head_dim support — operators on
+Mac can use `milliways /switch-local-server llama-server` when they
+want Devstral).
+
+#### Net recommendation by deployment
+
+| Hardware | Daily driver | Premium / specialty |
+|---|---|---|
+| macOS 24 GB unified | Qwen3 14B Q4_K_M (candle, validated) | `llama-server` subprocess for Devstral / Qwen3-Coder MoE (Homebrew install, Metal works without Xcode) |
+| Linux NVIDIA 6 GB | Qwen3 4B Q4_K_M (candle + gpu-cuda) | n/a |
+| Linux NVIDIA 12 GB | Qwen3 8B Q4_K_M (candle + gpu-cuda) | n/a |
+| Linux NVIDIA 16+ GB | Qwen3 14B Q4_K_M (candle + gpu-cuda) | Qwen3-Coder-30B-A3B (candle + gpu-cuda, MoE works on CUDA) or mistralrs Devstral 24B (with `mistral-rs` + `gpu-cuda` features) |
+| Linux AMD 16 GB (ROCm) | Qwen3 14B Q4_K_M (candle + gpu-cuda via HIP shim) | Same as NVIDIA 16+ GB, pending ROCm validation |
+
+The mistralrs feature flag and Cargo dep stay in the workspace
+specifically so the Linux deployment story includes
+"premium-quality MoE / non-canonical Mistrals" without forcing users
+back onto Python. macOS users with company-policy constraints get
+the same value via `llama-server` (already installed, Metal works).
+
 ### GPU acceleration
 
 The default build is CPU-only. To enable GPU inference, opt in via one of the
