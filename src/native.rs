@@ -547,6 +547,43 @@ pub fn format_native_chat_prompt(
     messages: &[NativeChatMessage],
 ) -> String {
     match family {
+        // Mistral family (Devstral, Mistral Small, etc.) — classic
+        // `<s>[INST] ... [/INST]` template. Devstral and other agentic-tuned
+        // Mistral fine-tunes also accept this format; their own elaborate
+        // chat_templates (in the GGUF metadata) are a strict superset.
+        CandleModelFamily::Mistral => {
+            let mut out = String::from("<s>");
+            for msg in messages {
+                let content = message_content_text(msg);
+                let role = msg.role.as_str();
+                match role {
+                    "user" => {
+                        out.push_str("[INST] ");
+                        out.push_str(&content);
+                        out.push_str(" [/INST]");
+                    }
+                    "assistant" => {
+                        out.push(' ');
+                        out.push_str(&content);
+                        out.push_str("</s>");
+                    }
+                    "system" => {
+                        // System prompts in Mistral land are normally folded
+                        // into the first user turn — but a leading
+                        // [INST] block alone is still parseable.
+                        out.push_str("[INST] ");
+                        out.push_str(&content);
+                        out.push_str(" [/INST]");
+                    }
+                    _ => {
+                        out.push_str("[INST] ");
+                        out.push_str(&content);
+                        out.push_str(" [/INST]");
+                    }
+                }
+            }
+            out
+        }
         // Qwen3 (dense + MoE) — native ChatML format <|im_start|>role\n...<|im_end|>
         CandleModelFamily::Qwen3 | CandleModelFamily::Qwen3Moe => {
             let mut out = String::new();
@@ -1167,7 +1204,13 @@ impl CandleModelFamily {
         match self {
             Self::Qwen3 | Self::Qwen3Moe => "qwen3-native",
             Self::Gemma4 => "gemma4-native",
-            Self::DeepSeek | Self::Kimi | Self::Mistral | Self::MiniMax => "none",
+            // Devstral and other Mistral instruct-tuned variants emit
+            // tool calls inside `[INST]...[/INST]` turns; they don't share
+            // a stable cross-vendor tool-call protocol yet. Operators
+            // pointing at a Mistral GGUF still get `mistral-instruct`
+            // semantics — distinct from the qwen3 / gemma4 protocols.
+            Self::Mistral => "mistral-instruct",
+            Self::DeepSeek | Self::Kimi | Self::MiniMax => "none",
         }
     }
 
@@ -1355,7 +1398,12 @@ fn supported_candle_formats_for_family(family: CandleModelFamily) -> Vec<NativeM
         // Qwen3 MoE is currently only supported via GGUF — candle 0.10.2 does not
         // ship a safetensors path for the MoE variant.
         CandleModelFamily::Qwen3Moe => vec![NativeModelFormat::Gguf],
-        CandleModelFamily::DeepSeek | CandleModelFamily::Mistral => {
+        // Mistral now supports both: safetensors via candle's mistral::Model
+        // and GGUF via the llama-arch quantized_llama path (Devstral, etc.).
+        CandleModelFamily::Mistral => {
+            vec![NativeModelFormat::Gguf, NativeModelFormat::Safetensors]
+        }
+        CandleModelFamily::DeepSeek => {
             vec![NativeModelFormat::Safetensors]
         }
         CandleModelFamily::Kimi | CandleModelFamily::MiniMax => Vec::new(),
@@ -1796,6 +1844,11 @@ enum RealCandleModel {
     Gemma3(candle_transformers::models::gemma3::Model),
     Gemma4Gguf(crate::gemma4_gguf::ModelWeights),
     Mistral(candle_transformers::models::mistral::Model),
+    // Mistral-family models distributed as GGUFs tagged
+    // `general.architecture = "llama"` (Devstral, Mistral Small, etc).
+    // candle's quantized_llama covers the runtime; the Mistral family
+    // name here is operator-facing.
+    MistralGguf(candle_transformers::models::quantized_llama::ModelWeights),
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -1809,6 +1862,7 @@ impl std::fmt::Debug for RealCandleModel {
             Self::Gemma3(_) => "Gemma3",
             Self::Gemma4Gguf(_) => "Gemma4Gguf",
             Self::Mistral(_) => "Mistral",
+            Self::MistralGguf(_) => "MistralGguf",
         };
         f.debug_tuple("RealCandleModel").field(&variant).finish()
     }
@@ -1981,9 +2035,34 @@ fn load_real_candle_decoder(
                         .with_context(|| "failed to construct quantized Gemma4 model")?,
                     )
                 }
-                CandleModelFamily::Mistral => bail!(
-                    "candle-native-mistral GGUF decoding is not wired in Candle 0.10.2; use safetensors with tokenizer.json and config.json"
-                ),
+                CandleModelFamily::Mistral => {
+                    // Mistral-family GGUFs (Devstral, Mistral Small, etc.) tag
+                    // `general.architecture = "llama"` because they share the
+                    // Llama transformer shape. candle's `quantized_llama` is
+                    // the universal loader for that arch — no remap needed.
+                    let arch = content
+                        .metadata
+                        .get("general.architecture")
+                        .and_then(|v| v.to_string().ok().cloned())
+                        .unwrap_or_default();
+                    if arch != "llama" {
+                        bail!(
+                            "Mistral GGUF expected general.architecture = \"llama\", got {arch:?}"
+                        );
+                    }
+                    tracing::info!(
+                        arch = %arch,
+                        "loading Mistral-family GGUF via candle quantized_llama"
+                    );
+                    RealCandleModel::MistralGguf(
+                        candle_transformers::models::quantized_llama::ModelWeights::from_gguf(
+                            content, &mut file, &device,
+                        )
+                        .with_context(|| {
+                            "failed to construct quantized Llama-arch Candle model for Mistral family"
+                        })?,
+                    )
+                }
                 CandleModelFamily::DeepSeek => bail!(
                     "candle-native-deepseek GGUF decoding is not wired because Candle 0.10.2 does not expose quantized DeepSeek2 model weights; use safetensors with tokenizer.json and config.json"
                 ),
@@ -2163,6 +2242,15 @@ impl RealCandleModel {
             Self::Gemma3(model) => model.clear_kv_cache(),
             Self::Gemma4Gguf(model) => model.clear_kv_cache(),
             Self::Mistral(model) => model.clear_kv_cache(),
+            // candle 0.10.2's quantized_llama also does not expose a public
+            // clear_kv_cache(). Same pattern as Qwen3 MoE — independent
+            // sessions must reload the model.
+            Self::MistralGguf(_) => {
+                tracing::warn!(
+                    "Mistral GGUF clear_kv_cache is a no-op in candle 0.10.2 — \
+                     independent sessions must reload the model"
+                );
+            }
         }
     }
 
@@ -2179,6 +2267,7 @@ impl RealCandleModel {
             Self::Gemma3(model) => model.forward(&input, offset),
             Self::Gemma4Gguf(model) => model.forward(&input, offset),
             Self::Mistral(model) => model.forward(&input, offset),
+            Self::MistralGguf(model) => model.forward(&input, offset),
         }
         .with_context(|| "native Candle model forward pass failed")?;
         let logits_shape = logits.dims().to_vec();
@@ -3886,6 +3975,162 @@ mod tests {
         eprintln!("  Device:               {device:?}");
         eprintln!("  Forward program ran:  /tmp/rs_llmctl_count_forward.py");
         eprintln!("  Reverse program ran:  /tmp/rs_llmctl_count_reverse.py");
+    }
+
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+    #[test]
+    #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS
+    #[ignore = "Mac premium: Devstral / Mistral-family GGUF via candle quantized_llama (slow, requires Devstral GGUF on disk)"]
+    fn mistral_runtime_python_counting_program() {
+        // Devstral Small 24B (Mistral architecture, agentic-tuned by Mistral AI)
+        // as the Mac premium path — same dual-direction Python counting test
+        // pattern as Qwen3, with the Mistral [INST]/[/INST] chat format.
+        //
+        // Devstral GGUF tags `general.architecture = "llama"`, so the runtime
+        // routes it through candle's `quantized_llama::ModelWeights::from_gguf`.
+        // KV cache reset on quantized_llama is a no-op in candle 0.10.2 (same
+        // limitation as Qwen3 MoE) — the test reloads the model between prompts.
+        let path_str = std::env::var("MISTRAL_GGUF_PATH").unwrap_or_else(|_| {
+            "/Users/w199447/.local/share/milliways/models/Devstral-Small-2505-GGUF-Q4_K_M.gguf"
+                .into()
+        });
+        let gguf_path = std::path::PathBuf::from(&path_str);
+        if !gguf_path.exists() {
+            eprintln!("skipping mistral test, no GGUF at {path_str}");
+            return;
+        }
+        eprintln!("Using model: {}", gguf_path.display());
+
+        let device = crate::gemma4_gguf::best_device();
+        eprintln!("Device: {device:?}");
+
+        // Read tokenizer once (no cache state).
+        let mut tokfile = std::fs::File::open(&gguf_path).unwrap();
+        let tokcontent = candle_core::quantized::gguf_file::Content::read(&mut tokfile).unwrap();
+        let tokenizer = <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(&tokcontent).unwrap();
+        let eos_id = tokenizer
+            .token_to_id("</s>")
+            .or_else(|| tokenizer.token_to_id("<|im_end|>"))
+            .unwrap_or(2);
+        drop(tokcontent);
+        drop(tokfile);
+
+        // Helper: load FRESH model, run one prompt, return decoded output + timings.
+        let run = |user_prompt: &str,
+                   max_tokens: usize|
+         -> (
+            String,
+            std::time::Duration,
+            std::time::Duration,
+            std::time::Duration,
+        ) {
+            let load_start = std::time::Instant::now();
+            let mut file = std::fs::File::open(&gguf_path).unwrap();
+            let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
+            let mut model = candle_transformers::models::quantized_llama::ModelWeights::from_gguf(
+                content, &mut file, &device,
+            )
+            .unwrap();
+            let load_elapsed = load_start.elapsed();
+
+            // Mistral instruct format. Devstral accepts this baseline.
+            let prompt = format!("<s>[INST] {user_prompt} [/INST]");
+            let encoding = tokenizer.encode(prompt.as_str(), false).unwrap();
+            let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+            let prefill_start = std::time::Instant::now();
+            let input = candle_core::Tensor::new(input_ids.as_slice(), &device)
+                .and_then(|t| t.reshape((1, input_ids.len())))
+                .unwrap();
+            let logits = model.forward(&input, 0).unwrap();
+            let prefill_elapsed = prefill_start.elapsed();
+
+            let next_token = logits
+                .squeeze(0)
+                .and_then(|t| t.argmax(candle_core::D::Minus1))
+                .and_then(|t| t.to_scalar::<u32>())
+                .unwrap();
+
+            let gen_start = std::time::Instant::now();
+            let mut all_tokens = vec![next_token];
+            let mut cur_pos = input_ids.len();
+            let mut prev_token = next_token;
+            for _ in 0..max_tokens {
+                if prev_token == eos_id {
+                    break;
+                }
+                let next_input = candle_core::Tensor::new(&[prev_token], &device)
+                    .and_then(|t| t.reshape((1, 1)))
+                    .unwrap();
+                let logits = model.forward(&next_input, cur_pos).unwrap();
+                let tok = logits
+                    .squeeze(0)
+                    .and_then(|t| t.argmax(candle_core::D::Minus1))
+                    .and_then(|t| t.to_scalar::<u32>())
+                    .unwrap();
+                all_tokens.push(tok);
+                prev_token = tok;
+                cur_pos += 1;
+            }
+            let gen_elapsed = gen_start.elapsed();
+            let decoded = tokenizer.decode(&all_tokens, false).unwrap_or_default();
+            (decoded, load_elapsed, prefill_elapsed, gen_elapsed)
+        };
+
+        eprintln!("\n--- PROMPT 1: count from 1 to 10 ---");
+        let (forward_out, load1, p1_prefill, p1_gen) = run(
+            "Write a Python program that counts from 1 to 10. Output only the code, in a single fenced ```python``` block.",
+            400,
+        );
+        eprintln!("Load: {load1:?}   Prefill: {p1_prefill:?}   Generation: {p1_gen:?}");
+        eprintln!("=== FORWARD OUTPUT ===\n{forward_out}\n=== END ===");
+
+        assert!(
+            forward_out.contains("print"),
+            "forward output missing print(): {forward_out:?}"
+        );
+        let forward_has_iter = forward_out.contains("range(1, 11)")
+            || forward_out.contains("range(1,11)")
+            || forward_out.contains("range(10)")
+            || forward_out.contains("range(11)")
+            || (forward_out.contains("range(") && forward_out.contains("11"))
+            || forward_out.contains("for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
+        assert!(
+            forward_has_iter,
+            "forward output missing forward-iteration construct: {forward_out:?}"
+        );
+
+        eprintln!("\n--- PROMPT 2: count from 10 down to 1 ---");
+        let (reverse_out, load2, p2_prefill, p2_gen) = run(
+            "Write a Python program that counts from 10 down to 1. Output only the code, in a single fenced ```python``` block.",
+            400,
+        );
+        eprintln!("Load: {load2:?}   Prefill: {p2_prefill:?}   Generation: {p2_gen:?}");
+        eprintln!("=== REVERSE OUTPUT ===\n{reverse_out}\n=== END ===");
+
+        assert!(
+            reverse_out.contains("print"),
+            "reverse output missing print(): {reverse_out:?}"
+        );
+        let reverse_has_iter = reverse_out.contains("range(10, 0, -1)")
+            || reverse_out.contains("range(10,0,-1)")
+            || reverse_out.contains("range(10, -1, -1)")
+            || reverse_out.contains("reversed(")
+            || reverse_out.contains("for i in [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]")
+            || (reverse_out.contains("range(") && reverse_out.contains("-1"));
+        assert!(
+            reverse_has_iter,
+            "reverse output missing reverse-iteration construct: {reverse_out:?}"
+        );
+
+        eprintln!("\n=== Mistral / Devstral TIMING SUMMARY ===");
+        eprintln!("  Load 1:               {load1:?}");
+        eprintln!("  Forward prefill:      {p1_prefill:?}");
+        eprintln!("  Forward generation:   {p1_gen:?}");
+        eprintln!("  Load 2 (after drop):  {load2:?}");
+        eprintln!("  Reverse prefill:      {p2_prefill:?}");
+        eprintln!("  Reverse generation:   {p2_gen:?}");
+        eprintln!("  Device:               {device:?}");
     }
 
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
