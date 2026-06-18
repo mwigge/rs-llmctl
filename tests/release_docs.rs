@@ -38,10 +38,15 @@ fn ci_workflow_enforces_core_rust_gates() {
     let workflow = read(".github/workflows/ci.yml");
     let smoke = read("tests/smoke/smoke_native_release.sh");
 
+    // Note: `--all-features` was previously the catch-all clippy/test
+    // invocation but had to be split per-feature in 1.6.4 because the new
+    // `gpu-metal` feature pulls in Apple-only `objc2`. The gates below
+    // assert the runtime-relevant feature set (`native-candle,native-tokenizers`)
+    // is still under -D warnings on the Linux runner.
     for gate in [
         "cargo fmt --all -- --check",
-        "cargo clippy --all-targets --all-features -- -D warnings",
-        "cargo test --all-targets --all-features",
+        "cargo clippy --all-targets --features native-candle,native-tokenizers -- -D warnings",
+        "cargo test --all-targets --features native-candle,native-tokenizers",
         "cargo build --release --bin llmctl",
         "tags:",
         "'v*'",
@@ -750,7 +755,11 @@ fn release_checksum_artifact_generation_is_pinned() {
         "packaging/generate-checksums.sh",
         "SHA256SUMS",
         "actions/upload-artifact@v4",
-        "release-artifacts",
+        // Per-platform artifacts (renamed from the single `release-artifacts`
+        // bundle when the macOS aarch64 build job was added in 23dc035) — the
+        // publish job downloads each by name and concatenates into dist/.
+        "release-linux",
+        "release-macos",
         "dist/rs-llmctl-*.tar.gz",
         "dist/SHA256SUMS",
         "packaging/generate-sbom.sh dist",
