@@ -29,7 +29,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # `--all-features` is intentionally avoided on the Linux runner because
+        # `gpu-metal` activates candle/metal → `objc2`, which is Apple-only.
+        # Native runtime features (without GPU acceleration) cover the lint
+        # surface that the production binary ships with on Linux.
+        run: cargo clippy --all-targets --features native-candle,native-tokenizers -- -D warnings
 
       - name: Check feature matrix
         run: |
@@ -37,7 +41,7 @@ jobs:
           cargo check --workspace --all-targets --no-default-features --features native-tokenizers
           cargo check --workspace --all-targets --no-default-features --features native-candle
           cargo check --workspace --all-targets --no-default-features --features native
-          cargo check --workspace --all-targets --all-features
+          cargo check --workspace --all-targets --features native-candle,native-tokenizers
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -46,7 +50,9 @@ jobs:
         run: cargo audit
 
       - name: Run tests
-        run: cargo test --all-targets --all-features
+        # Same reasoning as clippy: drop `--all-features` so the Apple-only
+        # `gpu-metal` path is not unified into the Linux test build.
+        run: cargo test --all-targets --features native-candle,native-tokenizers
 
   build-linux:
     name: Build linux/x86_64
@@ -175,7 +181,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build native release binary
-        run: cargo build --release --bin llmctl --all-features
+        # Same as the Linux clippy/test jobs: `--all-features` activates the
+        # Apple-only `gpu-metal` feature which fails to link on Linux.
+        run: cargo build --release --bin llmctl --features native-candle,native-tokenizers
 
       - name: Package native release artifact
         run: packaging/generate-checksums.sh
