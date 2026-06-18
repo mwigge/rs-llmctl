@@ -3434,6 +3434,7 @@ mod tests {
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     #[ignore = "requires GGUF file on disk — slow (~30s)"]
+    #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS
     fn gemma4_gguf_forward_pass_produces_coherent_tokens() {
         let gguf_path = std::path::Path::new(
             "/Users/w199447/.local/share/milliways/models/gemma-4-E4B-it-Q4_K_M.gguf",
@@ -3579,6 +3580,7 @@ mod tests {
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     #[ignore = "requires GGUF file on disk — slow (~3 min)"]
+    #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS
     fn gemma4_gguf_generates_python_counting_program() {
         // Prefer E2B (smaller, ~5 GB working set) — falls back to E4B if absent.
         // Override via GEMMA4_GGUF_PATH env var.
@@ -3672,6 +3674,7 @@ mod tests {
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     #[ignore = "requires GGUF file on disk — slow (~3 min on Metal)"]
+    #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS
     fn qwen3_runtime_python_counting_program() {
         // M1 acceptance test for the add-tool-capable-tiered-runtime change.
         // Verifies the model handles both forward AND reverse counting,
@@ -3888,6 +3891,7 @@ mod tests {
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     #[ignore = "Final E2E: model reads chaostooling-otel patterns + adds tracing to its own counter program (slow, requires Qwen3 14B GGUF on disk)"]
+    #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS
     fn qwen3_runtime_adds_chaosotel_tracing_to_counter_program() {
         // This is the "no help from outside apart from the prompt" test:
         // we feed the Qwen3 14B model
@@ -4119,6 +4123,7 @@ with instrument_db_span(
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     #[ignore = "requires Qwen3-Coder MoE GGUF on disk — slow (load ~30-60 s + 2× gen)"]
+    #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS
     fn qwen3_moe_coder_python_counting_program() {
         // M2 acceptance test: Qwen3-Coder-30B-A3B (MoE) loaded via candle's
         // quantized_qwen3_moe path, exercises both forward and reverse counting.
@@ -4363,7 +4368,7 @@ with instrument_db_span(
         // Read layer_output_scale values for first 5 layers
         let device = candle_core::Device::Cpu;
         let mut file2 = std::fs::File::open(gguf_path).unwrap();
-        let mut content2 = candle_core::quantized::gguf_file::Content::read(&mut file2).unwrap();
+        let content2 = candle_core::quantized::gguf_file::Content::read(&mut file2).unwrap();
         for layer_idx in 0..5 {
             let key = format!("blk.{layer_idx}.layer_output_scale.weight");
             let val = content2
@@ -4956,6 +4961,7 @@ with instrument_db_span(
             factory.registered_families(),
             vec![
                 CandleModelFamily::Qwen3,
+                CandleModelFamily::Qwen3Moe,
                 CandleModelFamily::Gemma4,
                 CandleModelFamily::DeepSeek,
                 CandleModelFamily::Kimi,
@@ -4970,9 +4976,18 @@ with instrument_db_span(
                 .expect("family is registered");
             assert_eq!(metadata.model_family, *family);
             assert_eq!(metadata.engine, family.engine_name());
+            // Qwen3 MoE is GGUF-only in candle 0.10.2 (no safetensors path),
+            // and Kimi / MiniMax are not yet wired at all.
             if matches!(family, CandleModelFamily::Kimi | CandleModelFamily::MiniMax) {
                 assert!(metadata.supported_formats.is_empty());
                 assert!(metadata.tokenizer_contracts.is_empty());
+            } else if matches!(family, CandleModelFamily::Qwen3Moe) {
+                assert!(metadata
+                    .supported_formats
+                    .contains(&NativeModelFormat::Gguf));
+                assert!(!metadata
+                    .supported_formats
+                    .contains(&NativeModelFormat::Safetensors));
             } else {
                 assert!(metadata
                     .supported_formats
@@ -4990,7 +5005,12 @@ with instrument_db_span(
             }
             assert_eq!(
                 metadata.tokenizer_requirement(NativeModelFormat::Safetensors),
-                if matches!(family, CandleModelFamily::Kimi | CandleModelFamily::MiniMax) {
+                if matches!(
+                    family,
+                    CandleModelFamily::Kimi
+                        | CandleModelFamily::MiniMax
+                        | CandleModelFamily::Qwen3Moe
+                ) {
                     CandleTokenizerRequirement::UnsupportedFormat
                 } else {
                     CandleTokenizerRequirement::TokenizerJson

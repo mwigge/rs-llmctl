@@ -825,16 +825,13 @@ pub fn process_peak_resident_mb() -> Option<f64> {
             return None;
         }
         let maxrss = usage.ru_maxrss as f64;
+        // Linux reports `ru_maxrss` in KiB; macOS and most BSDs report it in
+        // bytes. Both cases normalise to megabytes here.
         #[cfg(target_os = "linux")]
-        {
-            // Linux reports KiB.
-            return Some(maxrss / 1024.0);
-        }
+        let mb = maxrss / 1024.0;
         #[cfg(not(target_os = "linux"))]
-        {
-            // macOS and most BSDs report bytes.
-            return Some(maxrss / (1024.0 * 1024.0));
-        }
+        let mb = maxrss / (1024.0 * 1024.0);
+        Some(mb)
     }
     #[cfg(not(unix))]
     {
@@ -1317,27 +1314,29 @@ mod tests {
         // Build a minimal Config with a Langfuse host that resolves to a blocked address.
         // We use a host that starts with the metadata IP so the derived OTLP endpoint
         // will be rejected by validate_http_endpoint.
-        let mut cfg = Config::default();
-        cfg.observability = ObservabilityConfig {
-            otlp_endpoint: None,
-            service_name: None,
-            service_version: None,
-            environment: None,
-            traces_enabled: true,
-            metrics_enabled: true,
-            logs_enabled: true,
-            resource_attributes: BTreeMap::new(),
-            exporter: ObservabilityExporterConfig {
-                endpoint: None,
-                ..ObservabilityExporterConfig::default()
+        let cfg = Config {
+            observability: ObservabilityConfig {
+                otlp_endpoint: None,
+                service_name: None,
+                service_version: None,
+                environment: None,
+                traces_enabled: true,
+                metrics_enabled: true,
+                logs_enabled: true,
+                resource_attributes: BTreeMap::new(),
+                exporter: ObservabilityExporterConfig {
+                    endpoint: None,
+                    ..ObservabilityExporterConfig::default()
+                },
+                langfuse: LangfuseExporterConfig {
+                    enabled: true,
+                    host: Some("http://169.254.169.254".to_string()),
+                    public_key: Some("pk-lf-test".to_string()),
+                    secret_key: Some("sk-lf-test".to_string()),
+                },
+                webhook: crate::config::WebhookExporterConfig::default(),
             },
-            langfuse: LangfuseExporterConfig {
-                enabled: true,
-                host: Some("http://169.254.169.254".to_string()),
-                public_key: Some("pk-lf-test".to_string()),
-                secret_key: Some("sk-lf-test".to_string()),
-            },
-            webhook: crate::config::WebhookExporterConfig::default(),
+            ..Default::default()
         };
 
         let result = ObservabilityPlan::from_config(&cfg);
