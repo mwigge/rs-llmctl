@@ -3977,6 +3977,110 @@ mod tests {
         eprintln!("  Reverse program ran:  /tmp/rs_llmctl_count_reverse.py");
     }
 
+    /// Stage-1 spike for the mistral.rs (mistralrs) integration track. Goal:
+    /// confirm that mistralrs 0.8.1 can load the Devstral 24B GGUF (which
+    /// candle 0.10.2's quantized_llama can NOT, due to its hardcoded
+    /// `head_dim = embedding_length / head_count`) and emit at least one
+    /// coherent forward-pass result on Metal. This is the "go/no-go" signal
+    /// for the full backend integration in Stage 2.
+    #[cfg(all(
+        feature = "native-candle",
+        feature = "native-tokenizers",
+        feature = "mistral-rs"
+    ))]
+    #[test]
+    #[ignore = "Stage 1 spike — requires Devstral GGUF on disk + the mistral-rs feature compiled in"]
+    fn mistralrs_devstral_spike() {
+        // We use the high-level `GgufModelBuilder`. The `model_id` argument
+        // accepts a local directory path (HuggingFace convention — the
+        // underlying loader resolves it relative to either an HF repo cache
+        // or the absolute path we pass in here).
+        let model_dir = std::path::PathBuf::from("/Users/w199447/.local/share/milliways/models");
+        let model_file = "Devstral-Small-2505-GGUF-Q4_K_M.gguf";
+        let full_path = model_dir.join(model_file);
+        if !full_path.exists() {
+            eprintln!(
+                "skipping mistralrs spike, no GGUF at {}",
+                full_path.display()
+            );
+            return;
+        }
+        eprintln!(
+            "Stage 1 spike: loading {} via mistralrs",
+            full_path.display()
+        );
+
+        // mistralrs is async-tokio. Build a single-thread runtime for the spike
+        // — keeps it independent from any global runtime in production paths.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let result = rt.block_on(async {
+            use mistralrs::{GgufModelBuilder, TextMessageRole, TextMessages};
+
+            // Bind Metal explicitly. Without `.with_device()` mistralrs's
+            // auto-mapper picked CPU (24 GB headroom) and the forward pass
+            // ran painfully slow. The `mistralrs?/metal` feature toggle in
+            // Cargo.toml (gated by our gpu-metal feature) is what makes
+            // `Device::new_metal(0)` resolve to a real GPU device here.
+            #[cfg(feature = "gpu-metal")]
+            let device = candle_core::Device::new_metal(0)
+                .map_err(|e| format!("Metal device init failed: {e}"))?;
+            #[cfg(not(feature = "gpu-metal"))]
+            let device = candle_core::Device::Cpu;
+            eprintln!("Stage 1 spike: bound device {device:?}");
+
+            let load_start = std::time::Instant::now();
+            let model = GgufModelBuilder::new(
+                model_dir.to_string_lossy().to_string(),
+                vec![model_file.to_string()],
+            )
+            .with_device(device)
+            .with_logging()
+            .build()
+            .await
+            .map_err(|e| format!("mistralrs build failed: {e}"))?;
+            let load_elapsed = load_start.elapsed();
+            eprintln!("Stage 1 spike: model loaded in {load_elapsed:?}");
+
+            let messages = TextMessages::new().add_message(
+                TextMessageRole::User,
+                "Write a Python program that counts from 1 to 10. Output only the code in a single ```python``` block.",
+            );
+
+            let send_start = std::time::Instant::now();
+            let response = model
+                .send_chat_request(messages)
+                .await
+                .map_err(|e| format!("mistralrs chat request failed: {e}"))?;
+            let send_elapsed = send_start.elapsed();
+
+            let content = response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            eprintln!("Stage 1 spike: chat completed in {send_elapsed:?}");
+            eprintln!(
+                "Throughput: prompt {:?} tok/s, completion {:?} tok/s",
+                response.usage.avg_prompt_tok_per_sec, response.usage.avg_compl_tok_per_sec
+            );
+            eprintln!("=== MISTRALRS OUTPUT ===\n{content}\n=== END ===");
+
+            Result::<String, String>::Ok(content)
+        });
+
+        let content = result.expect("Stage 1 spike: forward pass should succeed");
+        assert!(
+            content.contains("print") || content.contains("range"),
+            "Stage 1 spike output missing Python code markers: {content:?}"
+        );
+        eprintln!("=== Stage 1 spike PASSED ===");
+    }
+
     #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
     #[test]
     #[allow(clippy::explicit_counter_loop)] // cur_pos counter is intentional for the LLM-inference loop with early `break` on EOS

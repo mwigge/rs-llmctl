@@ -25,8 +25,25 @@ tokenizers = ["dep:tokenizers"]
 # `gpu-cuda`:  NVIDIA (CUDA) on Linux/Windows; also works with AMD GPUs on
 #              Linux via ROCm/HIP's CUDA shim (requires ROCm install and
 #              HIP_PLATFORM=amd at build time).
-gpu-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-gpu-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+gpu-metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+    # When the mistral-rs backend is also enabled, propagate Metal support
+    # into it. The `?` syntax keeps this a no-op when `mistral-rs` is off.
+    "mistralrs?/metal",
+]
+gpu-cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "mistralrs?/cuda",
+]
+# `mistral-rs`: opt-in second inference backend (the `mistralrs` crate from
+# EricLBuehler/mistral.rs). Used for models that candle 0.10.2 can't run —
+# specifically the non-canonical-head_dim Mistrals (Devstral, Mistral Small)
+# and Metal-MoE workloads. See docs/native-gguf-internals.md.
+mistral-rs = ["dep:mistralrs"]
 
 [dependencies]
 anyhow = "1.0"
@@ -37,6 +54,9 @@ base64 = "0.22"
 candle-core = { version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 candle-transformers = { version = "0.10.2", optional = true }
+# Pinned to the latest published crates.io version. Pulls a tokio-async
+# Pipeline/Loader stack — only resolves when the `mistral-rs` feature is on.
+mistralrs = { version = "0.8.1", optional = true, default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
