@@ -241,6 +241,185 @@ pub trait NativeEngine: Send + Sync {
     }
 }
 
+/// In-process llama.cpp engine backed by the `llama-cpp-2` Rust bindings.
+///
+/// This engine runs model inference directly in-process using the llama.cpp C
+/// library via FFI.  GPU offload is configured through `gpu_layers`.  When the
+/// `dynamic-backends` feature of `llama-cpp-2` is enabled (as it is here) the
+/// appropriate GGML backend (`ROCm`, `Vulkan`, CPU) is selected at runtime by
+/// loading `.so` plugins from the backends directory rather than being baked
+/// in at compile time.
+#[cfg(feature = "llama-cpp-native")]
+#[derive(Debug, Clone)]
+pub struct LlamaCppNativeEngine {
+    /// Display name returned by `NativeEngine::model_alias`.
+    pub alias: String,
+    /// Absolute path to the GGUF model file.
+    pub model_path: PathBuf,
+    /// Number of model layers to offload to the GPU.  `0` = CPU-only.
+    pub gpu_layers: u32,
+}
+
+#[cfg(feature = "llama-cpp-native")]
+impl LlamaCppNativeEngine {
+    /// Constructs a `LlamaCppNativeEngine` after validating that `model_path` exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `model_path` does not point to an existing file.
+    pub fn load(alias: String, model_path: &Path, gpu_layers: u32) -> Result<Self> {
+        if !model_path.exists() {
+            anyhow::bail!("model path not found: {}", model_path.display());
+        }
+        Ok(Self {
+            alias,
+            model_path: model_path.to_owned(),
+            gpu_layers,
+        })
+    }
+}
+
+#[cfg(feature = "llama-cpp-native")]
+impl NativeEngine for LlamaCppNativeEngine {
+    fn model_alias(&self) -> &str {
+        &self.alias
+    }
+
+    fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        use llama_cpp_2::{
+            context::params::LlamaContextParams,
+            llama_backend::LlamaBackend,
+            llama_batch::LlamaBatch,
+            model::{params::LlamaModelParams, AddBos, LlamaModel},
+            sampling::LlamaSampler,
+        };
+        use std::num::NonZeroU32;
+
+        let model_path = self.model_path.clone();
+        let gpu_layers = self.gpu_layers;
+
+        Box::pin(async move {
+            // The entire decode loop runs in a blocking thread so the Tokio
+            // thread pool is not starved during FFI calls.
+            let response = tokio::task::spawn_blocking(move || -> Result<NativeChatResponse> {
+                // The backend is a process-global singleton; re-init is idempotent.
+                let backend = LlamaBackend::init()
+                    .or_else(|e| {
+                        if e == llama_cpp_2::LlamaCppError::BackendAlreadyInitialized {
+                            // SAFETY: LlamaBackend has no public fields; its only
+                            // purpose is to serve as a proof-of-init token.
+                            Ok(LlamaBackend {})
+                        } else {
+                            Err(e)
+                        }
+                    })
+                    .map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+
+                let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+                let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+                    .map_err(|e| anyhow::anyhow!("llama model load: {e}"))?;
+
+                // Build a plain text prompt from the messages.  The model's
+                // chat template is not applied here — the synchronous path is
+                // for unit testing and simple completions; a proper template
+                // application would require `feature = "common"` from
+                // llama-cpp-2.
+                let mut prompt = request.messages.iter().fold(String::new(), |mut acc, msg| {
+                    let text = message_content_text(msg);
+                    acc.push_str("<|");
+                    acc.push_str(&msg.role);
+                    acc.push_str("|>\n");
+                    acc.push_str(&text);
+                    acc.push('\n');
+                    acc
+                });
+                prompt.push_str("<|assistant|>\n");
+
+                let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(2048));
+                let mut ctx = model
+                    .new_context(&backend, ctx_params)
+                    .map_err(|e| anyhow::anyhow!("llama context init: {e}"))?;
+
+                let tokens = model
+                    .str_to_token(&prompt, AddBos::Always)
+                    .map_err(|e| anyhow::anyhow!("tokenise prompt: {e}"))?;
+
+                let input_token_count = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
+
+                // Prefill: add all prompt tokens to a single batch.
+                let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+                for (i, &token) in tokens.iter().enumerate() {
+                    let last = i == tokens.len() - 1;
+                    batch
+                        .add(token, i32::try_from(i).unwrap_or(i32::MAX), &[0], last)
+                        .map_err(|e| anyhow::anyhow!("batch add: {e}"))?;
+                }
+                ctx.decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("prefill decode: {e}"))?;
+
+                // Greedy sampler — chain_simple wraps it in a performance-
+                // tracking chain automatically.
+                let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+
+                let max_new_tokens =
+                    usize::try_from(request.max_tokens.unwrap_or(512)).unwrap_or(512);
+
+                let mut output = String::new();
+                let mut output_token_count = 0u64;
+                let mut pos = tokens.len();
+                // Stateful UTF-8 decoder required by `token_to_piece` — tokens
+                // may not always map to complete UTF-8 sequences individually.
+                let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+                // Decode loop: one token at a time so OTel hooks can fire per token.
+                loop {
+                    if output_token_count >= u64::try_from(max_new_tokens).unwrap_or(u64::MAX) {
+                        break;
+                    }
+
+                    let token_id = sampler.sample(&ctx, -1);
+
+                    if model.is_eog_token(token_id) {
+                        break;
+                    }
+
+                    sampler.accept(token_id);
+
+                    let piece = model
+                        .token_to_piece(token_id, &mut decoder, false, None)
+                        .map_err(|e| anyhow::anyhow!("token to piece: {e}"))?;
+                    output.push_str(&piece);
+                    output_token_count += 1;
+
+                    let mut next_batch = LlamaBatch::new(1, 1);
+                    next_batch
+                        .add(token_id, i32::try_from(pos).unwrap_or(i32::MAX), &[0], true)
+                        .map_err(|e| anyhow::anyhow!("next batch add: {e}"))?;
+                    ctx.decode(&mut next_batch)
+                        .map_err(|e| anyhow::anyhow!("decode step: {e}"))?;
+                    pos += 1;
+                }
+
+                Ok(NativeChatResponse {
+                    model: request.model.clone(),
+                    content: output,
+                    tool_calls: None,
+                    finish_reason: "stop".to_string(),
+                    usage: NativeTokenUsage::with_mode(
+                        input_token_count,
+                        output_token_count,
+                        TokenAccountingMode::NativeExact,
+                    ),
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
+
+            Ok(response)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSchedulerConfig {
     pub max_concurrent_requests: usize,
@@ -5867,6 +6046,45 @@ mod quantized_gemma4_tests {
             message.contains("not an array"),
             "error message `{message}` should explain it is not an array"
         );
+    }
+
+    #[cfg(feature = "llama-cpp-native")]
+    mod llama_cpp_tests {
+        use super::super::{LlamaCppNativeEngine, NativeEngine};
+
+        #[test]
+        fn load_rejects_missing_path() {
+            let result = LlamaCppNativeEngine::load(
+                "test".to_string(),
+                std::path::Path::new("/nonexistent/model.gguf"),
+                32,
+            );
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("not found") || msg.contains("nonexistent"),
+                "error message `{msg}` should mention missing path"
+            );
+        }
+
+        #[test]
+        fn load_stores_alias_and_gpu_layers() {
+            use tempfile::NamedTempFile;
+            let tmp = NamedTempFile::new().expect("create temp file");
+            let engine = LlamaCppNativeEngine {
+                alias: "my-model".to_string(),
+                model_path: tmp.path().to_owned(),
+                gpu_layers: 32,
+            };
+            assert_eq!(engine.model_alias(), "my-model");
+            assert_eq!(engine.gpu_layers, 32);
+        }
+
+        #[test]
+        fn llama_cpp_native_engine_implements_native_engine_trait() {
+            fn assert_native_engine<T: crate::native::NativeEngine>() {}
+            assert_native_engine::<LlamaCppNativeEngine>();
+        }
     }
 
     #[test]
