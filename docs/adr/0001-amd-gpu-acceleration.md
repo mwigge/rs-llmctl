@@ -1,0 +1,262 @@
+# ADR-0001: AMD GPU (ROCm/Vulkan) Acceleration for Native Inference
+
+## Status
+
+Proposed
+
+## Context
+
+rs-llmctl's `native` feature runs inference in-process via `candle-core`
+0.10.2 (`src/native.rs`). Today this path is **CPU-only and fail-closed**:
+
+- `load_real_candle_decoder`, `RealCandleModel::forward_next`, and the GGUF
+  loaders hardcode `candle_core::Device::Cpu` (`src/native.rs:835, 888, 1795,
+  1967`).
+- `NativeCandleEngineLoader::load` explicitly rejects any
+  `NativeAcceleration` other than `Cpu`/`Auto` with: *"native Candle decoding
+  currently supports CPU execution only"* (`src/native.rs:1593-1599`).
+- `candle-core` 0.10.2 ships exactly three device backends: CPU, CUDA
+  (NVIDIA, via `cudarc`), and Metal (Apple). **There is no ROCm, HIP, or
+  Vulkan backend in this version of candle.**
+
+Despite this, the config/resource-planning layers already model AMD GPUs as
+a first-class target:
+
+- `NativeAcceleration::AmdRocm` enum variant (`src/native.rs:1045`), mapped
+  from `gpu_vendor` via `from_resources` (`src/native.rs:1056-...`).
+- `hardware_matrix()` in `src/runtime.rs:319` lists `("amd-vulkan",
+  NativeAcceleration::AmdRocm, false)` as an optional validation target.
+- `WorkerBackend::AmdVulkan { gpu_layers }` in `src/worker.rs:39,53-55`,
+  selected when `gpu_vendor` is `"amd"`/`"vulkan"`/`"amd-vulkan"`.
+- `src/resources.rs` already does AMD GPU discovery via sysfs
+  (`amd_sysfs_gpus`, vendor ID `0x1002`) and `rocm-smi --showmeminfo vram`
+  (`src/resources.rs:267-282`), populating `GpuBudget` with AMD VRAM
+  figures.
+
+So the **resource-planning and config layers anticipate AMD GPU execution**,
+but the **execution layer (candle-native) cannot deliver it** — any request
+for AMD acceleration fails closed today. On the current dev box, ROCm is not
+installed (`/opt/rocm` absent, no `rocm-*` packages, `rocm-smi` not found);
+`vulkaninfo` is present, suggesting a Vulkan-capable graphics stack but no
+ROCm/HIP compute stack.
+
+The trigger for this ADR: the user has an AMD RX 9060 XT (RDNA4, Navi 44)
+and wants GPU-accelerated local inference, citing llama.cpp's mature
+`-DGGML_HIP=ON` AMD support and AMD's day-0 ROCm support for Gemma models.
+
+## Options Considered
+
+### (a) Wait for candle's ROCm backend upstream
+
+candle's only ROCm work is huggingface/candle#3424: an unmerged, explicitly
+experimental WIP using the `rocm-rs` crate with AOT-compiled HIP kernels.
+It currently supports **BERT only**; the PR description states "many unsafe
+implementations remain, not all features complete." It does not cover
+quantized GGUF model execution, which is what `quantized_gemma4` /
+`quantized_qwen3` and the rest of `src/native.rs` depend on.
+
+| Pros | Cons |
+|---|---|
+| Zero engineering effort | No ETA — PR has been WIP with no merge timeline |
+| No new dependencies, no build complexity | Doesn't cover GGUF/quantized models even if merged today |
+| Stays within the existing single-backend (candle) architecture | Blocks AMD GPU acceleration indefinitely |
+
+### (b) Add a llama.cpp-based runtime backend for AMD (HIP/hipBLAS)
+
+Introduce a second runtime path — alongside, not replacing, candle-native —
+that runs a HIP-enabled llama.cpp (`-DGGML_HIP=ON`) for GGUF inference when
+`gpu_vendor` resolves to AMD. Two integration shapes:
+
+- **FFI bindings** (e.g. `llama-cpp-2` / `llama-cpp-sys-2`): link a
+  HIP-built `libllama`/`libggml` into the `llmctl` binary, add a new
+  `NativeAcceleration`-driven code path that constructs and drives a
+  llama.cpp context instead of a candle one.
+- **Subprocess/server model**: build `llama-server` with HIP support as a
+  separate binary, and have rs-llmctl spawn it as a worker process. Notably,
+  `WorkerSpec`/`CommandSpec` (`src/worker.rs:120-160, 153-...`) already model
+  an external-process worker with a `program: PathBuf` field — the in-process
+  candle path is itself represented as a sentinel
+  `program: "<in-process:candle-native>"`. This means the **worker
+  abstraction already has a seam for "external program" backends**; a
+  llama.cpp subprocess backend would slot into an existing extension point
+  rather than requiring a new abstraction.
+
+| Pros | Cons |
+|---|---|
+| llama.cpp HIP/hipBLAS AMD support is mature and production-used | New dependency (FFI crate or vendored llama.cpp build) |
+| Subprocess shape reuses the existing `WorkerSpec`/`CommandSpec` "external program" seam — smallest architectural delta | Build pipeline must compile/link a HIP-enabled llama.cpp — needs ROCm dev headers + correct GPU target (gfx-series for RDNA4) in CI and on target hosts |
+| Decoupled from candle's version/feature churn | FFI shape requires a new in-process code path parallel to `native.rs` (new `RuntimeBackend` variant, GGUF compat testing, tokenizer/chat-template parity with existing candle loaders) |
+| Gets GGUF + RDNA4 working with a stack AMD actively supports | Two execution paths to maintain, test, and keep behaviourally consistent (sampling, stop sequences, streaming) |
+| `rocm-smi`/sysfs VRAM discovery in `resources.rs` already works for budget planning | Requires ROCm runtime installed on the host (currently absent) |
+
+### (c) Contribute to candle's ROCm PR upstream
+
+Help land huggingface/candle#3424 and extend it to quantized GGUF models.
+Technically the "correct" long-term fix (single backend, no new
+dependencies). **Not recommended for this team** — this is a multi-month
+upstream effort spanning unsafe FFI kernel work in a project we don't
+control, with no guarantee of timeline or eventual GGUF coverage. Mentioned
+for completeness only.
+
+### (d) CPU-only now; reconcile the AMD config plumbing
+
+Keep candle-native CPU-only and either:
+- **Remove** `NativeAcceleration::AmdRocm` / `gpu_vendor="amd-vulkan"` /
+  `WorkerBackend::AmdVulkan` plumbing, since it currently implies AMD GPU
+  support that fail-closes at runtime, or
+- **Keep it as a documented future hook** — annotate it clearly as
+  "resource-planning models this target; no execution backend implements it
+  yet" so it's ready to wire up when (b) lands, without misleading operators
+  who set `gpu_vendor = "amd"` today.
+
+Recommend **keep as documented hook**, not remove — `resources.rs`'s AMD GPU
+discovery (sysfs + `rocm-smi`) is independently useful for reporting/capacity
+planning even before an AMD execution backend exists, and removing the enum
+variant would just have to be re-added for (b).
+
+### (e) Rust-native ROCm GEMM backend via FFI bindings (rocm-rs / oxicuda-rocm)
+
+Build a small custom compute backend for `quantized_gemma4`/`quantized_qwen3`
+that calls ROCm's GEMM/BLAS libraries directly from Rust via existing FFI
+crates, rather than waiting for huggingface/candle#3424 or shelling out to
+llama.cpp. Two Linux/AMD-only crates surfaced during research:
+
+- **rocm-rs** (MIT, v0.5.0, "early development"): raw FFI bindings to
+  rocBLAS, MIOpen, HIP runtime, rocRAND, rocSOLVER, rocSPARSE, rocFFT (safe
+  wrapper currently only for rocFFT). Requires ROCm 6.3+ dev headers/libs at
+  *build* time — the same "needs ROCm dev stack installed" cost as option
+  (b)'s HIP/hipBLAS variant. This is the same kind of FFI approach
+  candle#3424 itself takes (BERT-only, WIP).
+- **oxicuda-rocm** (Apache-2.0): pure-Rust HIP + hipBLAS bindings that
+  `dlopen` the ROCm runtime libraries at *runtime* via `libloading` — no
+  ROCm dev headers needed at build time, only the ROCm runtime installed on
+  the host. Provides hipRTC (runtime kernel compilation), hipBLAS GEMM,
+  device memory management, multi-GPU dispatch.
+
+| Pros | Cons |
+|---|---|
+| Stays pure-Rust/in-process — no second runtime, no subprocess management | Quantized (Q4_K_M etc.) GEMM isn't in rocBLAS/hipBLAS — would need Composable Kernel/rocWMMA or custom HIP kernels for dequant+matmul, which neither crate wraps yet |
+| oxicuda-rocm's dlopen approach avoids ROCm-dev-headers-at-build-time, lowering the CI/build burden vs (b)'s HIP/hipBLAS variant | Both crates are early-stage — significant integration work either way |
+| Reuses `resources.rs`'s existing AMD GPU discovery (sysfs + `rocm-smi`) for device selection | Duplicates the goal of candle#3424 (a ROCm candle backend) as a parallel, rs-llmctl-local effort — maintenance burden if candle lands its own backend later |
+| No new external process/binary to manage (vs (b)) | Neither crate's docs mention RDNA4/gfx12 (Navi 44) validation |
+
+Also considered: the `amdgcn-amd-amdhsa` rustc target (Tier 3, write raw GPU
+kernels in Rust, `no_std`, `-Zbuild-std=core`, loaded via HIP/ROCR).
+Discarded for now — Tier 3 means nightly-only plus manual `core` builds, and
+it would mean hand-writing dequantized-GEMM kernels from scratch, a much
+larger lift than wrapping rocBLAS/hipBLAS/MIOpen via FFI.
+
+Stack note: both rocm-rs and oxicuda-rocm sit on top of **HIP**, which in
+turn sits on **ROCR** (`github.com/ROCm/rocm-systems/.../rocr-runtime`) —
+the C/C++ user-mode HSA runtime that does agent discovery, queue/signal
+management, and memory allocation against the `amdgpu`/ROCk kernel driver.
+ROCR is not itself a separate option here: it's the foundation any HIP-based
+path (b or e) already depends on transitively, and it's part of why
+`rocm-smi`-based discovery in `resources.rs` works today even without a full
+ROCm dev/build stack installed.
+
+### (f) hipfire — Rust-native RDNA-targeted inference engine
+
+`github.com/Kaden-Schutt/hipfire`: a Rust + HIP engine that ships pre-compiled
+kernel blobs and JIT-compiles the rest, eliminating Python from the hot path.
+Key differentiators vs. (b) llama.cpp subprocess and (e) oxicuda-rocm:
+
+- Explicitly targets all RDNA generations including RDNA4 (gfx12xx) as a first-class target
+- CASK-based KV cache eviction handles long-context without OOM (addresses the
+  16 GB VRAM budget problem directly)
+- DFlash speculative decoding for throughput gains
+- 63% Rust codebase — could integrate as a native in-process backend rather
+  than a subprocess (closer to (e) than (b))
+- Requires ROCm 6+ on Linux; NixOS flake available
+
+**Status**: Track as a candidate AMD backend. Could replace both llama-server
+subprocess (b) and the oxicuda-rocm GEMM approach (e) if the project matures
+to full GGUF coverage. Evaluate once GGUF quantized-model support (Q4_K_M) is
+confirmed.
+
+### Other options considered and discarded
+
+- **ONNX Runtime + ROCm execution provider** — would require exporting/
+  converting GGUF models to ONNX, a separate model-prep pipeline, and a third
+  inference runtime. Discarded: more invasive than (b) for less mature AMD
+  GPU coverage of the quantized models we actually run.
+- **Vulkan compute backend** (e.g. via `ggml`'s Vulkan backend in llama.cpp,
+  which doesn't require ROCm at all) — worth noting as a *variant* of (b):
+  llama.cpp also supports `-DGGML_VULKAN=ON`, which works on AMD without
+  installing ROCm (uses the Vulkan stack already present on this machine, per
+  `vulkaninfo`). This could be a **lower-friction first cut of (b)** — same
+  architectural seam (subprocess `llama-server`), but `GGML_VULKAN` avoids
+  the ROCm install/build dependency entirely, at some performance cost vs
+  HIP/hipBLAS. Recommend evaluating Vulkan-backend llama.cpp first if (b) is
+  pursued, before investing in a HIP build pipeline.
+
+## Decision
+
+1. **Now**: **(b) llama-server subprocess — implemented** (`src/worker.rs`).
+   `WorkerLaunchPlan::LlamaServerSubprocess` now wires `WorkerBackend::AmdVulkan`
+   to a managed llama-server child process when `gpu_vendor = "amd"` and a
+   HIP-enabled `llama-server` binary is available (`resources.llama_server_bin`
+   or auto-detected at `~/.local/bin/llama-server`). The subprocess path uses
+   `q8_0` K+V cache quantization, `--jinja`, and the correct `LD_LIBRARY_PATH`
+   for the HIP plugin (`libggml-hip.so` in `~/.local/lib/milliways`).
+   The milliways `install_local_amd_hip.sh` script builds llama-server with
+   `-DGGML_HIP=ON -DAMDGPU_TARGETS=<auto-detected gfx arch>` and installs it.
+
+   The candle-native path (`NativeAcceleration::AmdRocm` fail-close) is kept
+   as-is — **(d)** still applies for the native Candle path.
+
+2. **Track but do not block on (a)**: periodically check
+   huggingface/candle#3424 for GGUF/quantized model support landing. Revisit
+   this ADR if/when it merges and covers `quantized_gemma4`/`quantized_qwen3`
+   equivalents.
+
+3. **If AMD GPU acceleration becomes a priority**, pursue **(b)**, starting
+   with the **Vulkan-backend llama.cpp variant** (subprocess `llama-server`
+   built with `-DGGML_VULKAN=ON`) as the lowest-friction proof of concept,
+   using the existing `WorkerSpec`/`CommandSpec` external-program seam. Only
+   invest in a HIP/hipBLAS build pipeline (which requires installing the
+   ROCm dev stack — currently absent on this machine) if Vulkan performance
+   is insufficient for RDNA4.
+
+4. **(c)** is explicitly out of scope.
+
+5. **Track (e) as a lighter-weight alternative to (a)**: when revisiting
+   candle#3424, also evaluate whether `oxicuda-rocm`'s dlopen-based
+   HIP/hipBLAS bindings (no ROCm dev headers at build time) are mature
+   enough to prototype a minimal in-process GEMM dispatch for
+   `quantized_gemma4`/`quantized_qwen3`, as a smaller-scope alternative to
+   either waiting on candle or building the (b) llama.cpp subprocess path.
+   Quantized-GEMM kernel coverage (Composable Kernel/rocWMMA) remains the
+   open question for this option.
+
+### Effort sizing
+
+| Option | Effort | Outcome |
+|---|---|---|
+| (a) | Zero now | No ETA; blocks AMD GPU indefinitely; doesn't cover GGUF even if merged |
+| (b) — Vulkan llama.cpp subprocess | ~1-2 weeks: vendor/build `llama-server` with `GGML_VULKAN`, new `WorkerBackend`/`CommandSpec` wiring, GGUF/chat-template parity testing, OTel spans for the new worker type | Working AMD GPU inference via existing process-worker seam, no ROCm install required |
+| (b) — HIP/hipBLAS FFI or subprocess | Multi-week: FFI crate evaluation (`llama-cpp-2`) or HIP build pipeline, ROCm dev stack install/CI, new parallel in-process runtime path if FFI, GGUF compat + sampling/streaming parity testing | Best AMD performance, highest build/maintenance cost |
+| (c) | Multi-month, upstream-controlled | Not recommended |
+| (d) | Trivial (doc comments only) | Removes misleading "AMD GPU supported" implication; preserves the planning hook |
+| (e) — Rust FFI (rocm-rs/oxicuda-rocm) GEMM backend | Multi-week, exploratory: prototype hipBLAS GEMM dispatch via oxicuda-rocm (no ROCm dev headers needed), then quantized-kernel coverage (Composable Kernel/rocWMMA) for Q4_K_M-style formats — largest unknown of any option | In-process, pure-Rust AMD GPU path if quantized kernel coverage works out; otherwise reduces to a GEMM-only speedup for non-quantized paths |
+
+## Consequences
+
+- No immediate code change to execution behaviour; `gpu_vendor=amd*` still
+  fail-closes to CPU via the existing error path in `native.rs`.
+- Doc comments added near `NativeAcceleration::AmdRocm`,
+  `WorkerBackend::AmdVulkan`, and the `hardware_matrix()` `"amd-vulkan"`
+  entry, pointing at this ADR.
+- Future AMD GPU work has a documented starting point (Vulkan llama.cpp
+  subprocess via the existing `WorkerSpec` external-program seam) rather
+  than starting from candle.
+- If (b) is later pursued, it introduces a second runtime backend
+  (`RuntimeBackend`-style split) that must be designed separately — this ADR
+  does not size that design, only the decision to pursue it.
+
+## Out of Scope
+
+- Detailed design of the llama.cpp subprocess backend (new ADR if/when (b)
+  is greenlit).
+- Any change to `candle-core` version pinning.
+- ROCm installation/runtime setup on any host.

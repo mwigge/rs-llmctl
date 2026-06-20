@@ -241,6 +241,185 @@ pub trait NativeEngine: Send + Sync {
     }
 }
 
+/// In-process llama.cpp engine backed by the `llama-cpp-2` Rust bindings.
+///
+/// This engine runs model inference directly in-process using the llama.cpp C
+/// library via FFI.  GPU offload is configured through `gpu_layers`.  When the
+/// `dynamic-backends` feature of `llama-cpp-2` is enabled (as it is here) the
+/// appropriate GGML backend (`ROCm`, `Vulkan`, CPU) is selected at runtime by
+/// loading `.so` plugins from the backends directory rather than being baked
+/// in at compile time.
+#[cfg(feature = "llama-cpp-native")]
+#[derive(Debug, Clone)]
+pub struct LlamaCppNativeEngine {
+    /// Display name returned by `NativeEngine::model_alias`.
+    pub alias: String,
+    /// Absolute path to the GGUF model file.
+    pub model_path: PathBuf,
+    /// Number of model layers to offload to the GPU.  `0` = CPU-only.
+    pub gpu_layers: u32,
+}
+
+#[cfg(feature = "llama-cpp-native")]
+impl LlamaCppNativeEngine {
+    /// Constructs a `LlamaCppNativeEngine` after validating that `model_path` exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `model_path` does not point to an existing file.
+    pub fn load(alias: String, model_path: &Path, gpu_layers: u32) -> Result<Self> {
+        if !model_path.exists() {
+            anyhow::bail!("model path not found: {}", model_path.display());
+        }
+        Ok(Self {
+            alias,
+            model_path: model_path.to_owned(),
+            gpu_layers,
+        })
+    }
+}
+
+/// Acquires the llama.cpp process-global backend singleton.
+///
+/// `LlamaBackend::init()` returns `Err(BackendAlreadyInitialized)` on every
+/// call after the first. This helper treats that error as success, so callers
+/// can call it once per request without tracking initialisation state.
+#[cfg(feature = "llama-cpp-native")]
+fn init_llama_backend() -> Result<llama_cpp_2::llama_backend::LlamaBackend> {
+    use llama_cpp_2::{llama_backend::LlamaBackend, LlamaCppError};
+    LlamaBackend::init()
+        .or_else(|e| {
+            if e == LlamaCppError::BackendAlreadyInitialized {
+                Ok(LlamaBackend {})
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("llama backend init: {e}"))
+}
+
+#[cfg(feature = "llama-cpp-native")]
+impl NativeEngine for LlamaCppNativeEngine {
+    fn model_alias(&self) -> &str {
+        &self.alias
+    }
+
+    fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        use llama_cpp_2::{
+            context::params::LlamaContextParams,
+            llama_batch::LlamaBatch,
+            model::{params::LlamaModelParams, AddBos, LlamaModel},
+            sampling::LlamaSampler,
+        };
+        use std::{fmt::Write as _, num::NonZeroU32};
+
+        let model_path = self.model_path.clone();
+        let gpu_layers = self.gpu_layers;
+
+        Box::pin(async move {
+            // The entire decode loop runs in a blocking thread so the Tokio
+            // thread pool is not starved during FFI calls.
+            let response = tokio::task::spawn_blocking(move || -> Result<NativeChatResponse> {
+                let backend = init_llama_backend()?;
+
+                let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+                let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+                    .map_err(|e| anyhow::anyhow!("llama model load: {e}"))?;
+
+                // Plain-text prompt: chat template not applied here (requires
+                // llama-cpp-2 feature = "common" which adds a heavy C++ dep).
+                let mut prompt = request.messages.iter().fold(String::new(), |mut acc, msg| {
+                    write!(acc, "<|{}|>\n{}\n", msg.role, message_content_text(msg))
+                        .expect("String write is infallible");
+                    acc
+                });
+                prompt.push_str("<|assistant|>\n");
+
+                let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(2048));
+                let mut ctx = model
+                    .new_context(&backend, ctx_params)
+                    .map_err(|e| anyhow::anyhow!("llama context init: {e}"))?;
+
+                let tokens = model
+                    .str_to_token(&prompt, AddBos::Always)
+                    .map_err(|e| anyhow::anyhow!("tokenise prompt: {e}"))?;
+
+                let input_token_count = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
+
+                // Prefill: add all prompt tokens to a single batch.
+                let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+                for (i, &token) in tokens.iter().enumerate() {
+                    let last = i == tokens.len() - 1;
+                    batch
+                        .add(token, i32::try_from(i).unwrap_or(i32::MAX), &[0], last)
+                        .map_err(|e| anyhow::anyhow!("batch add: {e}"))?;
+                }
+                ctx.decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("prefill decode: {e}"))?;
+
+                // Greedy sampler — chain_simple wraps it in a performance-
+                // tracking chain automatically.
+                let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+
+                let max_new_tokens =
+                    usize::try_from(request.max_tokens.unwrap_or(512)).unwrap_or(512);
+
+                let mut output = String::new();
+                let mut output_token_count = 0u64;
+                let mut pos = tokens.len();
+                // Stateful UTF-8 decoder required by `token_to_piece` — tokens
+                // may not always map to complete UTF-8 sequences individually.
+                let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+                // Decode loop: one token at a time so OTel hooks can fire per token.
+                loop {
+                    if output_token_count >= u64::try_from(max_new_tokens).unwrap_or(u64::MAX) {
+                        break;
+                    }
+
+                    let token_id = sampler.sample(&ctx, -1);
+
+                    if model.is_eog_token(token_id) {
+                        break;
+                    }
+
+                    sampler.accept(token_id);
+
+                    let piece = model
+                        .token_to_piece(token_id, &mut decoder, false, None)
+                        .map_err(|e| anyhow::anyhow!("token to piece: {e}"))?;
+                    output.push_str(&piece);
+                    output_token_count += 1;
+
+                    let mut next_batch = LlamaBatch::new(1, 1);
+                    next_batch
+                        .add(token_id, i32::try_from(pos).unwrap_or(i32::MAX), &[0], true)
+                        .map_err(|e| anyhow::anyhow!("next batch add: {e}"))?;
+                    ctx.decode(&mut next_batch)
+                        .map_err(|e| anyhow::anyhow!("decode step: {e}"))?;
+                    pos += 1;
+                }
+
+                Ok(NativeChatResponse {
+                    model: request.model.clone(),
+                    content: output,
+                    tool_calls: None,
+                    finish_reason: "stop".to_string(),
+                    usage: NativeTokenUsage::with_mode(
+                        input_token_count,
+                        output_token_count,
+                        TokenAccountingMode::NativeExact,
+                    ),
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
+
+            Ok(response)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSchedulerConfig {
     pub max_concurrent_requests: usize,
@@ -541,6 +720,39 @@ pub fn canonical_native_chat_input(messages: &[NativeChatMessage]) -> String {
     input
 }
 
+/// Renders `messages` using Gemma 4's chat template turn format —
+/// `<|turn>{role}\n{content}<turn|>\n` — as embedded in this model's GGUF
+/// `tokenizer.chat_template`. The older Gemma 2/3
+/// `<start_of_turn>{role}\n{content}<end_of_turn>\n` format is NOT used here:
+/// those tokens are absent from this model's vocabulary and would otherwise
+/// be split into garbage sub-tokens, corrupting the prompt.
+///
+/// `assistant` maps to the `model` role; `system` is passed through
+/// unchanged; all other roles (`user`, `tool`, etc.) map to `user`. The
+/// rendered prompt always ends with the generation cue
+/// `<|turn>model\n<|channel>thought\n<channel|>` (no closing `<turn|>`).
+#[must_use]
+pub fn gemma_chat_input(messages: &[NativeChatMessage]) -> String {
+    let mut input = String::new();
+
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" => "model",
+            "system" => "system",
+            _ => "user",
+        };
+
+        input.push_str("<|turn>");
+        input.push_str(role);
+        input.push('\n');
+        input.push_str(message_content_text(message).trim());
+        input.push_str("<turn|>\n");
+    }
+
+    input.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    input
+}
+
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 pub fn format_native_chat_prompt(
     family: CandleModelFamily,
@@ -603,30 +815,7 @@ pub fn format_native_chat_prompt(
             out.push_str("<|im_start|>assistant\n");
             out
         }
-        CandleModelFamily::Gemma4 => {
-            // Gemma4 E4B GGUF uses <|turn> (ID 105) to open a turn and <turn|> (ID 106)
-            // to close it. The EOS token is also <turn|> (eos_token_id = 106).
-            // BOS (add_bos_token = true) is prepended as the string "<bos>" which the
-            // tokenizer recognizes as ID 2.
-            let mut out = String::from("<bos>");
-            for msg in messages {
-                let role = msg.role.as_str();
-                let content = message_content_text(msg);
-                let turn_role = match role {
-                    "assistant" => "model",
-                    "system" => "system",
-                    _ => "user",
-                };
-                out.push_str("<|turn>");
-                out.push_str(turn_role);
-                out.push('\n');
-                out.push_str(&content);
-                out.push_str("<turn|>\n");
-            }
-            // Open the model's turn without closing it — the model fills the rest
-            out.push_str("<|turn>model\n");
-            out
-        }
+        CandleModelFamily::Gemma4 => gemma_chat_input(messages),
         _ => canonical_native_chat_input(messages),
     }
 }
@@ -1088,6 +1277,10 @@ impl NativeModelFormat {
 pub enum NativeAcceleration {
     Cpu,
     NvidiaCuda,
+    /// Resource-planning hook only — no candle-native execution backend
+    /// implements AMD GPU execution yet (candle 0.10.2 has no ROCm/HIP/
+    /// Vulkan device backend). Selecting this still fails closed to CPU
+    /// via `NativeCandleEngineLoader::load`. See `docs/adr/0001-amd-gpu-acceleration.md`.
     AmdRocm,
     AppleMetal,
     Auto,
@@ -1833,6 +2026,10 @@ struct RealCandleDecoder {
     tokenizer: tokenizers::tokenizer::Tokenizer,
     model: Mutex<RealCandleModel>,
     family: CandleModelFamily,
+    /// BOS token id to prepend to the generation prompt's `input_ids`, if the
+    /// GGUF tokenizer metadata configures `add_bos_token = true`. See
+    /// [`gguf_bos_token_to_prepend`] and [`prepend_bos_if_configured`].
+    bos_token_id: Option<u32>,
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -1932,7 +2129,7 @@ fn load_real_candle_decoder(
     let _load_guard = load_span.enter();
     let load_start = std::time::Instant::now();
 
-    let tokenizer = load_generation_tokenizer(model_path, artifacts)
+    let (tokenizer, bos_token_id) = load_generation_tokenizer(model_path, artifacts)
         .with_context(|| "failed to load native generation tokenizer")?;
     let model = match artifacts.model_format {
         NativeModelFormat::Safetensors => {
@@ -2101,6 +2298,7 @@ fn load_real_candle_decoder(
         tokenizer,
         model: Mutex::new(model),
         family,
+        bos_token_id,
     }))
 }
 
@@ -2119,6 +2317,7 @@ impl RealCandleDecoder {
             .encode(prompt, false)
             .map_err(|err| anyhow::anyhow!("failed to tokenize native prompt: {err}"))?;
         let mut input_ids = encoding.get_ids().to_vec();
+        prepend_bos_if_configured(&mut input_ids, self.bos_token_id);
         if input_ids.is_empty() {
             bail!("native prompt tokenization produced no tokens");
         }
@@ -2223,6 +2422,51 @@ impl RealCandleDecoder {
     }
 }
 
+#[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
+pub fn generate_gemma4_sources(
+    _model_path: &Path,
+    _prompts: &[String],
+    _max_tokens: u32,
+) -> Result<Vec<String>> {
+    bail!("generate_gemma4_sources requires the native-candle and native-tokenizers features")
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+pub fn generate_gemma4_sources(
+    model_path: &Path,
+    prompts: &[String],
+    max_tokens: u32,
+) -> Result<Vec<String>> {
+    let artifacts = CandleArtifactValidation {
+        model_family: CandleModelFamily::Gemma4,
+        model_format: NativeModelFormat::Gguf,
+        layout: CandleArtifactLayout::for_format(NativeModelFormat::Gguf),
+        weight_files: vec![artifact_file_name(model_path)],
+        tokenizer_file: None,
+        config_file: None,
+    };
+    let decoder = load_real_candle_decoder(CandleModelFamily::Gemma4, model_path, &artifacts)?;
+    prompts
+        .iter()
+        .map(|prompt| {
+            decoder.generate(&NativeChatRequest {
+                model: "gemma4-readiness".to_string(),
+                messages: vec![NativeChatMessage {
+                    role: "user".to_string(),
+                    content: Some(Value::String(prompt.clone())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                temperature: Some(0.0),
+                max_tokens: Some(max_tokens),
+                tools: None,
+                tool_choice: None,
+                metadata: BTreeMap::new(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 impl RealCandleModel {
     fn clear_kv_cache(&mut self) {
@@ -2301,38 +2545,1108 @@ fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_str(&raw).with_context(|| "failed to parse model config.json")
 }
 
+/// Builds a [`tokenizers::tokenizer::Tokenizer`] from GGUF metadata, dispatching on
+/// `tokenizer.ggml.model`.
+///
+/// Candle's own [`candle_core::quantized::tokenizer::TokenizerFromGguf`] only
+/// understands `tokenizer.ggml.model == "gpt2"` (byte-level BPE). Some model
+/// families — notably Gemma's `gemma4` GGUF exports — ship a SentencePiece-style
+/// BPE vocabulary (metaspace `▁` convention) tagged `tokenizer.ggml.model ==
+/// "gemma4"`. This function delegates `"gpt2"` to candle unchanged and adds a
+/// native `"gemma4"` code path; any other value is a hard error.
+///
+/// # Errors
+///
+/// Returns an error if `tokenizer.ggml.model` is missing or not a recognized
+/// value, or if the underlying tokenizer construction fails.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn tokenizer_from_gguf_content(
+    content: &candle_core::quantized::gguf_file::Content,
+) -> Result<tokenizers::tokenizer::Tokenizer> {
+    let model_kind = gemma4_gguf_tokenizer::metadata_value(content, "tokenizer.ggml.model")
+        .and_then(|value| value.to_string().map_err(candle_core::Error::wrap))
+        .map_err(|err| anyhow::anyhow!("failed to read GGUF tokenizer model kind: {err}"))?
+        .to_lowercase();
+
+    match model_kind.as_str() {
+        "gpt2" => {
+            <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(content)
+                .map_err(|err| anyhow::anyhow!("failed to build tokenizer from GGUF metadata: {err}"))
+        }
+        "gemma4" => gemma4_gguf_tokenizer::build(content)
+            .map_err(|err| anyhow::anyhow!("failed to build gemma4 tokenizer from GGUF metadata: {err}")),
+        other => bail!("unsupported tokenizer model `{other}` (supported: gpt2, gemma4)"),
+    }
+}
+
+/// Returns the BOS token id that [`prepend_bos_if_configured`] should insert at
+/// the start of `input_ids` for the generation prompt, based on GGUF tokenizer
+/// metadata.
+///
+/// `encode(prompt, false)` bypasses the tokenizer's post-processor, so a
+/// `tokenizer.ggml.add_bos_token = true` configuration (as set by
+/// [`gemma4_gguf_tokenizer::build`]) never actually adds `<bos>` to the
+/// generation prompt. This function reads that intent directly from the GGUF
+/// metadata so callers can apply it manually.
+///
+/// Returns `None` for tokenizer kinds that don't carry this metadata (e.g.
+/// `gpt2`), which keeps this a no-op for the existing Qwen3/other native model
+/// paths.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn gguf_bos_token_to_prepend(content: &candle_core::quantized::gguf_file::Content) -> Option<u32> {
+    let model_kind = gemma4_gguf_tokenizer::metadata_value(content, "tokenizer.ggml.model")
+        .and_then(|value| value.to_string().map_err(candle_core::Error::wrap))
+        .ok()?
+        .to_lowercase();
+
+    match model_kind.as_str() {
+        "gemma4" => gemma4_gguf_tokenizer::bos_token_to_prepend(content),
+        _ => None,
+    }
+}
+
+/// Prepends `bos_token_id` to `input_ids` if it is configured and not already
+/// the first element.
+///
+/// No-op when `bos_token_id` is `None`, or when `input_ids` already starts with
+/// that id (e.g. because the tokenizer's post-processor already added it).
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+fn prepend_bos_if_configured(input_ids: &mut Vec<u32>, bos_token_id: Option<u32>) {
+    let Some(bos_token_id) = bos_token_id else {
+        return;
+    };
+    if input_ids.first() != Some(&bos_token_id) {
+        input_ids.insert(0, bos_token_id);
+    }
+}
+
+/// Native (non-candle) construction of a SentencePiece-metaspace BPE tokenizer
+/// from `gemma4`-flavoured GGUF metadata.
+///
+/// Mirrors the structure of candle's `TokenizerFromGguf::from_gguf` for the
+/// `gpt2` case, but swaps the byte-level pre-tokenizer/decoder/post-processor
+/// for `SentencePiece` [`tokenizers::pre_tokenizers::metaspace::Metaspace`]
+/// equivalents, matching the `▁`-based vocabulary that `gemma4` GGUF exports use.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+mod gemma4_gguf_tokenizer {
+    use candle_core::quantized::gguf_file;
+    use candle_core::{Context as CandleContext, Error as CandleError, Result as CandleResult};
+    use std::collections::HashSet;
+    use tokenizers::models::bpe::{Vocab, BPE};
+    use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
+    use tokenizers::processors::template::TemplateProcessing;
+    use tokenizers::{AddedToken, PostProcessorWrapper, Tokenizer};
+
+    pub(super) fn metadata_value<'a>(
+        ct: &'a gguf_file::Content,
+        key: &str,
+    ) -> CandleResult<&'a gguf_file::Value> {
+        ct.metadata
+            .get(key)
+            .with_context(|| format!("missing GGUF metadata key `{key}`"))
+    }
+
+    fn gguf_value_to_u32(v: &gguf_file::Value) -> CandleResult<u32> {
+        let as_i64 = match v {
+            gguf_file::Value::U8(v) => i64::from(*v),
+            gguf_file::Value::I8(v) => i64::from(*v),
+            gguf_file::Value::U16(v) => i64::from(*v),
+            gguf_file::Value::I16(v) => i64::from(*v),
+            gguf_file::Value::U32(v) => i64::from(*v),
+            gguf_file::Value::I32(v) => i64::from(*v),
+            gguf_file::Value::U64(v) => i64::try_from(*v).map_err(CandleError::wrap)?,
+            gguf_file::Value::I64(v) => *v,
+            other => candle_core::bail!("expected numeric value for token type/id, got {other:?}"),
+        };
+        u32::try_from(as_i64)
+            .map_err(|_| CandleError::msg(format!("token type/id {as_i64} out of range for u32")))
+    }
+
+    fn value_to_string_array(v: &gguf_file::Value, name: &str) -> CandleResult<Vec<String>> {
+        let arr = v
+            .to_vec()
+            .with_context(|| format!("`{name}` is not an array"))?;
+        arr.iter()
+            .map(|v| {
+                v.to_string()
+                    .map(std::string::ToString::to_string)
+                    .with_context(|| format!("`{name}` element is not a string: {v:?}"))
+            })
+            .collect()
+    }
+
+    fn merges_from_value(v: &gguf_file::Value) -> CandleResult<Vec<(String, String)>> {
+        value_to_string_array(v, "tokenizer.ggml.merges")?
+            .into_iter()
+            .map(|m| {
+                m.split_once(' ')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .ok_or_else(|| CandleError::msg(format!("invalid merge entry `{m}`")))
+            })
+            .collect()
+    }
+
+    /// Looks up the unknown-token id, checking the `gemma4`-style
+    /// `tokenizer.ggml.unknown_token_id` key first and falling back to the
+    /// `gpt2`-style `tokenizer.ggml.unk_token_id` key.
+    fn unk_token_id(ct: &gguf_file::Content) -> Option<u32> {
+        metadata_value(ct, "tokenizer.ggml.unknown_token_id")
+            .or_else(|_| metadata_value(ct, "tokenizer.ggml.unk_token_id"))
+            .and_then(gguf_value_to_u32)
+            .ok()
+    }
+
+    /// Returns the BOS token id that callers should prepend to encoded prompts,
+    /// if `tokenizer.ggml.add_bos_token` is `true` and `tokenizer.ggml.bos_token_id`
+    /// is present.
+    ///
+    /// `encode(prompt, false)` (used for the generation prompt) skips the
+    /// tokenizer's post-processor entirely, so the post-processor configured by
+    /// [`build`] never has a chance to add `<bos>`. Callers must prepend it
+    /// manually via [`super::prepend_bos_if_configured`]. This is independent of
+    /// `tokenizer.ggml.add_eos_token`, which would otherwise also append `<eos>`
+    /// if `encode(prompt, true)` were used instead.
+    pub(super) fn bos_token_to_prepend(ct: &gguf_file::Content) -> Option<u32> {
+        let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(false);
+        if !add_bos {
+            return None;
+        }
+        metadata_value(ct, "tokenizer.ggml.bos_token_id")
+            .and_then(gguf_value_to_u32)
+            .ok()
+    }
+
+    /// Builds a BOS/EOS template post-processor, mirroring candle's private
+    /// `template_processor` helper for the `gpt2` GGUF tokenizer path.
+    fn template_processor(
+        tokens: &[String],
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Option<PostProcessorWrapper> {
+        if (!add_bos && !add_eos) || tokens.is_empty() {
+            return None;
+        }
+
+        let bos = bos_id.and_then(|id| tokens.get(id as usize)).cloned();
+        let eos = eos_id.and_then(|id| tokens.get(id as usize)).cloned();
+
+        let mut specials = Vec::new();
+        if add_bos {
+            let bos_id = bos_id?;
+            let bos_tok = bos.clone()?;
+            specials.push((bos_tok, bos_id));
+        }
+        if add_eos {
+            let eos_id = eos_id?;
+            let eos_tok = eos.clone()?;
+            specials.push((eos_tok, eos_id));
+        }
+
+        let mut single = Vec::new();
+        if add_bos {
+            single.push(bos.clone()?);
+        }
+        single.push("$0".to_string());
+        if add_eos {
+            single.push(eos.clone()?);
+        }
+
+        let mut pair = Vec::new();
+        if add_bos {
+            pair.push(format!("{}:0", bos.clone()?));
+        }
+        pair.push("$A:0".to_string());
+        if add_eos {
+            pair.push(format!("{}:0", eos.clone()?));
+        }
+        if add_bos {
+            pair.push(format!("{}:1", bos.clone()?));
+        }
+        pair.push("$B:1".to_string());
+        if add_eos {
+            pair.push(format!("{}:1", eos.clone()?));
+        }
+
+        let proc = TemplateProcessing::builder()
+            .try_single(single)
+            .ok()?
+            .try_pair(pair)
+            .ok()?
+            .special_tokens(specials)
+            .build()
+            .ok()?;
+
+        Some(PostProcessorWrapper::Template(proc))
+    }
+
+    /// Builds a SentencePiece-metaspace BPE [`Tokenizer`] from `gemma4`-flavoured
+    /// GGUF metadata (`tokenizer.ggml.model == "gemma4"`).
+    pub(super) fn build(ct: &gguf_file::Content) -> CandleResult<Tokenizer> {
+        let tokens = value_to_string_array(
+            metadata_value(ct, "tokenizer.ggml.tokens")?,
+            "tokenizer.ggml.tokens",
+        )?;
+        let vocab: Vocab = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| -> CandleResult<(String, u32)> {
+                let id = u32::try_from(i).map_err(|_| {
+                    CandleError::msg(format!("vocab index {i} out of range for u32"))
+                })?;
+                Ok((t.clone(), id))
+            })
+            .collect::<CandleResult<Vocab>>()?;
+        let merges = merges_from_value(metadata_value(ct, "tokenizer.ggml.merges")?)?;
+
+        let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
+
+        if let Some(token_id) = unk_token_id(ct) {
+            if let Some(token) = tokens.get(token_id as usize) {
+                builder = builder.unk_token(token.clone());
+            }
+        }
+
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.byte_fallback") {
+            builder = builder.byte_fallback(val.to_bool().map_err(CandleError::wrap)?);
+        }
+
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
+            builder = builder.ignore_merges(val.to_bool().map_err(CandleError::wrap)?);
+        }
+
+        let bpe = builder.build().map_err(CandleError::wrap)?;
+        let mut tokenizer = Tokenizer::new(bpe);
+
+        // SentencePiece convention: prepend a leading metaspace marker unless
+        // `tokenizer.ggml.add_space_prefix` is explicitly `false`.
+        let add_space_prefix = metadata_value(ct, "tokenizer.ggml.add_space_prefix")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(true);
+        let prepend_scheme = if add_space_prefix {
+            PrependScheme::Always
+        } else {
+            PrependScheme::Never
+        };
+        let metaspace = Metaspace::new('▁', prepend_scheme, true);
+        tokenizer.with_pre_tokenizer(Some(metaspace.clone()));
+        tokenizer.with_decoder(Some(metaspace));
+
+        let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(false);
+        let add_eos = metadata_value(ct, "tokenizer.ggml.add_eos_token")
+            .and_then(|v| v.to_bool().map_err(CandleError::wrap))
+            .unwrap_or(false);
+        let bos_id = metadata_value(ct, "tokenizer.ggml.bos_token_id")
+            .and_then(gguf_value_to_u32)
+            .ok();
+        let eos_id = metadata_value(ct, "tokenizer.ggml.eos_token_id")
+            .and_then(gguf_value_to_u32)
+            .ok();
+
+        if let Some(pp) = template_processor(&tokens, bos_id, eos_id, add_bos, add_eos) {
+            tokenizer.with_post_processor(Some(pp));
+        }
+
+        // Mark special tokens so decode(skip_special_tokens = true) behaves as expected.
+        if let Ok(gguf_file::Value::Array(arr)) = metadata_value(ct, "tokenizer.ggml.token_type") {
+            let mut specials = Vec::new();
+            for (idx, v) in arr.iter().enumerate() {
+                let ty = gguf_value_to_u32(v)?;
+                // Aligns with llama_token_type: treat non-normal/non-byte tokens as special.
+                let is_special = matches!(ty, 2..=5);
+                if is_special {
+                    if let Some(tok) = tokens.get(idx) {
+                        specials.push(AddedToken::from(tok.clone(), true));
+                    }
+                }
+            }
+            if !specials.is_empty() {
+                tokenizer.add_special_tokens(&specials);
+            }
+        }
+
+        let mut explicit_specials = HashSet::new();
+        for key in [
+            "tokenizer.ggml.bos_token_id",
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.pad_token_id",
+            "tokenizer.ggml.sep_token_id",
+        ] {
+            if let Ok(val) = metadata_value(ct, key) {
+                explicit_specials.insert(gguf_value_to_u32(val)?);
+            }
+        }
+        if let Some(id) = unk_token_id(ct) {
+            explicit_specials.insert(id);
+        }
+        if !explicit_specials.is_empty() {
+            let specials: Vec<_> = explicit_specials
+                .into_iter()
+                .filter_map(|id| tokens.get(id as usize))
+                .map(|tok| AddedToken::from(tok.clone(), true))
+                .collect();
+            if !specials.is_empty() {
+                tokenizer.add_special_tokens(&specials);
+            }
+        }
+
+        Ok(tokenizer)
+    }
+}
+
+/// Quantized model weights for `gemma4`-architecture GGUF exports.
+///
+/// `candle_transformers::models::quantized_gemma3::ModelWeights` reads
+/// `attention.head_count`, `attention.key_length`, `rope.freq_base`, and the
+/// sliding-window flag as **uniform scalars** applied to every transformer
+/// layer. The `gemma4` architecture instead has **per-layer heterogeneous
+/// attention configs**: layers alternate between "sliding window" (local) and
+/// "global" (full-attention) variants with different head dimensions, KV head
+/// counts, and RoPE frequencies. This module re-implements the equivalent of
+/// `quantized_gemma3::ModelWeights` with per-layer configuration read from
+/// `gemma4.*` metadata, including the `gemma4.attention.head_count_kv` and
+/// `gemma4.attention.sliding_window_pattern` per-layer arrays.
+///
+/// The `forward`/`mask`/`forward_attn`/[`RotaryEmbedding`]/[`Mlp`]/[`QMatMul`]
+/// logic is ported from `quantized_gemma3` essentially unchanged, since those
+/// types are already per-layer-parametrized; only `from_gguf`'s metadata
+/// reading differs.
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+mod quantized_gemma4 {
+    use candle_core::quantized::gguf_file;
+    use candle_core::quantized::QTensor;
+    use candle_core::{Context as CandleContext, DType, Device, IndexOp, Result, Tensor, D};
+    use candle_nn::{Embedding, Module};
+    use candle_transformers::quantized_nn::RmsNorm;
+    use candle_transformers::utils::repeat_kv;
+
+    /// Gemma 3/4 supports a 128K context window.
+    const MAX_SEQ_LEN: usize = 131_072;
+
+    #[derive(Debug, Clone)]
+    struct QMatMul {
+        inner: candle_core::quantized::QMatMul,
+        span: tracing::Span,
+    }
+
+    impl QMatMul {
+        fn from_qtensor(qtensor: QTensor) -> Result<Self> {
+            let inner = candle_core::quantized::QMatMul::from_qtensor(qtensor)?;
+            let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
+            Ok(Self { inner, span })
+        }
+
+        fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+            let _enter = self.span.enter();
+            self.inner.forward(xs)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Mlp {
+        feed_forward_gate: QMatMul,
+        feed_forward_up: QMatMul,
+        feed_forward_down: QMatMul,
+    }
+
+    impl Module for Mlp {
+        fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+            let gate = self.feed_forward_gate.forward(xs)?;
+            let up = self.feed_forward_up.forward(xs)?;
+            // llama.cpp's Gemma 4 path uses plain GeGLU, whose GELU is the
+            // tanh approximation; Candle's Tensor::gelu() is the same variant.
+            let gated = (gate.gelu()? * up)?;
+            self.feed_forward_down.forward(&gated)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RotaryEmbedding {
+        sin: Tensor,
+        cos: Tensor,
+    }
+
+    impl RotaryEmbedding {
+        /// `freq_factors`, when present, divides each dimension-pair's
+        /// rotation rate (`gemma4`'s top-level `rope_freqs.weight`, applied
+        /// only to global/non-SWA layers in upstream llama.cpp). A factor of
+        /// `1e30` effectively freezes that dimension pair's rotation
+        /// (`cos` -> 1, `sin` -> 0 for all positions), which is how gemma4
+        /// extends context length without retraining the higher rotary
+        /// dimensions.
+        fn new(
+            head_dim: usize,
+            rope_frequency: f32,
+            freq_factors: Option<&[f32]>,
+            device: &Device,
+        ) -> Result<Self> {
+            let theta: Vec<_> = (0..head_dim)
+                .step_by(2)
+                .enumerate()
+                .map(|(j, i)| {
+                    let base = 1f32 / rope_frequency.powf(i as f32 / head_dim as f32);
+                    match freq_factors.and_then(|factors| factors.get(j)) {
+                        Some(factor) => base / factor,
+                        None => base,
+                    }
+                })
+                .collect();
+            let theta = Tensor::new(theta.as_slice(), device)?;
+            let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+                .to_dtype(DType::F32)?
+                .reshape((MAX_SEQ_LEN, 1))?
+                .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+            let cos = idx_theta.cos()?;
+            let sin = idx_theta.sin()?;
+            Ok(Self { sin, cos })
+        }
+
+        fn apply_rotary_emb_qkv(
+            &self,
+            q: &Tensor,
+            k: &Tensor,
+            index_pos: usize,
+        ) -> Result<(Tensor, Tensor)> {
+            let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+            let cos = self.cos.narrow(0, index_pos, seq_len)?;
+            let sin = self.sin.narrow(0, index_pos, seq_len)?;
+            let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+            Ok((q_embed, k_embed))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LayerWeights {
+        attention_wq: QMatMul,
+        attention_wk: QMatMul,
+        /// Value projection. Absent on global (non-sliding) layers, which
+        /// have no `attn_v.weight` tensor in the GGUF; on those layers the
+        /// raw key projection output is reused as the value projection
+        /// (`Vcur = Kcur` in upstream llama.cpp's gemma4 graph, before any
+        /// reshape/norm/RoPE is applied to `Kcur`).
+        attention_wv: Option<QMatMul>,
+        attention_wo: QMatMul,
+
+        attention_q_norm: RmsNorm,
+        attention_k_norm: RmsNorm,
+
+        attention_norm: RmsNorm,
+        post_attention_norm: RmsNorm,
+        ffn_norm: RmsNorm,
+        post_ffn_norm: RmsNorm,
+
+        mlp: Mlp,
+
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        q_dim: usize,
+
+        sliding_window_size: Option<usize>,
+
+        rotary_embedding: RotaryEmbedding,
+        neg_inf: Tensor,
+
+        /// `eps` used for the unweighted RMS normalization applied to the
+        /// value projection (see [`rms_norm_unweighted`]).
+        rms_norm_eps: f64,
+
+        /// Scalar multiplier applied to this block's full output (after both
+        /// the attention and feed-forward residual additions) before it is
+        /// passed to the next layer, read from `blk.N.layer_output_scale.weight`.
+        layer_output_scale: f32,
+
+        kv_cache: Option<(Tensor, Tensor)>,
+
+        span_attn: tracing::Span,
+        span_mlp: tracing::Span,
+    }
+
+    impl LayerWeights {
+        fn mask(
+            &self,
+            b_sz: usize,
+            seq_len: usize,
+            index_pos: usize,
+            dtype: DType,
+            device: &Device,
+        ) -> Result<Tensor> {
+            let mask: Vec<_> = if let Some(sliding_window_size) = self.sliding_window_size {
+                (0..seq_len)
+                    .flat_map(|i| {
+                        (0..seq_len).map(move |j| {
+                            if i < j || j + sliding_window_size < i {
+                                0u32
+                            } else {
+                                1u32
+                            }
+                        })
+                    })
+                    .collect()
+            } else {
+                (0..seq_len)
+                    .flat_map(|i| (0..seq_len).map(move |j| if i < j { 0u32 } else { 1u32 }))
+                    .collect()
+            };
+            let mask = Tensor::from_slice(&mask, (seq_len, seq_len), device)?;
+            let mask = if index_pos > 0 {
+                let mask0 = Tensor::zeros((seq_len, index_pos), DType::F32, device)?;
+                Tensor::cat(&[&mask0, &mask], D::Minus1)?
+            } else {
+                mask
+            };
+            mask.expand((b_sz, 1, seq_len, seq_len + index_pos))?
+                .to_dtype(dtype)
+        }
+
+        fn forward_attn(
+            &mut self,
+            x: &Tensor,
+            mask: Option<&Tensor>,
+            index_pos: usize,
+        ) -> Result<Tensor> {
+            let _enter = self.span_attn.enter();
+            let (b_sz, seq_len, _) = x.dims3()?;
+
+            let q = self.attention_wq.forward(x)?;
+            let k = self.attention_wk.forward(x)?;
+            // Global (non-sliding) layers have no `attn_v.weight`; upstream
+            // llama.cpp reuses the raw key projection output as `Vcur` in
+            // that case (`Vcur = Kcur` before any reshape/norm/RoPE).
+            let v = match &self.attention_wv {
+                Some(wv) => wv.forward(x)?,
+                None => k.clone(),
+            };
+
+            let q = q
+                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let k = k
+                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+
+            let q = self.attention_q_norm.forward(&q.contiguous()?)?;
+            let k = self.attention_k_norm.forward(&k.contiguous()?)?;
+            // gemma4 applies an unweighted RMS norm to V on every layer
+            // (`ggml_rms_norm(Vcur, eps)` in upstream llama.cpp), unlike K
+            // which uses the learned `attn_k_norm` weight. V never receives
+            // RoPE.
+            let v = rms_norm_unweighted(&v.contiguous()?, self.rms_norm_eps)?;
+
+            let (q, k) = self
+                .rotary_embedding
+                .apply_rotary_emb_qkv(&q, &k, index_pos)?;
+
+            let (k, v) = match &self.kv_cache {
+                None => (k, v),
+                Some((k_cache, v_cache)) => {
+                    if index_pos == 0 {
+                        (k, v)
+                    } else {
+                        let k = Tensor::cat(&[k_cache, &k], 2)?;
+                        let v = Tensor::cat(&[v_cache, &v], 2)?;
+                        (k, v)
+                    }
+                }
+            };
+            self.kv_cache = Some((k.clone(), v.clone()));
+
+            let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
+            let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
+
+            // Gemma4 uses `self.scaling = 1.0` (no pre-attention scaling) —
+            // unlike the standard `1/sqrt(head_dim)` transformer attention
+            // scale, per upstream llama.cpp's
+            // `hparams.f_attention_scale = 1.0f`.
+            let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?;
+
+            if let Some(mask) = mask {
+                let mask = mask.broadcast_as(attn_weights.shape())?;
+                let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
+                attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
+            }
+
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v)?;
+
+            let attn_output = attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, seq_len, self.q_dim))?;
+
+            self.attention_wo.forward(&attn_output)
+        }
+    }
+
+    /// Per-layer attention configuration derived from the `gemma4.*`
+    /// per-layer arrays (`attention.head_count_kv` and
+    /// `attention.sliding_window_pattern`).
+    struct LayerConfig {
+        n_kv_head: usize,
+        head_dim: usize,
+        sliding_window_size: Option<usize>,
+        rope_freq: f32,
+    }
+
+    /// Reads a required `u32` scalar from `gemma4.{suffix}` metadata.
+    fn md_u32(ct: &gguf_file::Content, suffix: &str) -> Result<u32> {
+        let key = format!("gemma4.{suffix}");
+        ct.metadata
+            .get(&key)
+            .with_context(|| format!("cannot find {key} in metadata"))?
+            .to_u32()
+    }
+
+    /// Reads a required `f32` scalar from `gemma4.{suffix}` metadata.
+    fn md_f32(ct: &gguf_file::Content, suffix: &str) -> Result<f32> {
+        let key = format!("gemma4.{suffix}");
+        ct.metadata
+            .get(&key)
+            .with_context(|| format!("cannot find {key} in metadata"))?
+            .to_f32()
+    }
+
+    /// Converts a GGUF metadata array element to `u32`, accepting any
+    /// integral type (`U8`..`I64`) or `Bool` (`true` -> 1, `false` -> 0).
+    ///
+    /// Real `gemma4` GGUF exports store `attention.head_count_kv` as `I32`
+    /// and `attention.sliding_window_pattern` as `Bool`, neither of which
+    /// `gguf_file::Value::to_u32` accepts directly.
+    fn value_to_u32(v: &gguf_file::Value) -> Result<u32> {
+        let as_i64 = match v {
+            gguf_file::Value::U8(v) => i64::from(*v),
+            gguf_file::Value::I8(v) => i64::from(*v),
+            gguf_file::Value::U16(v) => i64::from(*v),
+            gguf_file::Value::I16(v) => i64::from(*v),
+            gguf_file::Value::U32(v) => i64::from(*v),
+            gguf_file::Value::I32(v) => i64::from(*v),
+            gguf_file::Value::U64(v) => i64::try_from(*v).map_err(candle_core::Error::wrap)?,
+            gguf_file::Value::I64(v) => *v,
+            gguf_file::Value::Bool(v) => i64::from(*v),
+            other => candle_core::bail!("expected integral or bool value, got {other:?}"),
+        };
+        u32::try_from(as_i64)
+            .map_err(|_| candle_core::Error::msg(format!("value {as_i64} out of range for u32")))
+    }
+
+    /// Dequantizes a `[1]`-shaped GGUF tensor (e.g. `blk.N.layer_output_scale.weight`)
+    /// to a single `f32` scalar.
+    fn dequantize_scalar_f32(tensor: QTensor, device: &Device) -> Result<f32> {
+        let values = tensor.dequantize(device)?.flatten_all()?.to_vec1::<f32>()?;
+        match values.as_slice() {
+            [value] => Ok(*value),
+            other => candle_core::bail!(
+                "expected a single-element tensor, got {} elements",
+                other.len()
+            ),
+        }
+    }
+
+    /// Applies an unweighted RMS normalization (`x / sqrt(mean(x^2) + eps)`)
+    /// over the last dimension of `x`, with no learned scale.
+    ///
+    /// gemma4 applies this to the value projection on every layer (see
+    /// `ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)` in upstream
+    /// llama.cpp), in contrast to the key projection which uses the learned
+    /// `attn_k_norm` weight.
+    fn rms_norm_unweighted(x: &Tensor, eps: f64) -> Result<Tensor> {
+        let hidden_size = x.dim(D::Minus1)?;
+        let x32 = x.to_dtype(DType::F32)?;
+        let norm_x = (x32.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let x_normed = x32.broadcast_div(&(norm_x + eps)?.sqrt()?)?;
+        x_normed.to_dtype(x.dtype())
+    }
+
+    /// Applies a `tanh`-based softcap to the final logits:
+    /// `logits = tanh(logits / cap) * cap`.
+    ///
+    /// Matches upstream llama.cpp's `hparams.f_final_logit_softcapping`
+    /// handling (`ggml_scale` by `1/cap`, `ggml_tanh`, `ggml_scale` by
+    /// `cap`), which bounds the final logits to `(-cap, cap)`.
+    fn apply_final_logit_softcapping(logits: &Tensor, softcap: f32) -> Result<Tensor> {
+        let softcap = f64::from(softcap);
+        (logits / softcap)?.tanh()? * softcap
+    }
+
+    /// Reads a required `gemma4.{suffix}` array with exactly `expected_len`
+    /// elements, converting each element to `u32` via [`value_to_u32`].
+    fn md_u32_array(
+        ct: &gguf_file::Content,
+        suffix: &str,
+        expected_len: usize,
+    ) -> Result<Vec<u32>> {
+        let key = format!("gemma4.{suffix}");
+        let values = ct
+            .metadata
+            .get(&key)
+            .with_context(|| format!("cannot find {key} in metadata"))?
+            .to_vec()
+            .with_context(|| format!("{key} is not an array"))?;
+        if values.len() != expected_len {
+            candle_core::bail!(
+                "{key} has {} elements, expected {expected_len} (one per layer)",
+                values.len()
+            );
+        }
+        values.iter().map(value_to_u32).collect()
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ModelWeights {
+        tok_embeddings: Embedding,
+        embedding_length: usize,
+        layers: Vec<LayerWeights>,
+        norm: RmsNorm,
+        output: QMatMul,
+        /// `tanh`-based softcap applied to the final logits
+        /// (`gemma4.final_logit_softcapping`), e.g. `logits =
+        /// tanh(logits / cap) * cap`. Absent in synthetic/test GGUFs and some
+        /// exports, in which case the final logits are left unscaled.
+        final_logit_softcapping: Option<f32>,
+        span: tracing::Span,
+        span_output: tracing::Span,
+    }
+
+    impl ModelWeights {
+        /// Constructs gemma4 quantized model weights from GGUF `Content`.
+        ///
+        /// Unlike `quantized_gemma3::ModelWeights::from_gguf`, hyperparameters
+        /// are read directly from the `gemma4.*` namespace and per-layer
+        /// attention configuration (KV head count, head dimension, sliding
+        /// window, RoPE frequency) is derived from the per-layer
+        /// `gemma4.attention.head_count_kv` and
+        /// `gemma4.attention.sliding_window_pattern` arrays.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if required `gemma4.*` metadata keys are missing,
+        /// the per-layer arrays have the wrong length, or any tensor cannot be
+        /// loaded from the GGUF content.
+        pub fn from_gguf<R: std::io::Seek + std::io::Read>(
+            ct: gguf_file::Content,
+            reader: &mut R,
+            device: &Device,
+        ) -> Result<Self> {
+            let head_count = md_u32(&ct, "attention.head_count")? as usize;
+            let block_count = md_u32(&ct, "block_count")? as usize;
+            let embedding_length = md_u32(&ct, "embedding_length")? as usize;
+            let key_length = md_u32(&ct, "attention.key_length")? as usize;
+            let key_length_swa = md_u32(&ct, "attention.key_length_swa")? as usize;
+            let rms_norm_eps = f64::from(md_f32(&ct, "attention.layer_norm_rms_epsilon")?);
+            let sliding_window = md_u32(&ct, "attention.sliding_window")? as usize;
+            let rope_freq_base = md_f32(&ct, "rope.freq_base")?;
+            let rope_freq_base_swa = md_f32(&ct, "rope.freq_base_swa")?;
+
+            let head_count_kv = md_u32_array(&ct, "attention.head_count_kv", block_count)?;
+            let sliding_window_pattern =
+                md_u32_array(&ct, "attention.sliding_window_pattern", block_count)?;
+
+            let layer_configs: Vec<LayerConfig> = (0..block_count)
+                .map(|i| {
+                    let is_sliding = sliding_window_pattern[i] == 1;
+                    if is_sliding {
+                        LayerConfig {
+                            n_kv_head: head_count_kv[i] as usize,
+                            head_dim: key_length_swa,
+                            sliding_window_size: Some(sliding_window),
+                            rope_freq: rope_freq_base_swa,
+                        }
+                    } else {
+                        LayerConfig {
+                            n_kv_head: head_count_kv[i] as usize,
+                            head_dim: key_length,
+                            sliding_window_size: None,
+                            rope_freq: rope_freq_base,
+                        }
+                    }
+                })
+                .collect();
+
+            let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
+
+            let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
+            let tok_embeddings = tok_embeddings.dequantize(device)?;
+            let norm = RmsNorm::from_qtensor(
+                ct.tensor(reader, "output_norm.weight", device)?,
+                rms_norm_eps,
+            )?;
+            let output = match ct.tensor(reader, "output.weight", device) {
+                Ok(tensor) => tensor,
+                Err(_) => ct.tensor(reader, "token_embd.weight", device)?,
+            };
+
+            // Shared rope frequency-scaling factors for global (non-SWA)
+            // layers, applied per dimension-pair (see `RotaryEmbedding::new`).
+            // Absent in synthetic/test GGUFs and some exports, in which case
+            // global layers fall back to unscaled RoPE.
+            let rope_freqs: Option<Vec<f32>> = ct
+                .tensor(reader, "rope_freqs.weight", device)
+                .ok()
+                .map(|tensor| tensor.dequantize(device)?.flatten_all()?.to_vec1::<f32>())
+                .transpose()?;
+
+            // `tanh`-based softcap applied to the final logits
+            // (`logits = tanh(logits / cap) * cap`), per upstream
+            // llama.cpp's `hparams.f_final_logit_softcapping`. Absent in
+            // synthetic/test GGUFs and some exports, in which case the
+            // final logits are left unscaled.
+            let final_logit_softcapping = md_f32(&ct, "final_logit_softcapping").ok();
+
+            let mut layers = Vec::with_capacity(block_count);
+            for (layer_idx, layer_config) in layer_configs.into_iter().enumerate() {
+                let prefix = format!("blk.{layer_idx}");
+
+                let attention_wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
+                let attention_wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
+                // Global (non-sliding) layers have no `attn_v.weight` tensor in the
+                // GGUF at all; `forward_attn` reuses the raw key projection output
+                // as `Vcur` in that case, matching upstream llama.cpp.
+                let attention_wv = ct
+                    .tensor(reader, &format!("{prefix}.attn_v.weight"), device)
+                    .ok();
+                let attention_wo =
+                    ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
+
+                let attention_q_norm = RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.attn_q_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+                let attention_k_norm = RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.attn_k_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+                let attention_norm = RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+                let post_attention_norm = RmsNorm::from_qtensor(
+                    ct.tensor(
+                        reader,
+                        &format!("{prefix}.post_attention_norm.weight"),
+                        device,
+                    )?,
+                    rms_norm_eps,
+                )?;
+                let ffn_norm = RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+                let post_ffn_norm = RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.post_ffw_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+
+                let feed_forward_gate =
+                    ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
+                let feed_forward_up =
+                    ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+                let feed_forward_down =
+                    ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+
+                let mlp = Mlp {
+                    feed_forward_gate: QMatMul::from_qtensor(feed_forward_gate)?,
+                    feed_forward_up: QMatMul::from_qtensor(feed_forward_up)?,
+                    feed_forward_down: QMatMul::from_qtensor(feed_forward_down)?,
+                };
+
+                let freq_factors = layer_config
+                    .sliding_window_size
+                    .is_none()
+                    .then_some(rope_freqs.as_deref())
+                    .flatten();
+                let rotary_embedding = RotaryEmbedding::new(
+                    layer_config.head_dim,
+                    layer_config.rope_freq,
+                    freq_factors,
+                    device,
+                )?;
+
+                let layer_output_scale = dequantize_scalar_f32(
+                    ct.tensor(
+                        reader,
+                        &format!("{prefix}.layer_output_scale.weight"),
+                        device,
+                    )?,
+                    device,
+                )?;
+
+                let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
+                let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
+
+                layers.push(LayerWeights {
+                    attention_wq: QMatMul::from_qtensor(attention_wq)?,
+                    attention_wk: QMatMul::from_qtensor(attention_wk)?,
+                    attention_wv: attention_wv.map(QMatMul::from_qtensor).transpose()?,
+                    attention_wo: QMatMul::from_qtensor(attention_wo)?,
+                    attention_q_norm,
+                    attention_k_norm,
+                    attention_norm,
+                    post_attention_norm,
+                    ffn_norm,
+                    post_ffn_norm,
+                    mlp,
+                    n_head: head_count,
+                    n_kv_head: layer_config.n_kv_head,
+                    head_dim: layer_config.head_dim,
+                    q_dim: head_count * layer_config.head_dim,
+                    sliding_window_size: layer_config.sliding_window_size,
+                    rotary_embedding,
+                    neg_inf: neg_inf.clone(),
+                    rms_norm_eps,
+                    layer_output_scale,
+                    kv_cache: None,
+                    span_attn,
+                    span_mlp,
+                });
+            }
+
+            let span = tracing::span!(tracing::Level::TRACE, "model");
+            let span_output = tracing::span!(tracing::Level::TRACE, "output");
+
+            Ok(Self {
+                tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+                embedding_length,
+                layers,
+                norm,
+                output: QMatMul::from_qtensor(output)?,
+                final_logit_softcapping,
+                span,
+                span_output,
+            })
+        }
+
+        /// Resets the key/value cache for every layer.
+        ///
+        /// Call this before starting generation for a new prompt so that stale
+        /// cached keys/values from a previous request are not reused.
+        pub fn clear_kv_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.kv_cache = None;
+            }
+        }
+
+        /// Runs a forward pass over `x` (shape `(batch, seq_len)` token ids),
+        /// returning logits for the final position with shape
+        /// `(batch, vocab_size)`.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if any tensor operation fails.
+        pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+            let (b_sz, seq_len) = x.dims2()?;
+            let _enter = self.span.enter();
+
+            let mut layer_in = self.tok_embeddings.forward(x)?;
+            layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
+
+            for layer in &mut self.layers {
+                let attention_mask = if seq_len == 1 {
+                    None
+                } else {
+                    Some(layer.mask(b_sz, seq_len, index_pos, x.dtype(), x.device())?)
+                };
+
+                let residual = &layer_in;
+                let x = layer.attention_norm.forward(&layer_in)?;
+                let x = layer.forward_attn(&x, attention_mask.as_ref(), index_pos)?;
+                let x = layer.post_attention_norm.forward(&x)?;
+                let x = (x + residual)?;
+
+                let _enter = layer.span_mlp.enter();
+                let residual = &x;
+                let x = layer.ffn_norm.forward(&x)?;
+                let x = layer.mlp.forward(&x)?;
+                let x = layer.post_ffn_norm.forward(&x)?;
+                let x = (x + residual)?;
+                drop(_enter);
+
+                // `layer_output_scale` scales this block's entire output
+                // (i.e. the hidden state handed to the next layer), matching
+                // upstream llama.cpp's `cur = ggml_mul(cur, out_scale); inpL
+                // = cur;` applied after the feed-forward residual add.
+                layer_in = (x * f64::from(layer.layer_output_scale))?;
+            }
+
+            let _enter = self.span_output.enter();
+
+            let x = layer_in.i((.., seq_len - 1, ..))?;
+            let x = self.norm.forward(&x)?;
+            let output = self.output.forward(&x)?;
+            let output = match self.final_logit_softcapping {
+                Some(softcap) if softcap != 0.0 => apply_final_logit_softcapping(&output, softcap)?,
+                _ => output,
+            };
+
+            Ok(output)
+        }
+    }
+
+    #[cfg(test)]
+    mod softcap_tests {
+        use super::apply_final_logit_softcapping;
+        use candle_core::{Device, Tensor};
+
+        #[test]
+        fn softcapping_bounds_logits_to_plus_minus_cap() {
+            let device = Device::Cpu;
+            let logits = Tensor::new(&[60.0f32, -60.0, 0.0], &device).expect("logits tensor");
+
+            let capped = apply_final_logit_softcapping(&logits, 30.0)
+                .expect("softcapping should succeed")
+                .to_vec1::<f32>()
+                .expect("capped logits");
+
+            assert!(
+                capped.iter().all(|v| v.abs() < 30.0),
+                "softcapped logits {capped:?} should be strictly within (-30, 30)"
+            );
+            assert!(
+                (capped[2] - 0.0).abs() < 1e-6,
+                "tanh(0) * cap should be 0, got {}",
+                capped[2]
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+/// Loads the generation tokenizer for `artifacts`, along with the BOS token id
+/// (if any) that [`RealCandleDecoder::generate`] must manually prepend to the
+/// generation prompt's `input_ids` via [`prepend_bos_if_configured`].
+///
+/// `encode(prompt, false)`, used for the generation prompt, bypasses the
+/// tokenizer's post-processor, so a GGUF-configured `add_bos_token = true`
+/// would otherwise have no effect. The safetensors path returns `None` here
+/// unchanged — its `tokenizer.json` is not inspected for this metadata, which
+/// keeps this a no-op for the existing Qwen3/other safetensors-backed paths.
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 fn load_generation_tokenizer(
     model_path: &Path,
     artifacts: &CandleArtifactValidation,
-) -> Result<tokenizers::tokenizer::Tokenizer> {
+) -> Result<(tokenizers::tokenizer::Tokenizer, Option<u32>)> {
     match artifacts.model_format {
         NativeModelFormat::Safetensors => {
             let tokenizer_path = safetensors_artifact_dir(model_path).join("tokenizer.json");
-            tokenizers::tokenizer::Tokenizer::from_file(&tokenizer_path)
-                .map_err(|err| anyhow::anyhow!("failed to load tokenizer.json: {err}"))
+            let tokenizer = tokenizers::tokenizer::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|err| anyhow::anyhow!("failed to load tokenizer.json: {err}"))?;
+            Ok((tokenizer, None))
         }
         NativeModelFormat::Gguf => {
             let mut file = fs::File::open(model_path)
                 .with_context(|| "failed to open GGUF tokenizer metadata")?;
             let content = candle_core::quantized::gguf_file::Content::read(&mut file)
                 .with_context(|| "failed to read GGUF tokenizer metadata")?;
-            let result = <tokenizers::tokenizer::Tokenizer as candle_core::quantized::tokenizer::TokenizerFromGguf>::from_gguf(&content);
-            match result {
-                Ok(tok) => Ok(tok),
-                Err(err) => {
-                    let msg = err.to_string();
-                    if msg.contains("unsupported tokenizer model") {
-                        tokenizer_from_gguf_spm(&content).with_context(|| {
-                            format!("failed to build SentencePiece tokenizer from GGUF ({msg})")
-                        })
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "failed to build tokenizer from GGUF metadata: {err}"
-                        ))
-                    }
-                }
-            }
+            let tokenizer = tokenizer_from_gguf_content(&content)?;
+            let bos_token_id = gguf_bos_token_to_prepend(&content);
+            Ok((tokenizer, bos_token_id))
         }
         NativeModelFormat::Unknown => bail!("native artifact format is unsupported"),
     }
@@ -3500,10 +4814,8 @@ mod tests {
             tool_call_id: None,
         }];
         let prompt = format_native_chat_prompt(CandleModelFamily::Gemma4, &messages);
-        assert!(
-            prompt.starts_with("<bos>"),
-            "Gemma4 prompt must start with <bos>, got: {prompt:?}"
-        );
+        // BOS is handled at token-ID level (prepend_bos_if_configured), not as a
+        // string prefix in the rendered prompt. The prompt must use <|turn> markers.
         assert!(
             prompt.contains("<|turn>user"),
             "must contain user turn marker"
@@ -4757,6 +6069,70 @@ with instrument_db_span(
         assert!(end_pos > 1, "<turn|> must follow the content");
     }
 
+    #[test]
+    fn gemma_chat_input_renders_system_as_its_own_turn() {
+        let messages = vec![
+            NativeChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("answer briefly".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("hello".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        assert_eq!(
+            gemma_chat_input(&messages),
+            "<|turn>system\nanswer briefly<turn|>\n\
+             <|turn>user\nhello<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    #[test]
+    fn gemma_chat_input_maps_assistant_role_to_model_and_appends_generation_cue() {
+        let messages = vec![
+            NativeChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("be terse".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("hi".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String("hello there".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("how are you?".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        assert_eq!(
+            gemma_chat_input(&messages),
+            "<|turn>system\nbe terse<turn|>\n\
+             <|turn>user\nhi<turn|>\n\
+             <|turn>model\nhello there<turn|>\n\
+             <|turn>user\nhow are you?<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
     #[cfg(feature = "native-tokenizers")]
     #[test]
     fn tokenizers_counter_feature_exposes_native_accounting_api_shape() {
@@ -4783,6 +6159,7 @@ with instrument_db_span(
             budget: 0.8,
             cpu_only: false,
             gpu_vendor: "nvidia".to_string(),
+            llama_server_bin: None,
         };
 
         let plan = Qwen3CandleEngineLoader::plan(&model, &resources).expect("plan validates");
@@ -5379,6 +6756,7 @@ with instrument_db_span(
             budget: 0.7,
             cpu_only: true,
             gpu_vendor: "nvidia".to_string(),
+            llama_server_bin: None,
         };
 
         for family in [
@@ -5695,5 +7073,780 @@ with instrument_db_span(
             .safe_telemetry_attributes()
             .values()
             .all(|value| !value.to_string().contains("/private")));
+    }
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers", test))]
+mod gguf_tokenizer_tests {
+    use super::*;
+    use candle_core::quantized::gguf_file::{Content, Value as GgufValue, VersionedMagic};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    /// Builds a tiny synthetic GGUF `Content` with a `gemma4`-style SentencePiece
+    /// metaspace vocabulary, suitable for exercising the tokenizer builder without
+    /// reading a real model file.
+    fn gemma4_content() -> Content {
+        let tokens = vec![
+            "<pad>".to_string(),  // 0
+            "<eos>".to_string(),  // 1
+            "<bos>".to_string(),  // 2
+            "<unk>".to_string(),  // 3
+            "<mask>".to_string(), // 4
+            "▁".to_string(),      // 5
+            "h".to_string(),      // 6
+            "i".to_string(),      // 7
+            "t".to_string(),      // 8
+            "e".to_string(),      // 9
+            "r".to_string(),      // 10
+            "hi".to_string(),     // 11
+            "▁hi".to_string(),    // 12
+            "th".to_string(),     // 13
+            "the".to_string(),    // 14
+            "ther".to_string(),   // 15
+            "there".to_string(),  // 16
+            "▁there".to_string(), // 17
+        ];
+        let token_type: Vec<GgufValue> = vec![
+            GgufValue::U32(3), // <pad> -> control
+            GgufValue::U32(3), // <eos> -> control
+            GgufValue::U32(3), // <bos> -> control
+            GgufValue::U32(2), // <unk> -> unknown
+            GgufValue::U32(3), // <mask> -> control
+            GgufValue::U32(1), // ▁ -> normal
+            GgufValue::U32(1), // h -> normal
+            GgufValue::U32(1), // i -> normal
+            GgufValue::U32(1), // t -> normal
+            GgufValue::U32(1), // e -> normal
+            GgufValue::U32(1), // r -> normal
+            GgufValue::U32(1), // hi -> normal
+            GgufValue::U32(1), // ▁hi -> normal
+            GgufValue::U32(1), // th -> normal
+            GgufValue::U32(1), // the -> normal
+            GgufValue::U32(1), // ther -> normal
+            GgufValue::U32(1), // there -> normal
+            GgufValue::U32(1), // ▁there -> normal
+        ];
+        let merges = vec![
+            "h i".to_string(),
+            "▁ hi".to_string(),
+            "t h".to_string(),
+            "th e".to_string(),
+            "the r".to_string(),
+            "ther e".to_string(),
+            "▁ there".to_string(),
+        ];
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("gemma4".to_string()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            GgufValue::Array(merges.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(token_type),
+        );
+        metadata.insert("tokenizer.ggml.bos_token_id".to_string(), GgufValue::U32(2));
+        metadata.insert("tokenizer.ggml.eos_token_id".to_string(), GgufValue::U32(1));
+        metadata.insert(
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            GgufValue::U32(3),
+        );
+        metadata.insert(
+            "tokenizer.ggml.padding_token_id".to_string(),
+            GgufValue::U32(0),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_space_prefix".to_string(),
+            GgufValue::Bool(false),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(true),
+        );
+
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    /// Builds a minimal gpt2-style GGUF `Content`, just enough metadata for
+    /// candle's `TokenizerFromGguf::from_gguf` to be reached and attempted.
+    fn gpt2_content() -> Content {
+        let tokens = vec![
+            "<|endoftext|>".to_string(),
+            "h".to_string(),
+            "i".to_string(),
+            "Ġthere".to_string(),
+            "hi".to_string(),
+        ];
+        let merges = vec!["h i".to_string()];
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("gpt2".to_string()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            GgufValue::Array(merges.into_iter().map(GgufValue::String).collect()),
+        );
+
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    fn unsupported_content() -> Content {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("made-up-model".to_string()),
+        );
+
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn gemma4_metaspace_tokenizer_builds_and_round_trips() {
+        let content = gemma4_content();
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("gemma4 metaspace tokenizer should build from synthetic GGUF metadata");
+
+        let encoding = tokenizer
+            .encode("hi there", false)
+            .expect("encoding should succeed");
+        let ids = encoding.get_ids();
+        assert!(!ids.is_empty(), "encoding should produce at least one id");
+
+        // With add_space_prefix = false (PrependScheme::Never), the first token
+        // must not gain a leading metaspace marker that wasn't in the input.
+        let first_token = tokenizer
+            .id_to_token(ids[0])
+            .expect("first id maps to a token");
+        assert!(
+            !first_token.starts_with('▁'),
+            "leading token `{first_token}` should not carry a metaspace prefix \
+             when add_space_prefix is false"
+        );
+
+        let decoded = tokenizer
+            .decode(ids, true)
+            .expect("decoding should succeed");
+        assert_eq!(decoded, "hi there");
+    }
+
+    #[test]
+    fn gguf_bos_token_to_prepend_reads_gemma4_add_bos_token_metadata() {
+        let content = gemma4_content();
+        assert_eq!(gguf_bos_token_to_prepend(&content), Some(2));
+    }
+
+    #[test]
+    fn gguf_bos_token_to_prepend_is_none_when_add_bos_token_is_absent() {
+        let content = gpt2_content();
+        assert_eq!(gguf_bos_token_to_prepend(&content), None);
+    }
+
+    #[test]
+    fn prepend_bos_if_configured_inserts_missing_bos() {
+        let mut input_ids = vec![10, 11, 12];
+        prepend_bos_if_configured(&mut input_ids, Some(2));
+        assert_eq!(input_ids, vec![2, 10, 11, 12]);
+    }
+
+    #[test]
+    fn prepend_bos_if_configured_is_noop_when_bos_already_present() {
+        let mut input_ids = vec![2, 10, 11, 12];
+        prepend_bos_if_configured(&mut input_ids, Some(2));
+        assert_eq!(input_ids, vec![2, 10, 11, 12]);
+    }
+
+    #[test]
+    fn prepend_bos_if_configured_is_noop_when_bos_token_id_is_none() {
+        let mut input_ids = vec![10, 11, 12];
+        prepend_bos_if_configured(&mut input_ids, None);
+        assert_eq!(input_ids, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn unsupported_tokenizer_model_is_rejected() {
+        let content = unsupported_content();
+        let err = tokenizer_from_gguf_content(&content)
+            .expect_err("unrecognized tokenizer.ggml.model must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("made-up-model"),
+            "error message `{message}` should mention the unsupported model kind"
+        );
+    }
+
+    #[test]
+    fn gpt2_tokenizer_model_delegates_to_candle() {
+        let content = gpt2_content();
+        // The gpt2 branch must delegate to candle's own
+        // `TokenizerFromGguf::from_gguf`, which builds successfully for this
+        // minimal-but-valid gpt2 metadata.
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("gpt2 metadata should be handled by candle's existing implementation");
+        assert!(tokenizer.get_vocab_size(false) >= 4);
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk"]
+    fn real_gemma4_gguf_round_trips_hello_world() {
+        let path =
+            Path::new("/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let mut file = fs::File::open(path).expect("open real gemma4 gguf");
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .expect("read real gemma4 gguf metadata");
+
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("build tokenizer from real gemma4 gguf metadata");
+
+        let encoding = tokenizer
+            .encode("Hello, world!", false)
+            .expect("encode real text");
+        let ids = encoding.get_ids().to_vec();
+        let decoded = tokenizer.decode(&ids, true).expect("decode real text");
+
+        eprintln!("ids: {ids:?}");
+        eprintln!("decoded: {decoded:?}");
+        assert_eq!(decoded, "Hello, world!");
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk"]
+    fn real_gemma4_gguf_chat_input_ids_begin_with_bos_token() {
+        let path =
+            Path::new("/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let mut file = fs::File::open(path).expect("open real gemma4 gguf");
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .expect("read real gemma4 gguf metadata");
+
+        let tokenizer = tokenizer_from_gguf_content(&content)
+            .expect("build tokenizer from real gemma4 gguf metadata");
+        let bos_token_id = gguf_bos_token_to_prepend(&content);
+        assert_eq!(
+            bos_token_id,
+            Some(2),
+            "gemma4 GGUF should configure bos_token_id=2 with add_bos_token=true"
+        );
+
+        let messages = vec![NativeChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::String(
+                "Say hello in one short sentence.".to_string(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let prompt = gemma_chat_input(&messages);
+        let encoding = tokenizer.encode(prompt, false).expect("encode chat prompt");
+        let mut input_ids = encoding.get_ids().to_vec();
+        prepend_bos_if_configured(&mut input_ids, bos_token_id);
+
+        eprintln!("input_ids: {input_ids:?}");
+        assert_eq!(
+            input_ids.first().copied(),
+            Some(2),
+            "constructed input_ids should begin with the gemma BOS token id (2)"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk and runs a full 12B forward pass"]
+    fn real_gemma4_generation_produces_non_garbage_output() {
+        let model_path =
+            Path::new("/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf");
+        if !model_path.exists() {
+            eprintln!("skipping: {} not present", model_path.display());
+            return;
+        }
+
+        let artifacts = CandleArtifactValidation {
+            model_family: CandleModelFamily::Gemma4,
+            model_format: NativeModelFormat::Gguf,
+            layout: CandleArtifactLayout::for_format(NativeModelFormat::Gguf),
+            weight_files: vec![artifact_file_name(model_path)],
+            tokenizer_file: None,
+            config_file: None,
+        };
+
+        let decoder = load_real_candle_decoder(CandleModelFamily::Gemma4, model_path, &artifacts)
+            .expect("load real gemma4 candle decoder from GGUF");
+
+        let request = NativeChatRequest {
+            model: "gemma4:12b".to_string(),
+            messages: vec![NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String(
+                    "Say hello in one short sentence.".to_string(),
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            max_tokens: Some(32),
+            tools: None,
+            tool_choice: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let output = decoder
+            .generate(&request)
+            .expect("real gemma4 generation should succeed");
+
+        eprintln!("decoded output: {output:?}");
+        assert!(!output.is_empty(), "decoded output should be non-empty");
+        assert!(
+            output.chars().any(|ch| ch.is_ascii_alphabetic()),
+            "decoded output `{output}` should contain at least one ASCII letter, \
+             got what looks like garbage/replacement-character output"
+        );
+    }
+}
+
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers", test))]
+mod quantized_gemma4_tests {
+    use super::quantized_gemma4;
+    use candle_core::quantized::gguf_file::{
+        Content, TensorInfo, Value as GgufValue, VersionedMagic,
+    };
+    use candle_core::quantized::GgmlDType;
+    use candle_core::{Device, Shape};
+    use std::collections::HashMap;
+    use std::io::Cursor;
+
+    /// Synthetic gemma4 GGUF config: 2 layers, layer 0 sliding (local) and
+    /// layer 1 global, mirroring the real model's alternating attention
+    /// pattern but at a tiny scale.
+    const EMBEDDING_LENGTH: usize = 8;
+    const HEAD_COUNT: usize = 2;
+    const KEY_LENGTH: usize = 4; // global head_dim
+    const KEY_LENGTH_SWA: usize = 2; // sliding head_dim
+    const FFN_DIM: usize = 6;
+    const VOCAB_SIZE: usize = 10;
+    const BLOCK_COUNT: usize = 2;
+
+    /// Appends an F32 tensor (raw little-endian bytes) to `data` and records
+    /// a matching [`TensorInfo`] entry in `tensor_infos`.
+    fn push_tensor(
+        data: &mut Vec<u8>,
+        tensor_infos: &mut HashMap<String, TensorInfo>,
+        name: &str,
+        shape: &[usize],
+    ) {
+        let elem_count: usize = shape.iter().product();
+        let offset = data.len() as u64;
+        for i in 0..elem_count {
+            // Small deterministic values keep RmsNorm/softmax well-behaved.
+            let value = 0.01 * (i as f32 + 1.0);
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        tensor_infos.insert(
+            name.to_string(),
+            TensorInfo {
+                ggml_dtype: GgmlDType::F32,
+                shape: Shape::from(shape.to_vec()),
+                offset,
+            },
+        );
+    }
+
+    /// Builds a synthetic `gemma4` GGUF [`Content`] plus its backing tensor
+    /// data, with `block_count` layers alternating sliding/global per
+    /// `sliding_window_pattern`.
+    fn gemma4_content_and_data(
+        head_count_kv: &[u32],
+        sliding_window_pattern: &[u32],
+    ) -> (Content, Cursor<Vec<u8>>) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "gemma4.block_count".to_string(),
+            GgufValue::U32(BLOCK_COUNT as u32),
+        );
+        metadata.insert(
+            "gemma4.embedding_length".to_string(),
+            GgufValue::U32(EMBEDDING_LENGTH as u32),
+        );
+        metadata.insert(
+            "gemma4.attention.head_count".to_string(),
+            GgufValue::U32(HEAD_COUNT as u32),
+        );
+        metadata.insert(
+            "gemma4.attention.key_length".to_string(),
+            GgufValue::U32(KEY_LENGTH as u32),
+        );
+        metadata.insert(
+            "gemma4.attention.value_length".to_string(),
+            GgufValue::U32(KEY_LENGTH as u32),
+        );
+        metadata.insert(
+            "gemma4.attention.key_length_swa".to_string(),
+            GgufValue::U32(KEY_LENGTH_SWA as u32),
+        );
+        metadata.insert(
+            "gemma4.attention.value_length_swa".to_string(),
+            GgufValue::U32(KEY_LENGTH_SWA as u32),
+        );
+        metadata.insert(
+            "gemma4.attention.layer_norm_rms_epsilon".to_string(),
+            GgufValue::F32(1e-6),
+        );
+        metadata.insert(
+            "gemma4.attention.sliding_window".to_string(),
+            GgufValue::U32(4),
+        );
+        metadata.insert(
+            "gemma4.rope.freq_base".to_string(),
+            GgufValue::F32(1_000_000.0),
+        );
+        metadata.insert(
+            "gemma4.rope.freq_base_swa".to_string(),
+            GgufValue::F32(10_000.0),
+        );
+        metadata.insert(
+            "gemma4.attention.head_count_kv".to_string(),
+            GgufValue::Array(head_count_kv.iter().copied().map(GgufValue::U32).collect()),
+        );
+        metadata.insert(
+            "gemma4.attention.sliding_window_pattern".to_string(),
+            GgufValue::Array(
+                sliding_window_pattern
+                    .iter()
+                    .copied()
+                    .map(GgufValue::U32)
+                    .collect(),
+            ),
+        );
+
+        let mut data = Vec::new();
+        let mut tensor_infos = HashMap::new();
+
+        push_tensor(
+            &mut data,
+            &mut tensor_infos,
+            "token_embd.weight",
+            &[VOCAB_SIZE, EMBEDDING_LENGTH],
+        );
+        push_tensor(
+            &mut data,
+            &mut tensor_infos,
+            "output_norm.weight",
+            &[EMBEDDING_LENGTH],
+        );
+        push_tensor(
+            &mut data,
+            &mut tensor_infos,
+            "output.weight",
+            &[VOCAB_SIZE, EMBEDDING_LENGTH],
+        );
+
+        for (layer_idx, &pattern) in sliding_window_pattern.iter().enumerate() {
+            let head_dim = if pattern == 1 {
+                KEY_LENGTH_SWA
+            } else {
+                KEY_LENGTH
+            };
+            let n_kv_head = head_count_kv[layer_idx] as usize;
+            let q_dim = HEAD_COUNT * head_dim;
+            let kv_dim = n_kv_head * head_dim;
+            let prefix = format!("blk.{layer_idx}");
+
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.attn_q.weight"),
+                &[q_dim, EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.attn_k.weight"),
+                &[kv_dim, EMBEDDING_LENGTH],
+            );
+            // Global (non-sliding) layers have no `attn_v.weight` in the real
+            // GGUF; mirror that here so the fixture exercises the
+            // `Vcur = Kcur` fallback path.
+            if pattern == 1 {
+                push_tensor(
+                    &mut data,
+                    &mut tensor_infos,
+                    &format!("{prefix}.attn_v.weight"),
+                    &[kv_dim, EMBEDDING_LENGTH],
+                );
+            }
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.attn_output.weight"),
+                &[EMBEDDING_LENGTH, q_dim],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.attn_q_norm.weight"),
+                &[head_dim],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.attn_k_norm.weight"),
+                &[head_dim],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.attn_norm.weight"),
+                &[EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.post_attention_norm.weight"),
+                &[EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.ffn_norm.weight"),
+                &[EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.post_ffw_norm.weight"),
+                &[EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.layer_output_scale.weight"),
+                &[1],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.ffn_gate.weight"),
+                &[FFN_DIM, EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.ffn_up.weight"),
+                &[FFN_DIM, EMBEDDING_LENGTH],
+            );
+            push_tensor(
+                &mut data,
+                &mut tensor_infos,
+                &format!("{prefix}.ffn_down.weight"),
+                &[EMBEDDING_LENGTH, FFN_DIM],
+            );
+        }
+
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos,
+            tensor_data_offset: 0,
+        };
+        (content, Cursor::new(data))
+    }
+
+    #[test]
+    fn from_gguf_builds_model_with_alternating_sliding_and_global_layers() {
+        let (content, mut reader) = gemma4_content_and_data(&[1, 1], &[1, 0]);
+        let device = Device::Cpu;
+
+        let mut model = quantized_gemma4::ModelWeights::from_gguf(content, &mut reader, &device)
+            .expect("synthetic gemma4 GGUF should build successfully");
+
+        let input = candle_core::Tensor::new(&[1u32, 2u32, 3u32], &device)
+            .and_then(|t| t.reshape((1, 3)))
+            .expect("input tensor");
+
+        let logits = model
+            .forward(&input, 0)
+            .expect("forward pass on synthetic gemma4 model should succeed");
+
+        assert_eq!(logits.dims(), &[1, VOCAB_SIZE]);
+    }
+
+    #[test]
+    fn from_gguf_rejects_missing_head_count_kv_array() {
+        let (mut content, mut reader) = gemma4_content_and_data(&[1, 1], &[1, 0]);
+        content.metadata.remove("gemma4.attention.head_count_kv");
+        let device = Device::Cpu;
+
+        let err = quantized_gemma4::ModelWeights::from_gguf(content, &mut reader, &device)
+            .expect_err("missing head_count_kv array must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("attention.head_count_kv"),
+            "error message `{message}` should mention the missing key"
+        );
+    }
+
+    #[test]
+    fn from_gguf_rejects_wrong_length_sliding_window_pattern() {
+        let (mut content, mut reader) = gemma4_content_and_data(&[1, 1], &[1, 0]);
+        // Replace with an array of the wrong length (1 element instead of 2).
+        content.metadata.insert(
+            "gemma4.attention.sliding_window_pattern".to_string(),
+            GgufValue::Array(vec![GgufValue::U32(1)]),
+        );
+        let device = Device::Cpu;
+
+        let err = quantized_gemma4::ModelWeights::from_gguf(content, &mut reader, &device)
+            .expect_err("wrong-length sliding_window_pattern array must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("sliding_window_pattern"),
+            "error message `{message}` should mention the offending key"
+        );
+        assert!(
+            message.contains("expected 2"),
+            "error message `{message}` should mention the expected length"
+        );
+    }
+
+    #[test]
+    fn from_gguf_rejects_non_array_head_count_kv() {
+        let (mut content, mut reader) = gemma4_content_and_data(&[1, 1], &[1, 0]);
+        content.metadata.insert(
+            "gemma4.attention.head_count_kv".to_string(),
+            GgufValue::U32(1),
+        );
+        let device = Device::Cpu;
+
+        let err = quantized_gemma4::ModelWeights::from_gguf(content, &mut reader, &device)
+            .expect_err("non-array head_count_kv must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("head_count_kv"),
+            "error message `{message}` should mention the offending key"
+        );
+        assert!(
+            message.contains("not an array"),
+            "error message `{message}` should explain it is not an array"
+        );
+    }
+
+    #[cfg(feature = "llama-cpp-native")]
+    mod llama_cpp_tests {
+        use super::super::{LlamaCppNativeEngine, NativeEngine};
+
+        #[test]
+        fn load_rejects_missing_path() {
+            let result = LlamaCppNativeEngine::load(
+                "test".to_string(),
+                std::path::Path::new("/nonexistent/model.gguf"),
+                32,
+            );
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("not found") || msg.contains("nonexistent"),
+                "error message `{msg}` should mention missing path"
+            );
+        }
+
+        #[test]
+        fn load_stores_alias_and_gpu_layers() {
+            use tempfile::NamedTempFile;
+            let tmp = NamedTempFile::new().expect("create temp file");
+            let engine = LlamaCppNativeEngine {
+                alias: "my-model".to_string(),
+                model_path: tmp.path().to_owned(),
+                gpu_layers: 32,
+            };
+            assert_eq!(engine.model_alias(), "my-model");
+            assert_eq!(engine.gpu_layers, 32);
+        }
+
+        #[test]
+        fn llama_cpp_native_engine_implements_native_engine_trait() {
+            fn assert_native_engine<T: crate::native::NativeEngine>() {}
+            assert_native_engine::<LlamaCppNativeEngine>();
+        }
+
+        #[test]
+        fn arc_from_box_dyn_engine_preserves_alias() {
+            use std::sync::Arc;
+            use tempfile::NamedTempFile;
+            let tmp = NamedTempFile::new().expect("temp file");
+            let engine =
+                LlamaCppNativeEngine::load("registry-alias".to_string(), tmp.path(), 0).unwrap();
+            let boxed: Box<dyn NativeEngine> = Box::new(engine);
+            let arc: Arc<dyn NativeEngine> = Arc::from(boxed);
+            assert_eq!(arc.model_alias(), "registry-alias");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the real gemma-4-12b-it-Q4_K_M.gguf model file on disk"]
+    fn real_gemma4_gguf_constructs_model_and_runs_forward() {
+        let path = std::path::Path::new(
+            "/home/morgan/.local/share/milliways/models/gemma-4-12b-it-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let mut file = std::fs::File::open(path).expect("open real gemma4 gguf");
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .expect("read real gemma4 gguf metadata");
+        let device = Device::Cpu;
+
+        let mut model = quantized_gemma4::ModelWeights::from_gguf(content, &mut file, &device)
+            .expect("construct quantized gemma4 model from real GGUF weights");
+
+        let input = candle_core::Tensor::new(&[2u32, 3u32], &device)
+            .and_then(|t| t.reshape((1, 2)))
+            .expect("input tensor");
+
+        let logits = model
+            .forward(&input, 0)
+            .expect("forward pass on real gemma4 model should succeed");
+
+        eprintln!("logits dims: {:?}", logits.dims());
+        assert_eq!(logits.dims().len(), 2);
+        assert_eq!(logits.dims()[0], 1);
+        assert!(logits.dims()[1] > 0);
     }
 }

@@ -24,6 +24,7 @@ mod gemma4_gguf;
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 pub mod tier;
 
+pub mod amd;
 pub mod audit;
 pub mod config;
 pub mod contracts;
@@ -33,8 +34,10 @@ pub mod integrations;
 pub mod model;
 pub mod native;
 pub mod observability;
+pub mod profiles;
 pub mod quota;
 pub mod rag;
+pub mod readiness;
 pub mod reporting;
 pub mod resources;
 pub mod runtime;
