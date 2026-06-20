@@ -669,6 +669,59 @@ pub fn gen_ai_thinking_ratio_gauge() -> &'static Gauge<f64> {
     })
 }
 
+/// Returns the gauge that tracks the KV-cache occupancy ratio for one model worker.
+///
+/// Records values in the range `[0.0, 1.0]` where `1.0` means the cache is
+/// completely full.  Tagged with `gen_ai.request.model`.
+pub fn gen_ai_kv_cache_usage_ratio_gauge() -> &'static Gauge<f64> {
+    static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        global::meter(crate::SERVICE_NAME)
+            .f64_gauge("gen_ai.kv_cache.usage_ratio")
+            .with_description("KV-cache occupancy ratio per model worker (0.0 = empty, 1.0 = full)")
+            .build()
+    })
+}
+
+/// Adds a `gen_ai.thinking.started` event to the current span.
+///
+/// Call this when the model begins emitting thinking-phase tokens.
+pub fn emit_gen_ai_thinking_phase_started(model: &str, position: u64) {
+    use opentelemetry::trace::get_active_span;
+    get_active_span(|span| {
+        span.add_event(
+            "gen_ai.thinking.started",
+            vec![
+                KeyValue::new("gen_ai.request.model", model.to_string()),
+                KeyValue::new(
+                    "gen_ai.token.position",
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                ),
+            ],
+        );
+    });
+}
+
+/// Adds a `gen_ai.thinking.ended` event to the current span.
+///
+/// Call this when the model stops emitting thinking-phase tokens.
+pub fn emit_gen_ai_thinking_phase_ended(model: &str, thinking_tokens: u64, duration_seconds: f64) {
+    use opentelemetry::trace::get_active_span;
+    get_active_span(|span| {
+        span.add_event(
+            "gen_ai.thinking.ended",
+            vec![
+                KeyValue::new("gen_ai.request.model", model.to_string()),
+                KeyValue::new(
+                    "gen_ai.thinking.tokens",
+                    i64::try_from(thinking_tokens).unwrap_or(i64::MAX),
+                ),
+                KeyValue::new("gen_ai.thinking.duration_s", duration_seconds),
+            ],
+        );
+    });
+}
+
 /// Emits `gen_ai.thinking_tokens` and `gen_ai.thinking_ratio` metrics for one
 /// completed inference request, tagged with the serving model name.
 pub fn emit_gen_ai_thinking_metrics(model: &str, thinking_deltas: u64, output_deltas: u64) {
@@ -1042,5 +1095,28 @@ mod tests {
     #[test]
     fn emit_gen_ai_thinking_metrics_does_not_panic_on_zero_deltas() {
         emit_gen_ai_thinking_metrics("test-model", 0, 0);
+    }
+
+    #[test]
+    fn gen_ai_kv_cache_usage_ratio_gauge_returns_stable_reference() {
+        let g1 = gen_ai_kv_cache_usage_ratio_gauge();
+        let g2 = gen_ai_kv_cache_usage_ratio_gauge();
+        // Both references must point to the same static gauge (pointer equality).
+        assert!(std::ptr::eq(g1, g2));
+        // Recording must not panic.
+        g1.record(
+            0.42,
+            &[opentelemetry::KeyValue::new("gen_ai.request.model", "test")],
+        );
+    }
+
+    #[test]
+    fn emit_gen_ai_thinking_phase_started_does_not_panic() {
+        emit_gen_ai_thinking_phase_started("test-model", 0);
+    }
+
+    #[test]
+    fn emit_gen_ai_thinking_phase_ended_does_not_panic() {
+        emit_gen_ai_thinking_phase_ended("test-model", 128, 1.5);
     }
 }
