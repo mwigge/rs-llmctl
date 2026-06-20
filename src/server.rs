@@ -34,6 +34,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperBuilder;
 use hyper_util::service::TowerToHyperService;
 use opentelemetry::global;
+use opentelemetry::trace::{Span, SpanKind, Tracer};
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1626,8 +1627,12 @@ async fn chat_completions(
         }
     };
 
-    if route.external_provider.is_some() {
+    let has_subprocess_upstream =
+        state.upstreams.contains_key(&route.upstream_alias) || state.upstreams.contains_key("*");
+
+    if route.external_provider.is_some() || has_subprocess_upstream {
         let tool_audit = request.tool_audit_detail();
+        let gen_ai = gen_ai_params_from_request(&request);
         let upstream_timeout = model_upstream_timeout(&state, &model);
         return match dispatch_chat_request(
             &state, &route, &body, request_id, &principal, &model, started,
@@ -1648,6 +1653,7 @@ async fn chat_completions(
                         tool_audit,
                         started,
                         admission,
+                        gen_ai,
                     },
                 )
                 .await
@@ -1666,6 +1672,7 @@ async fn chat_completions(
                         tool_audit,
                         started,
                         admission,
+                        gen_ai,
                     },
                 )
                 .await
@@ -2303,6 +2310,19 @@ async fn retry_after_delay(response: &reqwest::Response) {
     tokio::time::sleep(delay).await;
 }
 
+/// Extracted gen_ai semantic-convention request parameters for lifecycle span
+/// instrumentation.  Fields are bounded to prevent large allocations from
+/// prompt-heavy payloads.
+#[derive(Debug, Clone, Default)]
+struct GenAiRequestParams {
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    /// First `system` role message body, truncated to 1 000 chars.
+    system_message: Option<String>,
+    /// Last `user` role message body, truncated to 1 000 chars.
+    user_message: Option<String>,
+}
+
 struct UpstreamRequestContext {
     request_id: Uuid,
     principal: Principal,
@@ -2313,6 +2333,29 @@ struct UpstreamRequestContext {
     tool_audit: ToolAuditDetail,
     started: Instant,
     admission: AdmissionPermit,
+    gen_ai: GenAiRequestParams,
+}
+
+/// Extracts gen_ai observability parameters from a [`ChatCompletionRequest`].
+///
+/// Message bodies are truncated to 1 000 chars to bound span payload size.
+fn gen_ai_params_from_request(request: &ChatCompletionRequest) -> GenAiRequestParams {
+    let system_message = request
+        .messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| native::message_content_text(m).chars().take(1000).collect());
+    let user_message = request
+        .messages
+        .iter()
+        .rfind(|m| m.role == "user")
+        .map(|m| native::message_content_text(m).chars().take(1000).collect());
+    GenAiRequestParams {
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+        system_message,
+        user_message,
+    }
 }
 
 async fn json_upstream(
@@ -2330,6 +2373,7 @@ async fn json_upstream(
         tool_audit,
         started,
         admission: _admission,
+        gen_ai: _gen_ai,
     } = context;
     let status = upstream_response.status();
     let headers = response_headers(upstream_response.headers());
@@ -2435,6 +2479,7 @@ async fn stream_upstream(
         tool_audit,
         started,
         admission,
+        gen_ai,
     } = context;
     let status = upstream_response.status();
     if !status.is_success() {
@@ -2483,11 +2528,15 @@ async fn stream_upstream(
     let response_upstream_model = upstream_model.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
     let idle_timeout = upstream_timeout;
+    let capture_content = state.cfg.observability.gen_ai.capture_message_content;
     let stream = async_stream::stream! {
         let _admission = admission;
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut usage_parser = SseUsageParser::default();
+        let mut content_parser = crate::observability::SseContentParser::default();
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let mut last_token_instant: Option<std::time::Instant> = None;
         loop {
             let chunk = match timeout(idle_timeout, upstream_stream.next()).await {
                 Ok(Some(chunk)) => chunk,
@@ -2535,6 +2584,15 @@ async fn stream_upstream(
             };
             match chunk {
                 Ok(bytes) => {
+                    content_parser.push(&bytes);
+                    let total_content = content_parser.output_deltas()
+                        .saturating_add(content_parser.thinking_deltas());
+                    if first_token_instant.is_none() && total_content > 0 {
+                        first_token_instant = Some(std::time::Instant::now());
+                    }
+                    if total_content > 0 {
+                        last_token_instant = Some(std::time::Instant::now());
+                    }
                     match usage_parser.push(&bytes) {
                         Ok((input, output)) => {
                             input_tokens = input_tokens.saturating_add(input);
@@ -2627,6 +2685,24 @@ async fn stream_upstream(
                 }
             }
         }
+        emit_gen_ai_inference_span(
+            &model,
+            &gen_ai,
+            input_tokens,
+            output_tokens,
+            content_parser.thinking_deltas(),
+            content_parser.output_deltas(),
+            started,
+            first_token_instant,
+            last_token_instant,
+            stream_status(input_tokens, output_tokens),
+            capture_content,
+        );
+        crate::observability::emit_gen_ai_thinking_metrics(
+            &model,
+            content_parser.thinking_deltas(),
+            content_parser.output_deltas(),
+        );
         record_usage(
             &state,
             UsageRecordInput {
@@ -3721,6 +3797,107 @@ fn usage_span_attributes(
             json!(event.output_tokens),
         ),
     ])
+}
+
+/// Emits a `gen_ai.chat` lifecycle span covering one complete inference request.
+///
+/// Span attributes follow the OTel GenAI semantic conventions.  Message content
+/// is included only when `capture_content` is `true`; otherwise the body is
+/// replaced with `[REDACTED]`.
+#[allow(clippy::too_many_arguments)] // all parameters carry distinct domain meaning
+fn emit_gen_ai_inference_span(
+    model: &str,
+    gen_ai: &GenAiRequestParams,
+    input_tokens: u64,
+    output_tokens: u64,
+    thinking_deltas: u64,
+    output_deltas: u64,
+    started: std::time::Instant,
+    first_token_instant: Option<std::time::Instant>,
+    last_token_instant: Option<std::time::Instant>,
+    status: &str,
+    capture_content: bool,
+) {
+    let tracer = global::tracer(crate::SERVICE_NAME);
+    let start_system_time = std::time::SystemTime::now()
+        .checked_sub(started.elapsed())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut span = tracer
+        .span_builder("gen_ai.chat")
+        .with_kind(SpanKind::Server)
+        .with_start_time(start_system_time)
+        .start(&tracer);
+
+    span.set_attribute(KeyValue::new("gen_ai.system", "local"));
+    span.set_attribute(KeyValue::new("gen_ai.operation.name", "chat"));
+    span.set_attribute(KeyValue::new("gen_ai.request.model", model.to_string()));
+    span.set_attribute(KeyValue::new("gen_ai.response.model", model.to_string()));
+    span.set_attribute(KeyValue::new(
+        "gen_ai.usage.input_tokens",
+        i64::try_from(input_tokens).unwrap_or(i64::MAX),
+    ));
+    span.set_attribute(KeyValue::new(
+        "gen_ai.usage.output_tokens",
+        i64::try_from(output_tokens).unwrap_or(i64::MAX),
+    ));
+    span.set_attribute(KeyValue::new(
+        "gen_ai.usage.thinking_tokens",
+        i64::try_from(thinking_deltas).unwrap_or(i64::MAX),
+    ));
+    span.set_attribute(KeyValue::new(
+        "gen_ai.usage.output_deltas",
+        i64::try_from(output_deltas).unwrap_or(i64::MAX),
+    ));
+    span.set_attribute(KeyValue::new("llmctl.status", status.to_string()));
+
+    if let Some(max_tokens) = gen_ai.max_tokens {
+        span.set_attribute(KeyValue::new(
+            "gen_ai.request.max_tokens",
+            i64::from(max_tokens),
+        ));
+    }
+    if let Some(temp) = gen_ai.temperature {
+        span.set_attribute(KeyValue::new("gen_ai.request.temperature", f64::from(temp)));
+    }
+
+    if let (Some(first), Some(last)) = (first_token_instant, last_token_instant) {
+        let ttft_secs = first.saturating_duration_since(started).as_secs_f64();
+        let decode_secs = last.saturating_duration_since(first).as_secs_f64();
+        span.set_attribute(KeyValue::new("gen_ai.ttft_seconds", ttft_secs));
+        if decode_secs > 0.0 {
+            let throughput = output_deltas as f64 / decode_secs;
+            span.set_attribute(KeyValue::new(
+                "gen_ai.decode_throughput_deltas_per_second",
+                throughput,
+            ));
+        }
+    }
+
+    let redacted = crate::observability::REDACTED_ATTRIBUTE_VALUE;
+    if let Some(sys) = &gen_ai.system_message {
+        let body = if capture_content {
+            sys.as_str()
+        } else {
+            redacted
+        };
+        span.add_event(
+            "gen_ai.system.message",
+            vec![KeyValue::new("body", body.to_string())],
+        );
+    }
+    if let Some(user) = &gen_ai.user_message {
+        let body = if capture_content {
+            user.as_str()
+        } else {
+            redacted
+        };
+        span.add_event(
+            "gen_ai.user.message",
+            vec![KeyValue::new("body", body.to_string())],
+        );
+    }
+
+    span.end();
 }
 
 /// JSON payload delivered to the configured usage webhook — the same
@@ -5492,6 +5669,98 @@ mod tests {
             family: Some("qwen3".to_string()),
             weight,
         }
+    }
+
+    fn make_chat_request(messages: Vec<native::NativeChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages,
+            temperature: Some(0.7),
+            max_tokens: Some(512),
+            stream: false,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    #[test]
+    fn gen_ai_params_extracts_system_and_user_messages() {
+        use serde_json::json;
+        let request = make_chat_request(vec![
+            native::NativeChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("You are helpful.")),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            native::NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("Hello")),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+        let params = gen_ai_params_from_request(&request);
+        assert_eq!(params.system_message.as_deref(), Some("You are helpful."));
+        assert_eq!(params.user_message.as_deref(), Some("Hello"));
+        assert_eq!(params.max_tokens, Some(512));
+        assert!((params.temperature.unwrap() - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn gen_ai_params_truncates_long_messages_to_1000_chars() {
+        use serde_json::json;
+        let long_text: String = "x".repeat(2000);
+        let request = make_chat_request(vec![native::NativeChatMessage {
+            role: "user".to_string(),
+            content: Some(json!(long_text)),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        let params = gen_ai_params_from_request(&request);
+        assert_eq!(params.user_message.as_ref().map(|s| s.len()), Some(1000));
+    }
+
+    #[test]
+    fn gen_ai_params_finds_last_user_message() {
+        use serde_json::json;
+        let request = make_chat_request(vec![
+            native::NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("first")),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            native::NativeChatMessage {
+                role: "assistant".to_string(),
+                content: Some(json!("response")),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            native::NativeChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("last")),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+        let params = gen_ai_params_from_request(&request);
+        assert_eq!(params.user_message.as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn gen_ai_params_returns_none_for_missing_roles() {
+        use serde_json::json;
+        let request = make_chat_request(vec![native::NativeChatMessage {
+            role: "assistant".to_string(),
+            content: Some(json!("I can help.")),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        let params = gen_ai_params_from_request(&request);
+        assert!(params.system_message.is_none());
+        assert!(params.user_message.is_none());
     }
 }
 

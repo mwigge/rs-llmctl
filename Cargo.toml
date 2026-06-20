@@ -44,6 +44,8 @@ gpu-cuda = [
 # specifically the non-canonical-head_dim Mistrals (Devstral, Mistral Small)
 # and Metal-MoE workloads. See docs/native-gguf-internals.md.
 mistral-rs = ["dep:mistralrs"]
+# `llama-cpp-native`: opt-in llama.cpp binding backend via llama-cpp-2 crate.
+llama-cpp-native = ["dep:llama-cpp-2", "dep:encoding_rs"]
 
 [dependencies]
 anyhow = "1.0"
@@ -86,6 +88,8 @@ tokio-rustls = "0.26"
 tokio-stream = "0.1"
 toml = "0.8"
 tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["onig"] }
+llama-cpp-2 = { version = "0.1.150", optional = true, features = ["dynamic-backends"] }
+encoding_rs = { version = "0.8", optional = true }
 tonic = { version = "0.14.6", default-features = false }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }

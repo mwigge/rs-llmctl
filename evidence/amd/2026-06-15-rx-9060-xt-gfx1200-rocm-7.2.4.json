@@ -1,0 +1,81 @@
+{
+  "schema": "amd-rocm-qualification/v1",
+  "qualified": true,
+  "captured_at": "2026-06-15T07:21:38Z",
+  "backend": "rocm",
+  "support_tier": "milliways-arch-preview",
+  "host": {
+    "distribution": "CachyOS",
+    "distribution_family": "arch",
+    "kernel": "7.0.11-1-cachyos",
+    "gpu": "AMD Radeon RX 9060 XT",
+    "pci_device_id": "1002:7590",
+    "gfx_target": "gfx1200",
+    "vram_bytes": 17095983104
+  },
+  "runtime": {
+    "rocm_version": "7.2.4",
+    "hip_version": "7.2.53211-3d9ef42",
+    "driver": "7.0.11-1-cachyos",
+    "device_nodes": ["/dev/kfd", "/dev/dri/renderD128"]
+  },
+  "worker": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "source_revision": "5f04dc7ac3f40271f60105574be0f617887195bb",
+    "cmake": [
+      "-DGGML_HIP=ON",
+      "-DAMDGPU_TARGETS=gfx1200",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DLLAMA_CURL=OFF",
+      "-DLLAMA_BUILD_TESTS=ON"
+    ],
+    "llama_cli_sha256": "e0685bde7cbcd7cdbcad2ceae172246b68f3c232e568894866f7238498742ead",
+    "backend_ops_sha256": "b2d08a338fc54827bb8cafcd8630d30dca14076bdb8fd0523b4ed35a01d52a30",
+    "llama_bench_sha256": "e4b0d05ed0d377d05058b71d4150d088c952e6a49bbf24af011bfe035ef0c8d4"
+  },
+  "backend_operations": {
+    "backend": "ROCm0",
+    "passed": 1982,
+    "failed": 0,
+    "operations": ["GELU", "GEGLU", "MUL_MAT", "RMS_NORM", "ROPE", "SOFT_MAX", "ADD", "MUL"]
+  },
+  "model": {
+    "filename": "gemma-4-12b-it-Q4_K_M.gguf",
+    "sha256": "43fec98c5102b1c446b4ddd0a9439f1db3a2e1f2e0b8cd143ce1ea619a9403d6",
+    "size_bytes": 7106035904,
+    "parameters": 11907350576,
+    "quantization": "Q4_K_M"
+  },
+  "smoke": {
+    "prompt": "Say hello in one short sentence.",
+    "response": "Hello!",
+    "offloaded_layers": 49,
+    "total_layers": 49,
+    "cold_ready_ms": 2365.34,
+    "warm_request_ms": 2965.17,
+    "prompt_tokens_per_second": 149.71,
+    "decode_tokens_per_second": 32.01,
+    "model_gpu_mib": 6776.91,
+    "model_cpu_mapped_mib": 540.0,
+    "kv_cache_gpu_mib": 512.0,
+    "compute_gpu_mib": 125.52,
+    "peak_gpu_use_percent": 99,
+    "peak_vram_bytes": 9178537984
+  },
+  "benchmark": {
+    "prompt_tokens": 128,
+    "decode_tokens": 32,
+    "repetitions": 3,
+    "prompt_tokens_per_second_mean": 730.030476,
+    "decode_tokens_per_second_mean": 33.900727,
+    "decode_32_tokens_ms_mean": 944.284381,
+    "peak_gpu_use_percent": 100,
+    "peak_vram_bytes": 8729255936
+  },
+  "source_references": [
+    "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html",
+    "https://wiki.archlinux.org/title/General-purpose_computing_on_graphics_processing_units",
+    "https://github.com/meltingscales/cachyos-whitedragon-ai-lab/blob/main/LLAMA.CPP-ROCM-ARCH-INSTALL.md",
+    "https://brian.th3rogers.com/posts/strixhalo-cachyos/"
+  ]
+}

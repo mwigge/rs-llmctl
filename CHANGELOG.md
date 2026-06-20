@@ -53,6 +53,17 @@ operator behavior, packaging contents, service lifecycle, and verification.
     opinionated single-binary serve configs for the 6 GB NVIDIA tier
     and the 16-18 GB Mac / discrete-GPU tier.
 
+## 1.3.1 - 2026-06-14
+
+- Native: `gemma4` GGUF models (e.g. `gemma-4-12b-it`) now load through a new
+  per-layer-aware quantized model loader and a SentencePiece-metaspace BPE
+  tokenizer built from `tokenizer.ggml.model == "gemma4"` GGUF metadata.
+- Native: generation prompts for `gemma4` models now use the
+  `<start_of_turn>{role}\n...<end_of_turn>\n` chat template (with `system`
+  content folded into the first `user` turn), and the configured `<bos>`
+  token is prepended to the prompt's `input_ids` when the GGUF metadata
+  requests it (`tokenizer.ggml.add_bos_token = true`).
+
 ## 1.6.4 - 2026-06-17
 
 - Native generation: Qwen3 14B Q4_K_M is the new daily-driver tool-capable

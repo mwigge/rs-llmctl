@@ -23,7 +23,9 @@ use rs_llmctl::quota::{self, Principal};
 use rs_llmctl::reporting;
 use rs_llmctl::runtime;
 use rs_llmctl::storage::Storage;
-use rs_llmctl::worker::{StartupPlan, SwapPlan, WorkerId};
+use rs_llmctl::worker::{
+    StartupPlan, SwapPlan, TokioWorkerRunner, WorkerId, WorkerLaunchPlan, WorkerSupervisor,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -33,9 +35,11 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 const DEFAULT_SERVICE_NAME: &str = "llmctld.service";
@@ -122,6 +126,10 @@ enum Command {
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
+    },
+    Amd {
+        #[command(subcommand)]
+        command: AmdCommand,
     },
 }
 
@@ -255,6 +263,53 @@ enum ModelCommand {
     ImportManifest(ModelImportManifestArgs),
     Inventory,
     List,
+    Profile {
+        #[command(subcommand)]
+        command: ModelProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelProfileCommand {
+    List,
+    Inspect(ModelProfileAliasArgs),
+    ImportLocal(ModelProfileImportLocalArgs),
+    ImportCatalog(ModelProfileImportCatalogArgs),
+    Qualify(ModelProfileQualifyArgs),
+    Quarantine(ModelProfileQuarantineArgs),
+    Remove(ModelProfileAliasArgs),
+    Adapters,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileAliasArgs {
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileImportLocalArgs {
+    path: PathBuf,
+    #[arg(long)]
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileImportCatalogArgs {
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileQualifyArgs {
+    alias: String,
+    #[arg(long)]
+    available_vram_bytes: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct ModelProfileQuarantineArgs {
+    alias: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -301,6 +356,8 @@ enum RuntimeCommand {
     Heartbeat,
     Placement,
     Route(RuntimeRouteArgs),
+    AmdQualification(RuntimeAmdQualificationArgs),
+    Gemma4Readiness(RuntimeGemma4ReadinessArgs),
     ValidationPlan(RuntimeValidationPlanArgs),
     ValidationRun(RuntimeValidationRunArgs),
     Validate,
@@ -330,6 +387,26 @@ struct RuntimeValidationPlanArgs {
 struct RuntimeValidationRunArgs {
     #[arg(long)]
     evidence_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeGemma4ReadinessArgs {
+    #[arg(long)]
+    model_path: PathBuf,
+    #[arg(long, default_value = "gemma4")]
+    alias: String,
+    #[arg(long)]
+    evidence_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeAmdQualificationArgs {
+    #[arg(long)]
+    preview: bool,
+    #[arg(long, alias = "community-opt-in")]
+    arch_opt_in: bool,
+    #[arg(long)]
+    evidence: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -896,6 +973,33 @@ enum IntegrationCommand {
     AqeContract,
 }
 
+#[derive(Debug, Subcommand)]
+enum AmdCommand {
+    Qualify(AmdQualifyArgs),
+    InstallServer(AmdInstallServerArgs),
+}
+
+#[derive(Debug, Args)]
+struct AmdQualifyArgs {
+    #[arg(long)]
+    preview: bool,
+    #[arg(long, alias = "community-opt-in")]
+    arch_opt_in: bool,
+    #[arg(long)]
+    evidence: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct AmdInstallServerArgs {
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(
+        long,
+        help = "Path to install-amd-hip.sh (defaults to scripts/install-amd-hip.sh in cwd)"
+    )]
+    script: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct DataExportArgs {
     #[arg(long, default_value_t = 24)]
@@ -991,6 +1095,7 @@ async fn main() -> Result<()> {
         Command::Integration { command } => {
             integration_command(&config_path, command, cli.json).await
         }
+        Command::Amd { command } => amd_command(command, cli.json).await,
     }
 }
 
@@ -1558,23 +1663,71 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
         ServerCommand::Run => {
             config::validate_production_security(&cfg)?;
             let storage = init_storage(&cfg.storage).await?;
-            let engines = load_native_engines_from_config(&cfg)?;
+            let plan = StartupPlan::from_config(&cfg);
+            let has_subprocess = plan
+                .workers
+                .iter()
+                .any(|w| matches!(w.launch, WorkerLaunchPlan::LlamaServerSubprocess { .. }));
+
             let telemetry = TelemetryRuntime::install(&cfg, cfg.log.format == LogFormat::Json)?;
-            emit(
-                as_json,
-                &json!({
-                    "status": if engines.is_empty() { "no_models" } else { "ready" },
-                    "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
-                    "native_engines": engines.len()
-                }),
-            )?;
-            let result = rs_llmctl::server::serve_with_storage_and_native_engines(
-                cfg,
-                storage,
-                engines,
-                rs_llmctl::server::shutdown_signal(),
-            )
-            .await;
+
+            let result = if has_subprocess {
+                // AMD HIP path: llama-server subprocess handles all inference.
+                // Skip Candle engine loading entirely — attempting to Candle-load
+                // a 14B GGUF on CPU while the subprocess is serving it via GPU
+                // would waste RAM and time.
+                let mut supervisor = WorkerSupervisor::new(TokioWorkerRunner::new());
+                let statuses = supervisor.start_all(&plan).await;
+                let worker_count = statuses.len();
+                let worker_control = Arc::new(AsyncMutex::new(supervisor));
+                emit(
+                    as_json,
+                    &json!({
+                        "status": "ready",
+                        "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
+                        "backend": "llama-server-subprocess",
+                        "workers": worker_count,
+                        "native_engines": 0
+                    }),
+                )?;
+                rs_llmctl::server::serve_with_storage_worker_control_and_shutdown(
+                    cfg,
+                    storage,
+                    Some(worker_control),
+                    rs_llmctl::server::shutdown_signal(),
+                )
+                .await
+            } else {
+                let engines = load_native_engines_from_config(&cfg)?;
+                #[cfg(feature = "llama-cpp-native")]
+                let backend_label = if plan
+                    .workers
+                    .iter()
+                    .any(|w| matches!(w.launch, WorkerLaunchPlan::LlamaCppNative { .. }))
+                {
+                    "llama-cpp-native"
+                } else {
+                    "candle-native"
+                };
+                #[cfg(not(feature = "llama-cpp-native"))]
+                let backend_label = "candle-native";
+                emit(
+                    as_json,
+                    &json!({
+                        "status": if engines.is_empty() { "no_models" } else { "ready" },
+                        "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
+                        "backend": backend_label,
+                        "native_engines": engines.len()
+                    }),
+                )?;
+                rs_llmctl::server::serve_with_storage_and_native_engines(
+                    cfg,
+                    storage,
+                    engines,
+                    rs_llmctl::server::shutdown_signal(),
+                )
+                .await
+            };
             let shutdown = telemetry.shutdown();
             result.and(shutdown)
         }
@@ -1618,6 +1771,42 @@ fn load_native_engines_from_config(
         .iter()
         .filter(|model| model.weight > 0 && local_aliases.contains(&model.alias))
         .collect::<Vec<_>>();
+
+    // When the llama-cpp-native feature is compiled in, check whether the startup
+    // plan selected LlamaCppNative for any local model.  If it did, load those
+    // models via LlamaCppNativeEngine and return early — the Candle factory is not
+    // used on this code path.
+    #[cfg(feature = "llama-cpp-native")]
+    {
+        let startup_plan = StartupPlan::from_config(cfg);
+        let llama_cpp_by_alias: BTreeMap<String, u32> = startup_plan
+            .workers
+            .iter()
+            .filter_map(|pw| {
+                if let WorkerLaunchPlan::LlamaCppNative { gpu_layers } = &pw.launch {
+                    Some((pw.worker.id.as_str().to_string(), *gpu_layers))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !llama_cpp_by_alias.is_empty() {
+            let mut engines = rs_llmctl::server::NativeEngineRegistry::new();
+            for model in &models {
+                if let Some(&gpu_layers) = llama_cpp_by_alias.get(&model.alias) {
+                    let engine: Box<dyn native::NativeEngine> =
+                        Box::new(native::LlamaCppNativeEngine::load(
+                            model.alias.clone(),
+                            &model.path,
+                            gpu_layers,
+                        )?);
+                    engines.insert(model.alias.clone(), std::sync::Arc::from(engine));
+                }
+            }
+            return Ok(engines);
+        }
+    }
 
     let factory = native::NativeCandleEngineFactory::default();
     let mut engines = rs_llmctl::server::NativeEngineRegistry::new();
@@ -1728,6 +1917,16 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             } else {
                 "running"
             };
+            let readiness = model
+                .family
+                .as_deref()
+                .filter(|family| family.eq_ignore_ascii_case("gemma4"))
+                .map(|_| {
+                    rs_llmctl::readiness::read_state(&rs_llmctl::readiness::evidence_path(
+                        &cfg.storage.model_dir,
+                        &model.alias,
+                    ))
+                });
 
             emit(
                 as_json,
@@ -1740,6 +1939,7 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
                     "runtime_backend": &cfg.runtime.backend,
                     "one_binary": true,
                     "entrypoint": one_binary_entrypoint(),
+                    "readiness": readiness,
                     "model": model,
                 }),
             )
@@ -1873,6 +2073,65 @@ async fn model_command(path: &Path, command: ModelCommand, as_json: bool) -> Res
             emit(as_json, &inventory)
         }
         ModelCommand::List => emit(as_json, &cfg.models),
+        ModelCommand::Profile { command } => {
+            model_profile_command(&cfg.storage.model_dir, command, as_json).await
+        }
+    }
+}
+
+async fn model_profile_command(
+    model_dir: &Path,
+    command: ModelProfileCommand,
+    as_json: bool,
+) -> Result<()> {
+    match command {
+        ModelProfileCommand::List => emit(as_json, &rs_llmctl::profiles::list_profiles(model_dir)?),
+        ModelProfileCommand::Inspect(args) => emit(
+            as_json,
+            &rs_llmctl::profiles::read_profile(model_dir, &args.alias)?,
+        ),
+        ModelProfileCommand::ImportLocal(args) => {
+            let profile =
+                rs_llmctl::profiles::import_local_candidate(&args.path, &args.alias).await?;
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": "candidate", "path": path, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::ImportCatalog(args) => {
+            let profile = rs_llmctl::profiles::import_catalog_candidate(&args.id)?;
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": "candidate", "path": path, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::Qualify(args) => {
+            let profile = rs_llmctl::profiles::read_profile(model_dir, &args.alias)?;
+            let (profile, policy) =
+                rs_llmctl::profiles::qualify_profile(profile, args.available_vram_bytes);
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": profile.qualification, "path": path, "policy": policy, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::Quarantine(args) => {
+            let mut profile = rs_llmctl::profiles::read_profile(model_dir, &args.alias)?;
+            profile.qualification = rs_llmctl::profiles::QualificationStatus::Quarantined;
+            profile.quarantine_reason = Some(args.reason);
+            let path = rs_llmctl::profiles::write_profile(model_dir, &profile)?;
+            emit(
+                as_json,
+                &json!({"status": "quarantined", "path": path, "profile": profile}),
+            )
+        }
+        ModelProfileCommand::Remove(args) => {
+            rs_llmctl::profiles::remove_profile(model_dir, &args.alias)?;
+            emit(as_json, &json!({"status": "removed", "alias": args.alias}))
+        }
+        ModelProfileCommand::Adapters => emit(as_json, &rs_llmctl::profiles::backend_catalog()),
     }
 }
 
@@ -1940,6 +2199,25 @@ async fn runtime_command(path: &Path, command: RuntimeCommand, as_json: bool) ->
                 (Some(_), Some(_)) => unreachable!("clap enforces conflicts_with"),
             };
             emit(as_json, &selection)
+        }
+        RuntimeCommand::AmdQualification(args) => emit(
+            as_json,
+            &rs_llmctl::amd::qualification_report_with_evidence(
+                args.preview,
+                args.arch_opt_in,
+                args.evidence.as_deref(),
+            ),
+        ),
+        RuntimeCommand::Gemma4Readiness(args) => {
+            let evidence =
+                rs_llmctl::readiness::run_gemma4_readiness(&args.model_path, &args.alias).await?;
+            let evidence_path = args.evidence_output.unwrap_or_else(|| {
+                rs_llmctl::readiness::evidence_path(&cfg.storage.model_dir, &args.alias)
+            });
+            rs_llmctl::readiness::write_evidence(&evidence_path, &evidence)?;
+            let result = rs_llmctl::readiness::ensure_qualified(&evidence);
+            emit(as_json, &evidence)?;
+            result
         }
         RuntimeCommand::ValidationPlan(args) => emit(
             as_json,
@@ -2303,7 +2581,9 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
                 return Ok(());
             }
             if !args.replace {
-                bail!("rotate-key requires --new-id for overlap rotation or --replace for in-place replacement");
+                bail!(
+                    "rotate-key requires --new-id for overlap rotation or --replace for in-place replacement"
+                );
             }
             let key = &mut cfg.security.api_keys[position];
             key.sha256 = sha256;
@@ -2608,7 +2888,9 @@ async fn read_api_key_secret(args: SecurityHashKeyArgs) -> Result<(String, &'sta
         return Ok((secret.trim_end_matches(['\r', '\n']).to_string(), "stdin"));
     }
 
-    bail!("security hash-key requires --stdin or --env NAME so secrets are not exposed in process arguments")
+    bail!(
+        "security hash-key requires --stdin or --env NAME so secrets are not exposed in process arguments"
+    )
 }
 
 async fn observe_command(path: &Path, command: ObserveCommand, as_json: bool) -> Result<()> {
@@ -4428,6 +4710,45 @@ async fn integration_command(
     }
 }
 
+async fn amd_command(command: AmdCommand, as_json: bool) -> Result<()> {
+    match command {
+        AmdCommand::Qualify(args) => emit(
+            as_json,
+            &rs_llmctl::amd::qualification_report_with_evidence(
+                args.preview,
+                args.arch_opt_in,
+                args.evidence.as_deref(),
+            ),
+        ),
+        AmdCommand::InstallServer(args) => {
+            let script = args.script.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("scripts")
+                    .join("install-amd-hip.sh")
+            });
+            if !script.exists() {
+                bail!(
+                    "install script not found: {}  (set --script or run from the rs-llmctl repo root)",
+                    script.display()
+                );
+            }
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(&script);
+            if args.dry_run {
+                cmd.env("DRY_RUN", "1");
+            }
+            let status = cmd
+                .status()
+                .with_context(|| format!("failed to run {}", script.display()))?;
+            if !status.success() {
+                bail!("install script exited with status {status}");
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn load_config(path: &Path) -> Result<Config> {
     config::load(path)
         .await
@@ -4963,6 +5284,7 @@ struct ModelInventoryItem {
     weight: u32,
     path: String,
     updated_at: Option<chrono::DateTime<Utc>>,
+    readiness: Option<rs_llmctl::readiness::ReadinessState>,
 }
 
 async fn model_inventory(cfg: &Config, storage: &Storage) -> Result<ModelInventoryOutput> {
@@ -4984,6 +5306,16 @@ async fn model_inventory(cfg: &Config, storage: &Storage) -> Result<ModelInvento
                 weight: model.weight,
                 path: path_basename(&model.path),
                 updated_at: persisted.map(|record| record.updated_at),
+                readiness: model
+                    .family
+                    .as_deref()
+                    .filter(|family| family.eq_ignore_ascii_case("gemma4"))
+                    .map(|_| {
+                        rs_llmctl::readiness::read_state(&rs_llmctl::readiness::evidence_path(
+                            &cfg.storage.model_dir,
+                            &model.alias,
+                        ))
+                    }),
             }
         })
         .collect();

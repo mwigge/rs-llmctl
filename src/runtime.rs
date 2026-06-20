@@ -2,6 +2,7 @@ use crate::config::{Config, ModelConfig, NativeEmbeddingMode};
 use crate::native::{
     self, CandleArtifactLayout, CandleModelFamily, NativeAcceleration, NativeModelFormat,
 };
+use crate::readiness::{self, ReadinessState};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -32,7 +33,16 @@ pub struct RuntimeStatus {
     pub observability: Vec<String>,
     pub security: Vec<String>,
     pub compatibility: Vec<String>,
+    pub model_readiness: Vec<ModelReadinessStatus>,
     pub next_step: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelReadinessStatus {
+    pub alias: String,
+    pub family: String,
+    pub state: ReadinessState,
+    pub evidence_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +323,8 @@ fn artifact_validation_plan(
 }
 
 fn hardware_matrix() -> Vec<NativeHardwareValidationTarget> {
+    // "amd-vulkan" is a resource-planning target only — no candle-native
+    // execution backend implements it yet. See docs/adr/0001-amd-gpu-acceleration.md.
     [
         ("cpu", NativeAcceleration::Cpu, true),
         ("nvidia-cuda", NativeAcceleration::NvidiaCuda, false),
@@ -436,11 +448,31 @@ fn benchmark_plan() -> NativeBenchmarkPlan {
 }
 
 pub fn status_from_config(cfg: &Config) -> RuntimeStatus {
-    candle_native_status(
+    let mut status = candle_native_status(
         cfg.resources.budget,
         cfg.runtime.embeddings.mode,
         cfg.runtime.embeddings.model_alias.clone(),
-    )
+    );
+    status.model_readiness = cfg
+        .models
+        .iter()
+        .filter(|model| {
+            model
+                .family
+                .as_deref()
+                .is_some_and(|family| family.eq_ignore_ascii_case("gemma4"))
+        })
+        .map(|model| {
+            let evidence_path = readiness::evidence_path(&cfg.storage.model_dir, &model.alias);
+            ModelReadinessStatus {
+                alias: model.alias.clone(),
+                family: "gemma4".to_string(),
+                state: readiness::read_state(&evidence_path),
+                evidence_present: evidence_path.exists(),
+            }
+        })
+        .collect();
+    status
 }
 
 fn candle_native_status(
@@ -471,6 +503,7 @@ fn candle_native_status(
             "OpenAI-compatible HTTP contract remains the serving surface".to_string(),
             "Candle-native is the only runtime backend".to_string(),
         ],
+        model_readiness: Vec::new(),
         next_step: "wire and verify DeepSeek first, then add reviewed Kimi and MiniMax architecture implementations when Candle-compatible decoders are available"
             .to_string(),
     }
@@ -531,7 +564,8 @@ fn resource_policy(budget_fraction: f64, enforcement: &str) -> RuntimeResourcePo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ModelConfig};
+    use std::path::PathBuf;
 
     #[test]
     fn native_validation_plan_covers_artifacts_hardware_soak_and_benchmarks() {
@@ -647,5 +681,83 @@ mod tests {
             .gpu_detection
             .iter()
             .any(|entry| entry.contains("apple")));
+    }
+
+    #[test]
+    fn runtime_status_reports_gemma4_quarantine_without_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.storage.model_dir = dir.path().to_path_buf();
+        cfg.models = vec![ModelConfig {
+            alias: "gemma4".to_string(),
+            path: PathBuf::from("gemma4.gguf"),
+            role: "coding".to_string(),
+            family: Some("gemma4".to_string()),
+            weight: 1,
+        }];
+
+        let status = status_from_config(&cfg);
+        assert_eq!(status.model_readiness.len(), 1);
+        assert_eq!(status.model_readiness[0].state, ReadinessState::Quarantined);
+        assert!(!status.model_readiness[0].evidence_present);
+    }
+
+    #[test]
+    fn runtime_status_reports_gemma4_qualified_with_persisted_evidence() {
+        use crate::readiness::{
+            CommandEvidence, Gemma4ReadinessEvidence, LanguageFixtureEvidence, SamplingParameters,
+            GEMMA4_READINESS_SCHEMA_VERSION,
+        };
+        use chrono::{TimeZone, Utc};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.storage.model_dir = dir.path().to_path_buf();
+        cfg.models = vec![ModelConfig {
+            alias: "gemma4".to_string(),
+            path: PathBuf::from("gemma4.gguf"),
+            role: "coding".to_string(),
+            family: Some("gemma4".to_string()),
+            weight: 1,
+        }];
+
+        let evidence_path = readiness::evidence_path(&cfg.storage.model_dir, "gemma4");
+        let evidence = Gemma4ReadinessEvidence {
+            schema_version: GEMMA4_READINESS_SCHEMA_VERSION.to_string(),
+            generated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            state: ReadinessState::Qualified,
+            artifact_path: "gemma4".to_string(),
+            artifact_sha256: "0".repeat(64),
+            runtime_revision: "rs-llmctl/test".to_string(),
+            sampling: SamplingParameters {
+                strategy: "greedy".to_string(),
+                temperature: "0".to_string(),
+                max_tokens: 256,
+            },
+            expected_output: readiness::CANONICAL_TEN_LINE_OUTPUT.to_string(),
+            fixtures: vec![LanguageFixtureEvidence {
+                language: readiness::FixtureLanguage::Go,
+                prompt: "prompt".to_string(),
+                raw_generation: "raw".to_string(),
+                generated_source: "source".to_string(),
+                toolchain_version: "go1.0".to_string(),
+                commands: vec![CommandEvidence {
+                    program: "go".to_string(),
+                    args: vec!["run".to_string(), "main.go".to_string()],
+                    exit_code: Some(0),
+                    stdout: readiness::CANONICAL_TEN_LINE_OUTPUT.to_string(),
+                    stderr: String::new(),
+                    passed: true,
+                }],
+                output_matches: true,
+                passed: true,
+            }],
+        };
+        readiness::write_evidence(&evidence_path, &evidence).expect("write evidence");
+
+        let status = status_from_config(&cfg);
+        assert_eq!(status.model_readiness.len(), 1);
+        assert_eq!(status.model_readiness[0].state, ReadinessState::Qualified);
+        assert!(status.model_readiness[0].evidence_present);
     }
 }

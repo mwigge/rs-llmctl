@@ -362,6 +362,10 @@ pub struct ResourceConfig {
     pub budget: f64,
     pub cpu_only: bool,
     pub gpu_vendor: String,
+    /// Path to a HIP-enabled `llama-server` binary used when `gpu_vendor` is
+    /// `"amd"`. When absent, rs-llmctl searches `~/.local/bin`, `/usr/local/bin`,
+    /// and `/usr/bin` for `llama-server`. See ADR-0001 option (b).
+    pub llama_server_bin: Option<std::path::PathBuf>,
 }
 
 impl Default for ResourceConfig {
@@ -370,6 +374,7 @@ impl Default for ResourceConfig {
             budget: 0.80,
             cpu_only: false,
             gpu_vendor: "auto".to_string(),
+            llama_server_bin: None,
         }
     }
 }
@@ -429,6 +434,8 @@ pub struct ObservabilityConfig {
     /// Fire-and-forget HTTP callback fired with usage/lineage metadata after
     /// every completion — for ecosystems without an OTLP receiver.
     pub webhook: WebhookExporterConfig,
+    /// Controls gen_ai semantic-convention data captured in OTel spans.
+    pub gen_ai: GenAiObservabilityConfig,
 }
 
 impl Default for ObservabilityConfig {
@@ -445,6 +452,7 @@ impl Default for ObservabilityConfig {
             exporter: ObservabilityExporterConfig::default(),
             langfuse: LangfuseExporterConfig::default(),
             webhook: WebhookExporterConfig::default(),
+            gen_ai: GenAiObservabilityConfig::default(),
         }
     }
 }
@@ -483,6 +491,45 @@ impl Default for WebhookExporterConfig {
             url: None,
             headers: BTreeMap::new(),
             timeout_ms: 5_000,
+        }
+    }
+}
+
+/// Controls which gen_ai semantic-convention data is captured in OTel spans.
+///
+/// Sensitive prompt content can be suppressed per-environment so traces never
+/// carry user input outside the host.
+// All four fields are independent on/off knobs for different observability
+// categories; a bitfield would lose TOML readability and serde round-trip
+// clarity, so a struct of bools is the right shape here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct GenAiObservabilityConfig {
+    /// When `true` (default), `gen_ai.user.message` and `gen_ai.system.message`
+    /// span events include the actual message body.  Set to `false` to emit
+    /// `[REDACTED]` instead — required in environments where prompt content
+    /// must not leave the host.
+    pub capture_message_content: bool,
+    /// Emit a `gen_ai.token` span event for every decoded token.  Defaults to
+    /// `false` — enable only in development; production traces will be very
+    /// high volume if this is on.
+    pub token_events: bool,
+    /// Record a per-token logit entropy histogram.  Defaults to `false` —
+    /// computing entropy over the full vocabulary adds latency on every token.
+    pub logit_entropy: bool,
+    /// Emit `gen_ai.thinking.started` and `gen_ai.thinking.ended` span events
+    /// when the model enters and exits a thinking phase.  Defaults to `true`.
+    pub thinking_phase_events: bool,
+}
+
+impl Default for GenAiObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            capture_message_content: true,
+            token_events: false,
+            logit_entropy: false,
+            thinking_phase_events: true,
         }
     }
 }
@@ -799,6 +846,37 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeBackend;
+
+    #[test]
+    fn gen_ai_observability_config_phase2_defaults_and_roundtrip() {
+        let defaults = GenAiObservabilityConfig::default();
+        assert!(!defaults.token_events);
+        assert!(!defaults.logit_entropy);
+        assert!(defaults.thinking_phase_events);
+
+        let toml_input =
+            "[gen-ai]\ntoken-events = true\nlogit-entropy = true\nthinking-phase-events = false\n";
+        let flipped: ObservabilityConfig = toml::from_str(toml_input).expect("valid toml");
+        assert!(flipped.gen_ai.token_events);
+        assert!(flipped.gen_ai.logit_entropy);
+        assert!(!flipped.gen_ai.thinking_phase_events);
+    }
+
+    #[test]
+    fn gen_ai_config_defaults_to_capture_message_content_enabled() {
+        let cfg = ObservabilityConfig::default();
+        assert!(cfg.gen_ai.capture_message_content);
+    }
+
+    #[test]
+    fn gen_ai_config_roundtrips_through_toml_with_content_disabled() {
+        let toml_input = r#"
+[gen-ai]
+capture-message-content = false
+"#;
+        let cfg: ObservabilityConfig = toml::from_str(toml_input).expect("valid toml");
+        assert!(!cfg.gen_ai.capture_message_content);
+    }
 
     #[test]
     fn default_runtime_backend_is_candle_native() {
