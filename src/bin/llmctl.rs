@@ -1699,12 +1699,24 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
                 .await
             } else {
                 let engines = load_native_engines_from_config(&cfg)?;
+                #[cfg(feature = "llama-cpp-native")]
+                let backend_label = if plan
+                    .workers
+                    .iter()
+                    .any(|w| matches!(w.launch, WorkerLaunchPlan::LlamaCppNative { .. }))
+                {
+                    "llama-cpp-native"
+                } else {
+                    "candle-native"
+                };
+                #[cfg(not(feature = "llama-cpp-native"))]
+                let backend_label = "candle-native";
                 emit(
                     as_json,
                     &json!({
                         "status": if engines.is_empty() { "no_models" } else { "ready" },
                         "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
-                        "backend": "candle-native",
+                        "backend": backend_label,
                         "native_engines": engines.len()
                     }),
                 )?;
@@ -1759,6 +1771,42 @@ fn load_native_engines_from_config(
         .iter()
         .filter(|model| model.weight > 0 && local_aliases.contains(&model.alias))
         .collect::<Vec<_>>();
+
+    // When the llama-cpp-native feature is compiled in, check whether the startup
+    // plan selected LlamaCppNative for any local model.  If it did, load those
+    // models via LlamaCppNativeEngine and return early — the Candle factory is not
+    // used on this code path.
+    #[cfg(feature = "llama-cpp-native")]
+    {
+        let startup_plan = StartupPlan::from_config(cfg);
+        let llama_cpp_by_alias: BTreeMap<String, u32> = startup_plan
+            .workers
+            .iter()
+            .filter_map(|pw| {
+                if let WorkerLaunchPlan::LlamaCppNative { gpu_layers } = &pw.launch {
+                    Some((pw.worker.id.as_str().to_string(), *gpu_layers))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !llama_cpp_by_alias.is_empty() {
+            let mut engines = rs_llmctl::server::NativeEngineRegistry::new();
+            for model in &models {
+                if let Some(&gpu_layers) = llama_cpp_by_alias.get(&model.alias) {
+                    let engine: Box<dyn native::NativeEngine> =
+                        Box::new(native::LlamaCppNativeEngine::load(
+                            model.alias.clone(),
+                            &model.path,
+                            gpu_layers,
+                        )?);
+                    engines.insert(model.alias.clone(), std::sync::Arc::from(engine));
+                }
+            }
+            return Ok(engines);
+        }
+    }
 
     let factory = native::NativeCandleEngineFactory::default();
     let mut engines = rs_llmctl::server::NativeEngineRegistry::new();

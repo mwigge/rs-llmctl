@@ -6085,6 +6085,18 @@ mod quantized_gemma4_tests {
             fn assert_native_engine<T: crate::native::NativeEngine>() {}
             assert_native_engine::<LlamaCppNativeEngine>();
         }
+
+        #[test]
+        fn arc_from_box_dyn_engine_preserves_alias() {
+            use std::sync::Arc;
+            use tempfile::NamedTempFile;
+            let tmp = NamedTempFile::new().expect("temp file");
+            let engine =
+                LlamaCppNativeEngine::load("registry-alias".to_string(), tmp.path(), 0).unwrap();
+            let boxed: Box<dyn NativeEngine> = Box::new(engine);
+            let arc: Arc<dyn NativeEngine> = Arc::from(boxed);
+            assert_eq!(arc.model_alias(), "registry-alias");
+        }
     }
 
     #[test]
