@@ -279,6 +279,25 @@ impl LlamaCppNativeEngine {
     }
 }
 
+/// Acquires the llama.cpp process-global backend singleton.
+///
+/// `LlamaBackend::init()` returns `Err(BackendAlreadyInitialized)` on every
+/// call after the first. This helper treats that error as success, so callers
+/// can call it once per request without tracking initialisation state.
+#[cfg(feature = "llama-cpp-native")]
+fn init_llama_backend() -> Result<llama_cpp_2::llama_backend::LlamaBackend> {
+    use llama_cpp_2::{llama_backend::LlamaBackend, LlamaCppError};
+    LlamaBackend::init()
+        .or_else(|e| {
+            if e == LlamaCppError::BackendAlreadyInitialized {
+                Ok(LlamaBackend {})
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("llama backend init: {e}"))
+}
+
 #[cfg(feature = "llama-cpp-native")]
 impl NativeEngine for LlamaCppNativeEngine {
     fn model_alias(&self) -> &str {
@@ -288,12 +307,11 @@ impl NativeEngine for LlamaCppNativeEngine {
     fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
         use llama_cpp_2::{
             context::params::LlamaContextParams,
-            llama_backend::LlamaBackend,
             llama_batch::LlamaBatch,
             model::{params::LlamaModelParams, AddBos, LlamaModel},
             sampling::LlamaSampler,
         };
-        use std::num::NonZeroU32;
+        use std::{fmt::Write as _, num::NonZeroU32};
 
         let model_path = self.model_path.clone();
         let gpu_layers = self.gpu_layers;
@@ -302,35 +320,17 @@ impl NativeEngine for LlamaCppNativeEngine {
             // The entire decode loop runs in a blocking thread so the Tokio
             // thread pool is not starved during FFI calls.
             let response = tokio::task::spawn_blocking(move || -> Result<NativeChatResponse> {
-                // The backend is a process-global singleton; re-init is idempotent.
-                let backend = LlamaBackend::init()
-                    .or_else(|e| {
-                        if e == llama_cpp_2::LlamaCppError::BackendAlreadyInitialized {
-                            // SAFETY: LlamaBackend has no public fields; its only
-                            // purpose is to serve as a proof-of-init token.
-                            Ok(LlamaBackend {})
-                        } else {
-                            Err(e)
-                        }
-                    })
-                    .map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+                let backend = init_llama_backend()?;
 
                 let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
                 let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
                     .map_err(|e| anyhow::anyhow!("llama model load: {e}"))?;
 
-                // Build a plain text prompt from the messages.  The model's
-                // chat template is not applied here — the synchronous path is
-                // for unit testing and simple completions; a proper template
-                // application would require `feature = "common"` from
-                // llama-cpp-2.
+                // Plain-text prompt: chat template not applied here (requires
+                // llama-cpp-2 feature = "common" which adds a heavy C++ dep).
                 let mut prompt = request.messages.iter().fold(String::new(), |mut acc, msg| {
-                    let text = message_content_text(msg);
-                    acc.push_str("<|");
-                    acc.push_str(&msg.role);
-                    acc.push_str("|>\n");
-                    acc.push_str(&text);
-                    acc.push('\n');
+                    write!(acc, "<|{}|>\n{}\n", msg.role, message_content_text(msg))
+                        .expect("String write is infallible");
                     acc
                 });
                 prompt.push_str("<|assistant|>\n");

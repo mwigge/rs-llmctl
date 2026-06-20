@@ -656,17 +656,24 @@ pub fn gen_ai_thinking_tokens_histogram() -> &'static Histogram<u64> {
     })
 }
 
+macro_rules! static_f64_gauge {
+    ($name:expr, $desc:expr) => {{
+        static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
+        GAUGE.get_or_init(|| {
+            global::meter(crate::SERVICE_NAME)
+                .f64_gauge($name)
+                .with_description($desc)
+                .build()
+        })
+    }};
+}
+
 /// Returns the gauge that tracks the fraction of output that was thinking content.
 pub fn gen_ai_thinking_ratio_gauge() -> &'static Gauge<f64> {
-    static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
-    GAUGE.get_or_init(|| {
-        global::meter(crate::SERVICE_NAME)
-            .f64_gauge("gen_ai.thinking_ratio")
-            .with_description(
-                "Fraction of content deltas that were thinking-phase (0.0–1.0) per request",
-            )
-            .build()
-    })
+    static_f64_gauge!(
+        "gen_ai.thinking_ratio",
+        "Fraction of content deltas that were thinking-phase (0.0–1.0) per request"
+    )
 }
 
 /// Returns the gauge that tracks the KV-cache occupancy ratio for one model worker.
@@ -674,52 +681,44 @@ pub fn gen_ai_thinking_ratio_gauge() -> &'static Gauge<f64> {
 /// Records values in the range `[0.0, 1.0]` where `1.0` means the cache is
 /// completely full.  Tagged with `gen_ai.request.model`.
 pub fn gen_ai_kv_cache_usage_ratio_gauge() -> &'static Gauge<f64> {
-    static GAUGE: OnceLock<Gauge<f64>> = OnceLock::new();
-    GAUGE.get_or_init(|| {
-        global::meter(crate::SERVICE_NAME)
-            .f64_gauge("gen_ai.kv_cache.usage_ratio")
-            .with_description("KV-cache occupancy ratio per model worker (0.0 = empty, 1.0 = full)")
-            .build()
-    })
+    static_f64_gauge!(
+        "gen_ai.kv_cache.usage_ratio",
+        "KV-cache occupancy ratio per model worker (0.0 = empty, 1.0 = full)"
+    )
+}
+
+fn add_thinking_phase_event(name: &'static str, attrs: Vec<KeyValue>) {
+    use opentelemetry::trace::get_active_span;
+    get_active_span(|span| span.add_event(name, attrs));
 }
 
 /// Adds a `gen_ai.thinking.started` event to the current span.
-///
-/// Call this when the model begins emitting thinking-phase tokens.
 pub fn emit_gen_ai_thinking_phase_started(model: &str, position: u64) {
-    use opentelemetry::trace::get_active_span;
-    get_active_span(|span| {
-        span.add_event(
-            "gen_ai.thinking.started",
-            vec![
-                KeyValue::new("gen_ai.request.model", model.to_string()),
-                KeyValue::new(
-                    "gen_ai.token.position",
-                    i64::try_from(position).unwrap_or(i64::MAX),
-                ),
-            ],
-        );
-    });
+    add_thinking_phase_event(
+        "gen_ai.thinking.started",
+        vec![
+            KeyValue::new("gen_ai.request.model", model.to_string()),
+            KeyValue::new(
+                "gen_ai.token.position",
+                i64::try_from(position).unwrap_or(i64::MAX),
+            ),
+        ],
+    );
 }
 
 /// Adds a `gen_ai.thinking.ended` event to the current span.
-///
-/// Call this when the model stops emitting thinking-phase tokens.
 pub fn emit_gen_ai_thinking_phase_ended(model: &str, thinking_tokens: u64, duration_seconds: f64) {
-    use opentelemetry::trace::get_active_span;
-    get_active_span(|span| {
-        span.add_event(
-            "gen_ai.thinking.ended",
-            vec![
-                KeyValue::new("gen_ai.request.model", model.to_string()),
-                KeyValue::new(
-                    "gen_ai.thinking.tokens",
-                    i64::try_from(thinking_tokens).unwrap_or(i64::MAX),
-                ),
-                KeyValue::new("gen_ai.thinking.duration_s", duration_seconds),
-            ],
-        );
-    });
+    add_thinking_phase_event(
+        "gen_ai.thinking.ended",
+        vec![
+            KeyValue::new("gen_ai.request.model", model.to_string()),
+            KeyValue::new(
+                "gen_ai.thinking.tokens",
+                i64::try_from(thinking_tokens).unwrap_or(i64::MAX),
+            ),
+            KeyValue::new("gen_ai.thinking.duration_s", duration_seconds),
+        ],
+    );
 }
 
 /// Emits `gen_ai.thinking_tokens` and `gen_ai.thinking_ratio` metrics for one

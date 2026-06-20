@@ -848,26 +848,18 @@ mod tests {
     use crate::runtime::RuntimeBackend;
 
     #[test]
-    fn gen_ai_observability_config_defaults_phase2() {
-        let cfg = GenAiObservabilityConfig::default();
-        assert!(!cfg.token_events);
-        assert!(!cfg.logit_entropy);
-        assert!(cfg.thinking_phase_events);
-    }
+    fn gen_ai_observability_config_phase2_defaults_and_roundtrip() {
+        let defaults = GenAiObservabilityConfig::default();
+        assert!(!defaults.token_events);
+        assert!(!defaults.logit_entropy);
+        assert!(defaults.thinking_phase_events);
 
-    #[test]
-    fn gen_ai_observability_config_phase2_roundtrips_through_toml() {
-        let toml_input = r#"
-[gen-ai]
-capture-message-content = true
-token-events = true
-logit-entropy = true
-thinking-phase-events = false
-"#;
-        let cfg: ObservabilityConfig = toml::from_str(toml_input).expect("valid toml");
-        assert!(cfg.gen_ai.token_events);
-        assert!(cfg.gen_ai.logit_entropy);
-        assert!(!cfg.gen_ai.thinking_phase_events);
+        let toml_input =
+            "[gen-ai]\ntoken-events = true\nlogit-entropy = true\nthinking-phase-events = false\n";
+        let flipped: ObservabilityConfig = toml::from_str(toml_input).expect("valid toml");
+        assert!(flipped.gen_ai.token_events);
+        assert!(flipped.gen_ai.logit_entropy);
+        assert!(!flipped.gen_ai.thinking_phase_events);
     }
 
     #[test]
