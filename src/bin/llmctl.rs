@@ -26,8 +26,6 @@ use rs_llmctl::storage::Storage;
 use rs_llmctl::worker::{
     StartupPlan, SwapPlan, TokioWorkerRunner, WorkerId, WorkerLaunchPlan, WorkerSupervisor,
 };
-use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -37,9 +35,11 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 const DEFAULT_SERVICE_NAME: &str = "llmctld.service";
@@ -993,7 +993,10 @@ struct AmdQualifyArgs {
 struct AmdInstallServerArgs {
     #[arg(long)]
     dry_run: bool,
-    #[arg(long, help = "Path to install-amd-hip.sh (defaults to scripts/install-amd-hip.sh in cwd)")]
+    #[arg(
+        long,
+        help = "Path to install-amd-hip.sh (defaults to scripts/install-amd-hip.sh in cwd)"
+    )]
     script: Option<PathBuf>,
 }
 
@@ -1673,12 +1676,10 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
                 // Skip Candle engine loading entirely — attempting to Candle-load
                 // a 14B GGUF on CPU while the subprocess is serving it via GPU
                 // would waste RAM and time.
-                let mut supervisor =
-                    WorkerSupervisor::new(TokioWorkerRunner::new());
+                let mut supervisor = WorkerSupervisor::new(TokioWorkerRunner::new());
                 let statuses = supervisor.start_all(&plan).await;
                 let worker_count = statuses.len();
-                let worker_control =
-                    Arc::new(AsyncMutex::new(supervisor));
+                let worker_control = Arc::new(AsyncMutex::new(supervisor));
                 emit(
                     as_json,
                     &json!({

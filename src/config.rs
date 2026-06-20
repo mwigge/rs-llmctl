@@ -434,6 +434,8 @@ pub struct ObservabilityConfig {
     /// Fire-and-forget HTTP callback fired with usage/lineage metadata after
     /// every completion — for ecosystems without an OTLP receiver.
     pub webhook: WebhookExporterConfig,
+    /// Controls gen_ai semantic-convention data captured in OTel spans.
+    pub gen_ai: GenAiObservabilityConfig,
 }
 
 impl Default for ObservabilityConfig {
@@ -450,6 +452,7 @@ impl Default for ObservabilityConfig {
             exporter: ObservabilityExporterConfig::default(),
             langfuse: LangfuseExporterConfig::default(),
             webhook: WebhookExporterConfig::default(),
+            gen_ai: GenAiObservabilityConfig::default(),
         }
     }
 }
@@ -488,6 +491,28 @@ impl Default for WebhookExporterConfig {
             url: None,
             headers: BTreeMap::new(),
             timeout_ms: 5_000,
+        }
+    }
+}
+
+/// Controls which gen_ai semantic-convention data is captured in OTel spans.
+///
+/// Sensitive prompt content can be suppressed per-environment so traces never
+/// carry user input outside the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct GenAiObservabilityConfig {
+    /// When `true` (default), `gen_ai.user.message` and `gen_ai.system.message`
+    /// span events include the actual message body.  Set to `false` to emit
+    /// `[REDACTED]` instead — required in environments where prompt content
+    /// must not leave the host.
+    pub capture_message_content: bool,
+}
+
+impl Default for GenAiObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            capture_message_content: true,
         }
     }
 }
@@ -804,6 +829,22 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeBackend;
+
+    #[test]
+    fn gen_ai_config_defaults_to_capture_message_content_enabled() {
+        let cfg = ObservabilityConfig::default();
+        assert!(cfg.gen_ai.capture_message_content);
+    }
+
+    #[test]
+    fn gen_ai_config_roundtrips_through_toml_with_content_disabled() {
+        let toml_input = r#"
+[gen-ai]
+capture-message-content = false
+"#;
+        let cfg: ObservabilityConfig = toml::from_str(toml_input).expect("valid toml");
+        assert!(!cfg.gen_ai.capture_message_content);
+    }
 
     #[test]
     fn default_runtime_backend_is_candle_native() {

@@ -1,5 +1,4 @@
 use crate::config::{Config, ModelConfig, ResourceConfig, ServerConfig};
-use std::path::Path;
 use crate::observability::{
     emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
 };
@@ -11,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -177,9 +177,7 @@ pub enum WorkerLaunchPlan {
     },
     /// llama-server subprocess — used for AMD GPU (HIP/Vulkan backend).
     /// See `docs/adr/0001-amd-gpu-acceleration.md` option (b).
-    LlamaServerSubprocess {
-        llama_server_path: PathBuf,
-    },
+    LlamaServerSubprocess { llama_server_path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
