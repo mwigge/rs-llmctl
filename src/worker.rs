@@ -178,6 +178,13 @@ pub enum WorkerLaunchPlan {
     /// llama-server subprocess — used for AMD GPU (HIP/Vulkan backend).
     /// See `docs/adr/0001-amd-gpu-acceleration.md` option (b).
     LlamaServerSubprocess { llama_server_path: PathBuf },
+    /// In-process llama.cpp FFI engine via the `llama-cpp-2` crate.
+    ///
+    /// When the `llama-cpp-native` feature is compiled in, AMD GPU workers
+    /// prefer this plan over `LlamaServerSubprocess` because it allows
+    /// per-token `OTel` hooks inside the sampling loop.
+    #[cfg(feature = "llama-cpp-native")]
+    LlamaCppNative { gpu_layers: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,11 +222,47 @@ pub struct PlanDiff {
 }
 
 impl StartupPlan {
+    #[must_use]
     pub fn from_config(cfg: &Config) -> Self {
-        let amd_llama_server = if matches!(
+        let is_amd = matches!(
             WorkerBackend::from_resources(&cfg.resources),
             WorkerBackend::AmdVulkan { .. }
-        ) {
+        );
+
+        // When the llama-cpp-native feature is compiled in and AMD GPU is
+        // detected, prefer the in-process FFI path over the subprocess path.
+        // This enables per-token OTel hooks inside the sampling loop.
+        #[cfg(feature = "llama-cpp-native")]
+        if is_amd {
+            let workers = cfg
+                .models
+                .iter()
+                .filter(|m| m.weight > 0)
+                .cloned()
+                .enumerate()
+                .map(|(index, model)| {
+                    let port_offset = u16::try_from(index).unwrap_or(u16::MAX);
+                    let worker = WorkerSpec::from_config(
+                        model.alias.clone(),
+                        model,
+                        &cfg.server,
+                        &cfg.resources,
+                        port_offset,
+                    );
+                    let gpu_layers = worker.backend.gpu_layers();
+                    PlannedWorker::llama_cpp_native(worker, gpu_layers)
+                })
+                .collect();
+            let resource_limits =
+                budget_plan(&snapshot(&cfg.resources), cfg.resources.budget).limits;
+            return Self {
+                resource_limits,
+                workers,
+            };
+        }
+
+        // Fallback: subprocess path for AMD without the FFI feature, or CPU.
+        let amd_llama_server = if is_amd {
             find_llama_server(cfg.resources.llama_server_bin.as_ref())
         } else {
             None
@@ -308,7 +351,12 @@ impl WorkerLaunchPlan {
     }
 
     pub fn is_in_process(&self) -> bool {
-        matches!(self, Self::InProcess { .. })
+        match self {
+            Self::InProcess { .. } => true,
+            Self::LlamaServerSubprocess { .. } => false,
+            #[cfg(feature = "llama-cpp-native")]
+            Self::LlamaCppNative { .. } => true,
+        }
     }
 }
 
@@ -319,6 +367,22 @@ impl PlannedWorker {
         Self {
             worker,
             launch: WorkerLaunchPlan::candle_native(),
+            execution,
+            command,
+        }
+    }
+
+    /// Constructs a `PlannedWorker` that will run inference via the
+    /// `llama-cpp-2` in-process FFI engine.
+    ///
+    /// Selecting this plan requires the `llama-cpp-native` Cargo feature.
+    #[cfg(feature = "llama-cpp-native")]
+    pub fn llama_cpp_native(worker: WorkerSpec, gpu_layers: u32) -> Self {
+        let command = CommandSpec::in_process_placeholder(&worker);
+        let execution = WorkerExecutionPlan::from_backend(&worker.backend);
+        Self {
+            worker,
+            launch: WorkerLaunchPlan::LlamaCppNative { gpu_layers },
             execution,
             command,
         }
@@ -439,6 +503,8 @@ impl CommandSpec {
                 "q8_0".to_string(),
                 "--jinja".to_string(),
                 "--metrics".to_string(),
+                "--ubatch-size".to_string(),
+                "1024".to_string(),
             ],
             env: vec![
                 ("HIP_PLATFORM".to_string(), "amd".to_string()),
@@ -1420,6 +1486,10 @@ mod tests {
         );
     }
 
+    // When llama-cpp-native is compiled in, AMD GPU workers use the in-process
+    // engine rather than the subprocess, so this test only applies to builds
+    // without that feature.
+    #[cfg(not(feature = "llama-cpp-native"))]
     #[test]
     fn startup_plan_selects_llama_server_subprocess_for_amd_when_binary_configured() {
         let llama_path = PathBuf::from("/usr/local/bin/llama-server");
@@ -1590,5 +1660,52 @@ mod tests {
         assert_eq!(diff.removed, vec![WorkerId::new("embed")]);
         assert_eq!(diff.changed, vec![WorkerId::new("chat")]);
         assert_eq!(diff.unchanged, vec![]);
+    }
+
+    #[cfg(feature = "llama-cpp-native")]
+    #[test]
+    fn amd_gpu_prefers_llama_cpp_native_when_feature_enabled() {
+        use crate::config::{Config, ResourceConfig};
+
+        let mut cfg = Config::default();
+        cfg.resources = ResourceConfig {
+            gpu_vendor: "amd".to_string(),
+            cpu_only: false,
+            ..ResourceConfig::default()
+        };
+        cfg.models = vec![model("my-model", "/models/my-model.gguf")];
+
+        let plan = StartupPlan::from_config(&cfg);
+
+        assert_eq!(plan.workers.len(), 1);
+        assert!(
+            matches!(
+                plan.workers[0].launch,
+                WorkerLaunchPlan::LlamaCppNative { .. }
+            ),
+            "AMD GPU with llama-cpp-native feature should use LlamaCppNative launch plan, got {:?}",
+            plan.workers[0].launch
+        );
+    }
+
+    #[test]
+    fn cpu_resources_use_in_process_candle_native_plan() {
+        use crate::config::{Config, ResourceConfig};
+
+        let mut cfg = Config::default();
+        cfg.resources = ResourceConfig {
+            gpu_vendor: String::new(),
+            cpu_only: true,
+            ..ResourceConfig::default()
+        };
+        cfg.models = vec![model("my-model", "/models/my-model.gguf")];
+
+        let plan = StartupPlan::from_config(&cfg);
+
+        assert_eq!(plan.workers.len(), 1);
+        assert!(
+            matches!(plan.workers[0].launch, WorkerLaunchPlan::InProcess { .. }),
+            "CPU-only resources should use InProcess launch plan"
+        );
     }
 }
