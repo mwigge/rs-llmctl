@@ -499,6 +499,10 @@ impl Default for WebhookExporterConfig {
 ///
 /// Sensitive prompt content can be suppressed per-environment so traces never
 /// carry user input outside the host.
+// All four fields are independent on/off knobs for different observability
+// categories; a bitfield would lose TOML readability and serde round-trip
+// clarity, so a struct of bools is the right shape here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct GenAiObservabilityConfig {
@@ -507,12 +511,25 @@ pub struct GenAiObservabilityConfig {
     /// `[REDACTED]` instead — required in environments where prompt content
     /// must not leave the host.
     pub capture_message_content: bool,
+    /// Emit a `gen_ai.token` span event for every decoded token.  Defaults to
+    /// `false` — enable only in development; production traces will be very
+    /// high volume if this is on.
+    pub token_events: bool,
+    /// Record a per-token logit entropy histogram.  Defaults to `false` —
+    /// computing entropy over the full vocabulary adds latency on every token.
+    pub logit_entropy: bool,
+    /// Emit `gen_ai.thinking.started` and `gen_ai.thinking.ended` span events
+    /// when the model enters and exits a thinking phase.  Defaults to `true`.
+    pub thinking_phase_events: bool,
 }
 
 impl Default for GenAiObservabilityConfig {
     fn default() -> Self {
         Self {
             capture_message_content: true,
+            token_events: false,
+            logit_entropy: false,
+            thinking_phase_events: true,
         }
     }
 }
@@ -829,6 +846,29 @@ pub fn validate_production_security(cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeBackend;
+
+    #[test]
+    fn gen_ai_observability_config_defaults_phase2() {
+        let cfg = GenAiObservabilityConfig::default();
+        assert!(!cfg.token_events);
+        assert!(!cfg.logit_entropy);
+        assert!(cfg.thinking_phase_events);
+    }
+
+    #[test]
+    fn gen_ai_observability_config_phase2_roundtrips_through_toml() {
+        let toml_input = r#"
+[gen-ai]
+capture-message-content = true
+token-events = true
+logit-entropy = true
+thinking-phase-events = false
+"#;
+        let cfg: ObservabilityConfig = toml::from_str(toml_input).expect("valid toml");
+        assert!(cfg.gen_ai.token_events);
+        assert!(cfg.gen_ai.logit_entropy);
+        assert!(!cfg.gen_ai.thinking_phase_events);
+    }
 
     #[test]
     fn gen_ai_config_defaults_to_capture_message_content_enabled() {
