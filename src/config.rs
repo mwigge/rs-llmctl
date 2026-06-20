@@ -362,6 +362,10 @@ pub struct ResourceConfig {
     pub budget: f64,
     pub cpu_only: bool,
     pub gpu_vendor: String,
+    /// Path to a HIP-enabled `llama-server` binary used when `gpu_vendor` is
+    /// `"amd"`. When absent, rs-llmctl searches `~/.local/bin`, `/usr/local/bin`,
+    /// and `/usr/bin` for `llama-server`. See ADR-0001 option (b).
+    pub llama_server_bin: Option<std::path::PathBuf>,
 }
 
 impl Default for ResourceConfig {
@@ -370,6 +374,7 @@ impl Default for ResourceConfig {
             budget: 0.80,
             cpu_only: false,
             gpu_vendor: "auto".to_string(),
+            llama_server_bin: None,
         }
     }
 }

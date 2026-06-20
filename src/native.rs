@@ -4277,6 +4277,7 @@ mod tests {
             budget: 0.8,
             cpu_only: false,
             gpu_vendor: "nvidia".to_string(),
+            llama_server_bin: None,
         };
 
         let plan = Qwen3CandleEngineLoader::plan(&model, &resources).expect("plan validates");
@@ -4858,6 +4859,7 @@ mod tests {
             budget: 0.7,
             cpu_only: true,
             gpu_vendor: "nvidia".to_string(),
+            llama_server_bin: None,
         };
 
         for family in [

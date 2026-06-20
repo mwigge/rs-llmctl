@@ -1,4 +1,5 @@
 use crate::config::{Config, ModelConfig, ResourceConfig, ServerConfig};
+use std::path::Path;
 use crate::observability::{
     emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
 };
@@ -174,6 +175,11 @@ pub enum WorkerLaunchPlan {
         engine: String,
         implemented: bool,
     },
+    /// llama-server subprocess — used for AMD GPU (HIP/Vulkan backend).
+    /// See `docs/adr/0001-amd-gpu-acceleration.md` option (b).
+    LlamaServerSubprocess {
+        llama_server_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +218,15 @@ pub struct PlanDiff {
 
 impl StartupPlan {
     pub fn from_config(cfg: &Config) -> Self {
+        let amd_llama_server = if matches!(
+            WorkerBackend::from_resources(&cfg.resources),
+            WorkerBackend::AmdVulkan { .. }
+        ) {
+            find_llama_server(cfg.resources.llama_server_bin.as_ref())
+        } else {
+            None
+        };
+
         let workers = cfg
             .models
             .iter()
@@ -227,7 +242,11 @@ impl StartupPlan {
                     &cfg.resources,
                     port_offset,
                 );
-                PlannedWorker::in_process_candle_native(worker)
+                if let Some(ref llama_path) = amd_llama_server {
+                    PlannedWorker::llama_server_subprocess(worker, llama_path.clone())
+                } else {
+                    PlannedWorker::in_process_candle_native(worker)
+                }
             })
             .collect();
 
@@ -306,6 +325,65 @@ impl PlannedWorker {
             command,
         }
     }
+
+    pub fn llama_server_subprocess(worker: WorkerSpec, llama_server_path: PathBuf) -> Self {
+        let command = CommandSpec::llama_server(&worker, &llama_server_path);
+        let execution = WorkerExecutionPlan::from_backend(&worker.backend);
+        let launch = WorkerLaunchPlan::LlamaServerSubprocess {
+            llama_server_path: llama_server_path.clone(),
+        };
+        Self {
+            worker,
+            launch,
+            execution,
+            command,
+        }
+    }
+}
+
+/// Returns the user home directory using the `HOME` environment variable,
+/// matching the behaviour of the milliways install scripts.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// Resolves the path to a HIP-enabled `llama-server` binary. Checks, in order:
+/// `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, and the system `PATH`.
+pub fn find_llama_server(cfg_path: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(p) = cfg_path {
+        if p.is_file() {
+            return Some(p.clone());
+        }
+    }
+    let candidates: Vec<PathBuf> = [
+        dirs_home()
+            .map(|h| h.join(".local/bin/llama-server"))
+            .as_ref()
+            .and_then(|p| p.is_file().then(|| p.clone())),
+        Some(PathBuf::from("/usr/local/bin/llama-server")),
+        Some(PathBuf::from("/usr/bin/llama-server")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for p in candidates {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    which_llama_server()
+}
+
+fn which_llama_server() -> Option<PathBuf> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    for dir in path_env.split(':') {
+        let p = PathBuf::from(dir).join("llama-server");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn workers_by_alias(workers: &[PlannedWorker]) -> BTreeMap<String, &PlannedWorker> {
@@ -326,6 +404,49 @@ impl CommandSpec {
                 spec.context_size.to_string(),
             ],
             env: Vec::new(),
+        }
+    }
+
+    fn llama_server(spec: &WorkerSpec, llama_server_path: &Path) -> Self {
+        let gpu_layers = spec.backend.gpu_layers();
+        // LD_LIBRARY_PATH must include the rs-llmctl lib dir (libggml-hip.so)
+        // and the ROCm runtime libs so the HIP plugin can load at runtime.
+        let lib_dir = dirs_home().map_or_else(
+            || "/usr/local/lib/llmctl".to_string(),
+            |h| format!("{}/.local/lib/llmctl", h.display()),
+        );
+        let ld_path = format!("{lib_dir}:/opt/rocm/lib:/opt/rocm/lib64");
+        let path_env = format!(
+            "/opt/rocm/bin:/opt/rocm/llvm/bin:/usr/local/bin:/usr/bin:/bin:{}",
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Self {
+            program: llama_server_path.to_path_buf(),
+            args: vec![
+                "-m".to_string(),
+                spec.model.path.display().to_string(),
+                "--alias".to_string(),
+                spec.model.alias.clone(),
+                "--host".to_string(),
+                spec.bind_host.clone(),
+                "--port".to_string(),
+                spec.port.to_string(),
+                "--ctx-size".to_string(),
+                spec.context_size.to_string(),
+                "-ngl".to_string(),
+                gpu_layers.to_string(),
+                "--cache-type-k".to_string(),
+                "q8_0".to_string(),
+                "--cache-type-v".to_string(),
+                "q8_0".to_string(),
+                "--jinja".to_string(),
+                "--metrics".to_string(),
+            ],
+            env: vec![
+                ("HIP_PLATFORM".to_string(), "amd".to_string()),
+                ("LD_LIBRARY_PATH".to_string(), ld_path),
+                ("PATH".to_string(), path_env),
+            ],
         }
     }
 
@@ -1299,6 +1420,44 @@ mod tests {
             plan.workers[0].command.program,
             PathBuf::from("<in-process:candle-native>")
         );
+    }
+
+    #[test]
+    fn startup_plan_selects_llama_server_subprocess_for_amd_when_binary_configured() {
+        let llama_path = PathBuf::from("/usr/local/bin/llama-server");
+        let cfg = crate::config::Config {
+            server: ServerConfig {
+                worker_base_port: 19200,
+                ..ServerConfig::default()
+            },
+            resources: ResourceConfig {
+                cpu_only: false,
+                gpu_vendor: "amd".to_string(),
+                llama_server_bin: Some(llama_path.clone()),
+                ..ResourceConfig::default()
+            },
+            models: vec![model("chat", "/models/qwen3-14b.gguf")],
+            ..Default::default()
+        };
+
+        let plan = StartupPlan::from_config(&cfg);
+
+        assert_eq!(plan.workers.len(), 1);
+        assert!(matches!(
+            plan.workers[0].launch,
+            WorkerLaunchPlan::LlamaServerSubprocess { .. }
+        ));
+        assert_eq!(
+            plan.workers[0].worker.backend,
+            WorkerBackend::AmdVulkan { gpu_layers: 99 }
+        );
+        assert_eq!(plan.workers[0].command.program, llama_path);
+        assert!(plan.workers[0].command.args.contains(&"-ngl".to_string()));
+        assert!(plan.workers[0]
+            .command
+            .env
+            .iter()
+            .any(|(k, _)| k == "HIP_PLATFORM"));
     }
 
     #[test]

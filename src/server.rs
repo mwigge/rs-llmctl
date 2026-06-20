@@ -1743,7 +1743,10 @@ async fn chat_completions(
         }
     };
 
-    if route.external_provider.is_some() {
+    let has_subprocess_upstream = state.upstreams.contains_key(&route.upstream_alias)
+        || state.upstreams.contains_key("*");
+
+    if route.external_provider.is_some() || has_subprocess_upstream {
         let tool_audit = request.tool_audit_detail();
         let upstream_timeout = model_upstream_timeout(&state, &model);
         return match dispatch_chat_request(

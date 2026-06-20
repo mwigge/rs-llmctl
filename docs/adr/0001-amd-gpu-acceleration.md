@@ -155,6 +155,25 @@ path (b or e) already depends on transitively, and it's part of why
 `rocm-smi`-based discovery in `resources.rs` works today even without a full
 ROCm dev/build stack installed.
 
+### (f) hipfire — Rust-native RDNA-targeted inference engine
+
+`github.com/Kaden-Schutt/hipfire`: a Rust + HIP engine that ships pre-compiled
+kernel blobs and JIT-compiles the rest, eliminating Python from the hot path.
+Key differentiators vs. (b) llama.cpp subprocess and (e) oxicuda-rocm:
+
+- Explicitly targets all RDNA generations including RDNA4 (gfx12xx) as a first-class target
+- CASK-based KV cache eviction handles long-context without OOM (addresses the
+  16 GB VRAM budget problem directly)
+- DFlash speculative decoding for throughput gains
+- 63% Rust codebase — could integrate as a native in-process backend rather
+  than a subprocess (closer to (e) than (b))
+- Requires ROCm 6+ on Linux; NixOS flake available
+
+**Status**: Track as a candidate AMD backend. Could replace both llama-server
+subprocess (b) and the oxicuda-rocm GEMM approach (e) if the project matures
+to full GGUF coverage. Evaluate once GGUF quantized-model support (Q4_K_M) is
+confirmed.
+
 ### Other options considered and discarded
 
 - **ONNX Runtime + ROCm execution provider** — would require exporting/
@@ -173,13 +192,18 @@ ROCm dev/build stack installed.
 
 ## Decision
 
-1. **Now**: Adopt **(d)** — keep the existing `NativeAcceleration::AmdRocm`
-   / `gpu_vendor` / `WorkerBackend::AmdVulkan` plumbing, but document it
-   inline (doc comments) as a resource-planning hook with no execution
-   backend yet, so `from_resources` selecting `AmdRocm`/`AmdVulkan` is
-   understood to still fail-close via `native.rs:1593-1599`. No code
-   behaviour change required — this is a documentation/comment correction
-   to avoid misleading future readers (including agents).
+1. **Now**: **(b) llama-server subprocess — implemented** (`src/worker.rs`).
+   `WorkerLaunchPlan::LlamaServerSubprocess` now wires `WorkerBackend::AmdVulkan`
+   to a managed llama-server child process when `gpu_vendor = "amd"` and a
+   HIP-enabled `llama-server` binary is available (`resources.llama_server_bin`
+   or auto-detected at `~/.local/bin/llama-server`). The subprocess path uses
+   `q8_0` K+V cache quantization, `--jinja`, and the correct `LD_LIBRARY_PATH`
+   for the HIP plugin (`libggml-hip.so` in `~/.local/lib/milliways`).
+   The milliways `install_local_amd_hip.sh` script builds llama-server with
+   `-DGGML_HIP=ON -DAMDGPU_TARGETS=<auto-detected gfx arch>` and installs it.
+
+   The candle-native path (`NativeAcceleration::AmdRocm` fail-close) is kept
+   as-is — **(d)** still applies for the native Candle path.
 
 2. **Track but do not block on (a)**: periodically check
    huggingface/candle#3424 for GGUF/quantized model support landing. Revisit

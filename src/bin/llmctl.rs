@@ -23,7 +23,11 @@ use rs_llmctl::quota::{self, Principal};
 use rs_llmctl::reporting;
 use rs_llmctl::runtime;
 use rs_llmctl::storage::Storage;
-use rs_llmctl::worker::{StartupPlan, SwapPlan, WorkerId};
+use rs_llmctl::worker::{
+    StartupPlan, SwapPlan, TokioWorkerRunner, WorkerId, WorkerLaunchPlan, WorkerSupervisor,
+};
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -122,6 +126,10 @@ enum Command {
     Integration {
         #[command(subcommand)]
         command: IntegrationCommand,
+    },
+    Amd {
+        #[command(subcommand)]
+        command: AmdCommand,
     },
 }
 
@@ -965,6 +973,30 @@ enum IntegrationCommand {
     AqeContract,
 }
 
+#[derive(Debug, Subcommand)]
+enum AmdCommand {
+    Qualify(AmdQualifyArgs),
+    InstallServer(AmdInstallServerArgs),
+}
+
+#[derive(Debug, Args)]
+struct AmdQualifyArgs {
+    #[arg(long)]
+    preview: bool,
+    #[arg(long, alias = "community-opt-in")]
+    arch_opt_in: bool,
+    #[arg(long)]
+    evidence: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct AmdInstallServerArgs {
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long, help = "Path to install-amd-hip.sh (defaults to scripts/install-amd-hip.sh in cwd)")]
+    script: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct DataExportArgs {
     #[arg(long, default_value_t = 24)]
@@ -1060,6 +1092,7 @@ async fn main() -> Result<()> {
         Command::Integration { command } => {
             integration_command(&config_path, command, cli.json).await
         }
+        Command::Amd { command } => amd_command(command, cli.json).await,
     }
 }
 
@@ -1627,23 +1660,61 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
         ServerCommand::Run => {
             config::validate_production_security(&cfg)?;
             let storage = init_storage(&cfg.storage).await?;
-            let engines = load_native_engines_from_config(&cfg)?;
+            let plan = StartupPlan::from_config(&cfg);
+            let has_subprocess = plan
+                .workers
+                .iter()
+                .any(|w| matches!(w.launch, WorkerLaunchPlan::LlamaServerSubprocess { .. }));
+
             let telemetry = TelemetryRuntime::install(&cfg, cfg.log.format == LogFormat::Json)?;
-            emit(
-                as_json,
-                &json!({
-                    "status": if engines.is_empty() { "no_models" } else { "ready" },
-                    "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
-                    "native_engines": engines.len()
-                }),
-            )?;
-            let result = rs_llmctl::server::serve_with_storage_and_native_engines(
-                cfg,
-                storage,
-                engines,
-                rs_llmctl::server::shutdown_signal(),
-            )
-            .await;
+
+            let result = if has_subprocess {
+                // AMD HIP path: llama-server subprocess handles all inference.
+                // Skip Candle engine loading entirely — attempting to Candle-load
+                // a 14B GGUF on CPU while the subprocess is serving it via GPU
+                // would waste RAM and time.
+                let mut supervisor =
+                    WorkerSupervisor::new(TokioWorkerRunner::new());
+                let statuses = supervisor.start_all(&plan).await;
+                let worker_count = statuses.len();
+                let worker_control =
+                    Arc::new(AsyncMutex::new(supervisor));
+                emit(
+                    as_json,
+                    &json!({
+                        "status": "ready",
+                        "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
+                        "backend": "llama-server-subprocess",
+                        "workers": worker_count,
+                        "native_engines": 0
+                    }),
+                )?;
+                rs_llmctl::server::serve_with_storage_worker_control_and_shutdown(
+                    cfg,
+                    storage,
+                    Some(worker_control),
+                    rs_llmctl::server::shutdown_signal(),
+                )
+                .await
+            } else {
+                let engines = load_native_engines_from_config(&cfg)?;
+                emit(
+                    as_json,
+                    &json!({
+                        "status": if engines.is_empty() { "no_models" } else { "ready" },
+                        "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
+                        "backend": "candle-native",
+                        "native_engines": engines.len()
+                    }),
+                )?;
+                rs_llmctl::server::serve_with_storage_and_native_engines(
+                    cfg,
+                    storage,
+                    engines,
+                    rs_llmctl::server::shutdown_signal(),
+                )
+                .await
+            };
             let shutdown = telemetry.shutdown();
             result.and(shutdown)
         }
@@ -4586,6 +4657,45 @@ async fn integration_command(
     match command {
         IntegrationCommand::AqeContract => {
             emit(as_json, &integrations::aqe_governance_contract(&cfg))
+        }
+    }
+}
+
+async fn amd_command(command: AmdCommand, as_json: bool) -> Result<()> {
+    match command {
+        AmdCommand::Qualify(args) => emit(
+            as_json,
+            &rs_llmctl::amd::qualification_report_with_evidence(
+                args.preview,
+                args.arch_opt_in,
+                args.evidence.as_deref(),
+            ),
+        ),
+        AmdCommand::InstallServer(args) => {
+            let script = args.script.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("scripts")
+                    .join("install-amd-hip.sh")
+            });
+            if !script.exists() {
+                bail!(
+                    "install script not found: {}  (set --script or run from the rs-llmctl repo root)",
+                    script.display()
+                );
+            }
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(&script);
+            if args.dry_run {
+                cmd.env("DRY_RUN", "1");
+            }
+            let status = cmd
+                .status()
+                .with_context(|| format!("failed to run {}", script.display()))?;
+            if !status.success() {
+                bail!("install script exited with status {status}");
+            }
+            Ok(())
         }
     }
 }
