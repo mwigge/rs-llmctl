@@ -4391,7 +4391,7 @@ struct ModelObject {
 
 /// Per-model capability advertisement consumed by external orchestrators
 /// (e.g. milliways sommelier) to route requests without out-of-band knowledge.
-/// All five fields are always present; unknowns surface as `0` or `"unknown"`
+/// All fields are always present; unknowns surface as `0` or `"unknown"`
 /// rather than being omitted, so the schema stays stable.
 #[derive(Debug, Serialize)]
 struct ModelCapabilities {
@@ -4399,6 +4399,11 @@ struct ModelCapabilities {
     context_window: u32,
     /// Stable tool-call protocol identifier; see `CandleModelFamily::tool_protocol()`.
     tool_protocol: &'static str,
+    /// Tool-call wire format consumed by external runners.
+    /// `"xml"` for Mistral-family models (Devstral, Mistral-instruct, etc.);
+    /// `"openai"` for all others. Allows milliways local runner to select the
+    /// correct prompt strategy without out-of-band configuration.
+    tool_format: &'static str,
     /// Approximate model size in billions of parameters. `0.0` when unknown.
     /// Heuristic: parsed from a `-{N}B` suffix in the alias if present.
     model_size_b: f32,
@@ -4489,6 +4494,18 @@ fn tool_protocol_for_family(_family_str: &str) -> &'static str {
     "none"
 }
 
+/// Wire format for tool calls. Mistral-family models require XML tool calling
+/// (the `<tool_call>…</tool_call>` block format used by Devstral and Mistral
+/// instruct variants). All other families use the standard OpenAI JSON
+/// `tool_calls` array. Defaults to `"openai"` for unknown families.
+fn tool_format_for_family(family_str: &str) -> &'static str {
+    if family_str == "mistral" {
+        "xml"
+    } else {
+        "openai"
+    }
+}
+
 fn build_model_object(model: &ModelConfig, snap: CapabilitySnapshot) -> ModelObject {
     let family_str = model.family.as_deref().unwrap_or("");
     ModelObject {
@@ -4498,6 +4515,7 @@ fn build_model_object(model: &ModelConfig, snap: CapabilitySnapshot) -> ModelObj
         capabilities: ModelCapabilities {
             context_window: default_context_window_for_family(family_str),
             tool_protocol: tool_protocol_for_family(family_str),
+            tool_format: tool_format_for_family(family_str),
             model_size_b: parse_model_size_b_from_alias(&model.alias),
             gpu_backend: snap.gpu_backend,
             tier: snap.tier,
@@ -5014,6 +5032,48 @@ mod tests {
         assert_eq!(legacy.id, "qwen3-8b");
         assert_eq!(legacy.object, "model");
         assert_eq!(legacy.owned_by, "rs-llmctl");
+    }
+
+    #[test]
+    fn tool_format_openai_for_qwen3_family() {
+        let mc = ModelConfig {
+            alias: "qwen3-14b".into(),
+            path: std::path::PathBuf::from("/tmp/none.gguf"),
+            role: "chat".into(),
+            family: Some("qwen3".into()),
+            weight: 1,
+        };
+        let json =
+            serde_json::to_value(build_model_object(&mc, CapabilitySnapshot::current())).unwrap();
+        assert_eq!(json["capabilities"]["tool_format"], "openai");
+    }
+
+    #[test]
+    fn tool_format_xml_for_devstral_family() {
+        let mc = ModelConfig {
+            alias: "devstral-small-2505".into(),
+            path: std::path::PathBuf::from("/tmp/none.gguf"),
+            role: "chat".into(),
+            family: Some("mistral".into()),
+            weight: 1,
+        };
+        let json =
+            serde_json::to_value(build_model_object(&mc, CapabilitySnapshot::current())).unwrap();
+        assert_eq!(json["capabilities"]["tool_format"], "xml");
+    }
+
+    #[test]
+    fn tool_format_openai_for_gemma4_family() {
+        let mc = ModelConfig {
+            alias: "gemma4-12b".into(),
+            path: std::path::PathBuf::from("/tmp/none.gguf"),
+            role: "chat".into(),
+            family: Some("gemma4".into()),
+            weight: 1,
+        };
+        let json =
+            serde_json::to_value(build_model_object(&mc, CapabilitySnapshot::current())).unwrap();
+        assert_eq!(json["capabilities"]["tool_format"], "openai");
     }
 
     #[test]
