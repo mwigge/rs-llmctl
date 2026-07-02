@@ -30,7 +30,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs as stdfs;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -43,11 +42,17 @@ use uuid::Uuid;
 
 const DEFAULT_SERVICE_NAME: &str = "llmctld.service";
 
+#[path = "llmctl/aiops.rs"]
+mod aiops;
 #[path = "llmctl/cli.rs"]
 mod cli;
+#[path = "llmctl/first_run.rs"]
+mod first_run;
 #[path = "llmctl/service_lifecycle.rs"]
 mod service_lifecycle;
+use aiops::*;
 use cli::*;
+use first_run::*;
 use service_lifecycle::*;
 
 #[tokio::main]
@@ -134,467 +139,6 @@ async fn init(path: &Path, args: InitArgs, as_json: bool) -> Result<()> {
         as_json,
         &json!({ "config": path, "database": cfg.storage.db_path, "model_dir": cfg.storage.model_dir }),
     )
-}
-
-async fn first_run(path: &Path, args: FirstRunArgs, as_json: bool) -> Result<()> {
-    validate_api_key_id(&args.api_key_id)?;
-    validate_first_run_identity(&args)?;
-    let scopes = first_run_scopes(&args);
-    let config_exists = path.exists();
-    let mut cfg = if config_exists {
-        load_config(path).await?
-    } else {
-        first_run_default_config(path, args.data_dir.as_deref())
-    };
-    if let Some(data_dir) = args.data_dir.as_deref() {
-        cfg.storage.db_path = data_dir.join("llmctl.db");
-        cfg.storage.model_dir = data_dir.join("models");
-    }
-
-    let base_url = args
-        .base_url
-        .clone()
-        .unwrap_or_else(|| first_run_base_url(&cfg));
-    let smoke_model = first_run_smoke_model(&cfg, &args);
-    let smoke_question = args
-        .smoke_question
-        .as_deref()
-        .unwrap_or("Reply with only: llmctl smoke ok");
-    let plan = first_run_plan_json(&FirstRunRenderContext {
-        path,
-        cfg: &cfg,
-        args: &args,
-        scopes: &scopes,
-        config_existed: config_exists,
-        base_url: &base_url,
-        smoke_model: &smoke_model,
-        smoke_question,
-    });
-
-    if !args.apply {
-        return emit(as_json, &plan);
-    }
-
-    let secret_output = args
-        .secret_output
-        .as_deref()
-        .context("first-run --apply requires --secret-output so the raw API key is written once outside config")?;
-    if cfg
-        .security
-        .api_keys
-        .iter()
-        .any(|key| key.id == args.api_key_id)
-    {
-        bail!("api key id `{}` already exists", args.api_key_id);
-    }
-
-    let secret = generate_api_key_secret(&args.key_prefix);
-    let sha256 = hex::encode(Sha256::digest(secret.as_bytes()));
-    let last_four = last_four(&secret);
-    let key = ApiKeyConfig {
-        id: args.api_key_id.clone(),
-        sha256,
-        subject: args.subject.clone(),
-        team: args.team.clone(),
-        scopes: scopes.clone(),
-        created_at: Some(Utc::now()),
-        expires_at: None,
-        rotated_at: None,
-        owner: args.owner.clone(),
-        purpose: args
-            .purpose
-            .clone()
-            .or_else(|| Some("first-run operator access".to_string())),
-        last_four: Some(last_four.clone()),
-        fingerprint: None,
-        status: "active".to_string(),
-    };
-    cfg.security.require_auth = true;
-    cfg.security.api_keys.push(key);
-
-    let installed_model = if let Some(model_path) = args.starter_model_path.as_ref() {
-        create_storage_dirs(&cfg.storage).await?;
-        let installed = model::install_model(&ModelInstallRequest {
-            alias: args.starter_model_alias.clone(),
-            source: ModelSource::LocalPath {
-                path: model_path.clone(),
-            },
-            cache_dir: cfg.storage.model_dir.clone(),
-            copy_to_cache: false,
-            expected_sha256: None,
-            role: args.starter_model_role.clone(),
-            family: Some(args.starter_model_family.clone()),
-            weight: args.starter_model_weight,
-        })
-        .await?;
-        upsert_model(&mut cfg.models, installed.config.clone());
-        Some(installed)
-    } else {
-        None
-    };
-
-    create_storage_dirs(&cfg.storage).await?;
-    write_secret_file(secret_output, &secret).await?;
-    config::save(path, &cfg).await?;
-    let storage = init_storage(&cfg.storage).await?;
-    for model in &cfg.models {
-        storage.upsert_model(model).await?;
-    }
-
-    emit(
-        as_json,
-        &first_run_applied_json(
-            &FirstRunRenderContext {
-                path,
-                cfg: &cfg,
-                args: &args,
-                scopes: &scopes,
-                config_existed: config_exists,
-                base_url: &base_url,
-                smoke_model: &smoke_model,
-                smoke_question,
-            },
-            secret_output,
-            &last_four,
-            installed_model.as_ref(),
-        ),
-    )
-}
-
-struct FirstRunRenderContext<'a> {
-    path: &'a Path,
-    cfg: &'a Config,
-    args: &'a FirstRunArgs,
-    scopes: &'a [String],
-    config_existed: bool,
-    base_url: &'a str,
-    smoke_model: &'a str,
-    smoke_question: &'a str,
-}
-
-fn first_run_default_config(path: &Path, data_dir: Option<&Path>) -> Config {
-    let mut cfg = Config::default();
-    let state_dir = data_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        path.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("rs-llmctl-state")
-    });
-    cfg.storage.db_path = state_dir.join("llmctl.db");
-    cfg.storage.model_dir = state_dir.join("models");
-    cfg.resources.cpu_only = true;
-    cfg
-}
-
-fn validate_first_run_identity(args: &FirstRunArgs) -> Result<()> {
-    if args.subject.trim().is_empty() {
-        bail!("subject must not be empty");
-    }
-    if args.team.trim().is_empty() {
-        bail!("team must not be empty");
-    }
-    if args.key_prefix.trim().is_empty() {
-        bail!("key-prefix must not be empty");
-    }
-    if args.api_key_env.trim().is_empty() {
-        bail!("api-key-env must not be empty");
-    }
-    if args.starter_model_alias.trim().is_empty() {
-        bail!("starter-model-alias must not be empty");
-    }
-    if args.starter_model_role.trim().is_empty() {
-        bail!("starter-model-role must not be empty");
-    }
-    Ok(())
-}
-
-fn first_run_scopes(args: &FirstRunArgs) -> Vec<String> {
-    if args.scopes.is_empty() {
-        vec!["chat".to_string(), "models.read".to_string()]
-    } else {
-        args.scopes.clone()
-    }
-}
-
-fn first_run_base_url(cfg: &Config) -> String {
-    format!("http://{}:{}/v1", cfg.server.host, cfg.server.port)
-}
-
-fn first_run_smoke_model(cfg: &Config, args: &FirstRunArgs) -> String {
-    if args.starter_model_path.is_some() {
-        return args.starter_model_alias.clone();
-    }
-    cfg.models
-        .iter()
-        .find(|model| model.weight > 0)
-        .or_else(|| cfg.models.first())
-        .map(|model| model.alias.clone())
-        .unwrap_or_else(|| args.starter_model_alias.clone())
-}
-
-fn first_run_plan_json(context: &FirstRunRenderContext<'_>) -> Value {
-    let next_command = first_run_apply_command(context);
-    json!({
-        "status": "planned",
-        "mode": "dry-run",
-        "side_effects": false,
-        "config": context.path,
-        "config_exists": context.config_existed,
-        "api_key": first_run_api_key_json(context.args, context.scopes, None, None),
-        "starter_model": first_run_starter_model_plan(context.args),
-        "config_changes": {
-            "write_config": true,
-            "require_auth": true,
-            "storage_db_path": context.cfg.storage.db_path,
-            "model_dir": context.cfg.storage.model_dir
-        },
-        "smoke": first_run_smoke_json(
-            context.base_url,
-            context.smoke_model,
-            context.smoke_question,
-            &context.args.api_key_env
-        ),
-        "next_command": shell_join(&next_command),
-        "next_command_argv": next_command
-    })
-}
-
-fn first_run_apply_command(context: &FirstRunRenderContext<'_>) -> Vec<String> {
-    let args = context.args;
-    let mut command = vec![
-        "llmctl".to_string(),
-        "--config".to_string(),
-        context.path.display().to_string(),
-        "first-run".to_string(),
-        "--apply".to_string(),
-        "--secret-output".to_string(),
-        args.secret_output
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<secret-file>".to_string()),
-        "--key-prefix".to_string(),
-        args.key_prefix.clone(),
-        "--api-key-id".to_string(),
-        args.api_key_id.clone(),
-        "--subject".to_string(),
-        args.subject.clone(),
-        "--team".to_string(),
-        args.team.clone(),
-    ];
-    for scope in &args.scopes {
-        command.push("--scope".to_string());
-        command.push(scope.clone());
-    }
-    if let Some(owner) = &args.owner {
-        command.push("--owner".to_string());
-        command.push(owner.clone());
-    }
-    if let Some(purpose) = &args.purpose {
-        command.push("--purpose".to_string());
-        command.push(purpose.clone());
-    }
-    if let Some(data_dir) = &args.data_dir {
-        command.push("--data-dir".to_string());
-        command.push(data_dir.display().to_string());
-    }
-    if let Some(path) = &args.starter_model_path {
-        command.push("--starter-model-path".to_string());
-        command.push(path.display().to_string());
-    }
-    command.push("--starter-model-alias".to_string());
-    command.push(args.starter_model_alias.clone());
-    command.push("--starter-model-role".to_string());
-    command.push(args.starter_model_role.clone());
-    command.push("--starter-model-family".to_string());
-    command.push(args.starter_model_family.clone());
-    command.push("--starter-model-weight".to_string());
-    command.push(args.starter_model_weight.to_string());
-    if let Some(base_url) = &args.base_url {
-        command.push("--base-url".to_string());
-        command.push(base_url.clone());
-    }
-    command.push("--api-key-env".to_string());
-    command.push(args.api_key_env.clone());
-    if let Some(question) = &args.smoke_question {
-        command.push("--smoke-question".to_string());
-        command.push(question.clone());
-    }
-    command
-}
-
-fn shell_join(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| {
-            if arg.chars().all(|ch| {
-                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '<' | '>')
-            }) {
-                arg.clone()
-            } else {
-                format!("'{}'", arg.replace('\'', "'\\''"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn first_run_applied_json(
-    context: &FirstRunRenderContext<'_>,
-    secret_output: &Path,
-    last_four: &str,
-    installed_model: Option<&model::InstalledModel>,
-) -> Value {
-    json!({
-        "status": "applied",
-        "mode": "apply",
-        "side_effects": true,
-        "config": context.path,
-        "config_existed": context.config_existed,
-        "api_key": first_run_api_key_json(
-            context.args,
-            context.scopes,
-            Some(secret_output),
-            Some(last_four)
-        ),
-        "starter_model": first_run_starter_model_applied(context.args, installed_model),
-        "config_changes": {
-            "wrote_config": true,
-            "require_auth": context.cfg.security.require_auth,
-            "api_keys": context.cfg.security.api_keys.len(),
-            "models": context.cfg.models.len(),
-            "storage_db_path": context.cfg.storage.db_path,
-            "model_dir": context.cfg.storage.model_dir
-        },
-        "smoke": first_run_smoke_json(
-            context.base_url,
-            context.smoke_model,
-            context.smoke_question,
-            &context.args.api_key_env
-        )
-    })
-}
-
-fn first_run_api_key_json(
-    args: &FirstRunArgs,
-    scopes: &[String],
-    secret_output: Option<&Path>,
-    last_four: Option<&str>,
-) -> Value {
-    json!({
-        "action": "generate",
-        "id": args.api_key_id,
-        "subject": args.subject,
-        "team": args.team,
-        "scopes": scopes,
-        "owner": args.owner,
-        "purpose": args.purpose.as_deref().unwrap_or("first-run operator access"),
-        "secret_output": args.secret_output,
-        "secret_written": secret_output.map(|path| path.display().to_string()),
-        "last_four": last_four,
-        "sha256_present": secret_output.is_some(),
-        "config_storage": "sha256-only",
-        "plaintext_secret_storage": false,
-        "print_secret": false
-    })
-}
-
-fn first_run_starter_model_plan(args: &FirstRunArgs) -> Value {
-    match args.starter_model_path.as_ref() {
-        Some(path) => json!({
-            "action": "configure-local",
-            "alias": args.starter_model_alias,
-            "role": args.starter_model_role,
-            "family": args.starter_model_family,
-            "weight": args.starter_model_weight,
-            "path": path,
-            "source_kind": "local",
-            "network": false,
-            "exists": path.exists()
-        }),
-        None => json!({
-            "action": "recommend",
-            "alias": args.starter_model_alias,
-            "role": args.starter_model_role,
-            "family": args.starter_model_family,
-            "weight": args.starter_model_weight,
-            "source_kind": "none",
-            "network": false,
-            "recommendation": "provide --starter-model-path /path/to/model.gguf, /path/to/model.safetensors with sibling config.json/tokenizer.json, or a safetensors directory containing config.json, tokenizer.json, and weights; offline manifests are also supported"
-        }),
-    }
-}
-
-fn first_run_starter_model_applied(
-    args: &FirstRunArgs,
-    installed_model: Option<&model::InstalledModel>,
-) -> Value {
-    if let Some(installed) = installed_model {
-        json!({
-            "action": "configured",
-            "alias": installed.alias,
-            "role": installed.config.role,
-            "family": installed.config.family,
-            "weight": installed.config.weight,
-            "path": installed.path,
-            "source_kind": "local",
-            "network": false,
-            "sha256": installed.sha256,
-            "bytes": installed.bytes,
-            "verified": installed.verification.verified
-        })
-    } else {
-        first_run_starter_model_plan(args)
-    }
-}
-
-fn first_run_smoke_json(base_url: &str, model: &str, question: &str, api_key_env: &str) -> Value {
-    json!({
-        "action": "plan",
-        "base_url": base_url,
-        "model": model,
-        "question": question,
-        "api_key_env": api_key_env,
-        "ask_question": {
-            "helper": "ask_question",
-            "crate": "rs-llmctl-client",
-            "environment": {
-                "LLMCTL_BASE_URL": base_url,
-                "api_key_env": api_key_env
-            },
-            "metadata": {
-                "session_id": "first-run-smoke",
-                "purpose": "operator-smoke"
-            }
-        },
-        "openai_compatible": {
-            "method": "POST",
-            "endpoint": "/v1/chat/completions",
-            "url": format!("{}/chat/completions", base_url.trim_end_matches('/')),
-            "headers": [
-                format!("Authorization: Bearer ${api_key_env}"),
-                "Content-Type: application/json"
-            ],
-            "body": {
-                "model": model,
-                "messages": [
-                    { "role": "user", "content": question }
-                ],
-                "metadata": {
-                    "session_id": "first-run-smoke",
-                    "purpose": "operator-smoke"
-                }
-            }
-        }
-    })
-}
-
-fn last_four(value: &str) -> String {
-    value
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
 }
 
 fn apply_init_profile(cfg: &mut Config, args: &InitArgs) {
@@ -1698,7 +1242,7 @@ async fn security_command(path: &Path, command: SecurityCommand, as_json: bool) 
     }
 }
 
-fn generate_api_key_secret(prefix: &str) -> String {
+pub(crate) fn generate_api_key_secret(prefix: &str) -> String {
     let cleaned = prefix
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
@@ -1713,7 +1257,7 @@ fn generate_api_key_secret(prefix: &str) -> String {
     format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
-async fn write_secret_file(path: &Path, secret: &str) -> Result<()> {
+pub(crate) async fn write_secret_file(path: &Path, secret: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .await
@@ -2528,309 +2072,6 @@ fn redact_display_path(path: &Path) -> String {
         .unwrap_or(rendered)
 }
 
-async fn aiops_command(command: AiopsCommand, as_json: bool) -> Result<()> {
-    match command {
-        AiopsCommand::Gaps => emit(as_json, &aiops_gaps_report()),
-        AiopsCommand::SloPlan(args) => emit_slo_plan(args),
-        AiopsCommand::IncidentTemplate(args) => emit(as_json, &incident_template(args)),
-    }
-}
-
-fn aiops_gaps_report() -> serde_json::Value {
-    json!({
-        "status": "tracked",
-        "delivered": [
-            "typed production/local config profiles",
-            "SSE, log, event, OTel, and data-fabric config fields",
-            "schema-versioned contracts for security, observability, usage, user, finops, model, drift, and audit datasets",
-            "domain-filtered JSON, JSONL, Arrow-schema JSON, Arrow IPC, and Parquet exports",
-            "CRA Article 14 active-control evidence and PCI DSS aligned reporting commands",
-            "OpenAI-compatible model and chat serving, local search, recommendations, quotas, and worker lifecycle controls",
-            "manifest-driven eval suites that execute golden prompts against OpenAI-compatible endpoints",
-            "runtime request-to-lineage joins for chat, local search, and recommendations",
-            "Prometheus/Alertmanager rules and Grafana dashboard renderers for SLOs",
-            "HMAC policy bundles plus Ed25519 policy signatures and hash-chained transparency logs",
-            "Candle-native greedy autoregressive decoding for Qwen3, Gemma-family, and Mistral safetensors paths where Candle exposes model support"
-        ],
-        "gaps": [
-            {
-                "area": "native-inference",
-                "gap": "DeepSeek, Kimi, and MiniMax remain tracked native backend targets; DeepSeek metadata exists in Candle but is not wired and verified, while Kimi and MiniMax do not expose reviewed Candle architecture modules to instantiate",
-                "next_control": "wire DeepSeek first if Candle deepseek2 maps cleanly to the target artifacts, then upgrade Candle or vendor reviewed Kimi and MiniMax model implementations behind the NativeCandleDecoder"
-            },
-            {
-                "area": "observability",
-                "gap": "RED metrics, upstream circuit-breaker state metrics, heartbeat, admission rejection metrics, and worker lifecycle telemetry are emitted; deeper burn-rate deployment sync remains operator-managed",
-                "next_control": "add optional push/apply helpers for Prometheus and Grafana provisioning"
-            },
-            {
-                "area": "model-quality",
-                "gap": "eval suites execute configured prompts, but advanced judges and rubric scoring are not bundled",
-                "next_control": "add optional LLM-as-judge and rubric evaluators with deterministic evidence output"
-            },
-            {
-                "area": "lineage",
-                "gap": "runtime joins are recorded when clients provide lineage IDs; automatic corpus/model lineage inference is not complete",
-                "next_control": "derive lineage IDs from configured model manifests and managed RAG indexes"
-            },
-            {
-                "area": "operations",
-                "gap": "SLO plans include Prometheus/Alertmanager rules and Grafana dashboards; live deployment sync is operator-managed",
-                "next_control": "add optional push/apply helpers for Prometheus rule files and Grafana dashboard provisioning"
-            },
-            {
-                "area": "governance",
-                "gap": "Ed25519 signing and a local transparency log exist; Sigstore/Rekor publication is not bundled",
-                "next_control": "add optional Sigstore/Rekor publication for organizations that want public transparency"
-            }
-        ]
-    })
-}
-
-fn emit_slo_plan(args: AiopsSloPlanArgs) -> Result<()> {
-    let rendered = match args.format {
-        AiopsSloPlanFormat::Plan => serde_json::to_string_pretty(&slo_plan(&args))?,
-        AiopsSloPlanFormat::Prometheus => prometheus_slo_rules(&args),
-        AiopsSloPlanFormat::Grafana => serde_json::to_string_pretty(&grafana_slo_dashboard(&args))?,
-    };
-
-    if let Some(output) = args.output {
-        stdfs::write(&output, rendered).with_context(|| format!("write {}", output.display()))?;
-    } else {
-        println!("{rendered}");
-    }
-    Ok(())
-}
-
-fn slo_plan(args: &AiopsSloPlanArgs) -> serde_json::Value {
-    json!({
-        "schema_version": 1,
-        "kind": "slo-plan",
-        "generated_at": Utc::now(),
-        "slos": {
-            "availability_percent": args.availability_percent,
-            "latency_p95_ms": args.latency_p95_ms,
-            "error_rate_percent": args.error_rate_percent
-        },
-        "alert_rules": [
-            {
-                "name": "llmctl_availability_below_slo",
-                "expr": format!("100 * (1 - (sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])))) < {}", args.availability_percent),
-                "for": "10m",
-                "severity": "page"
-            },
-            {
-                "name": "llmctl_high_error_rate",
-                "expr": format!("sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {}", args.error_rate_percent / 100.0),
-                "for": "10m",
-                "severity": "page"
-            },
-            {
-                "name": "llmctl_fast_burn_error_budget",
-                "expr": format!("(sum(rate(llmctl_slo_violations_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {fast_burn}) and (sum(rate(llmctl_slo_violations_total[1h])) / sum(rate(llmctl_requests_total[1h])) > {fast_burn})", fast_burn = (100.0 - args.availability_percent) / 100.0 * 14.4),
-                "for": "2m",
-                "severity": "page"
-            },
-            {
-                "name": "llmctl_slow_burn_error_budget",
-                "expr": format!("(sum(rate(llmctl_slo_violations_total[30m])) / sum(rate(llmctl_requests_total[30m])) > {slow_burn}) and (sum(rate(llmctl_slo_violations_total[6h])) / sum(rate(llmctl_requests_total[6h])) > {slow_burn})", slow_burn = (100.0 - args.availability_percent) / 100.0 * 6.0),
-                "for": "15m",
-                "severity": "ticket"
-            },
-            {
-                "name": "llmctl_high_latency_p95",
-                "expr": format!("histogram_quantile(0.95, rate(llmctl_request_latency_ms_bucket[5m])) > {}", args.latency_p95_ms),
-                "for": "15m",
-                "severity": "ticket"
-            }
-        ],
-        "evidence_commands": [
-            "llmctl observe plan",
-            "llmctl usage report --hours 24",
-            "llmctl compliance evidence"
-        ]
-    })
-}
-
-fn prometheus_slo_rules(args: &AiopsSloPlanArgs) -> String {
-    format!(
-        r#"groups:
-  - name: llmctl_slo_alerts
-    rules:
-      - alert: LlmctlAvailabilityBelowSlo
-        expr: 100 * (1 - (sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])))) < {availability_percent}
-        for: 10m
-        labels:
-          severity: page
-          service: llmctl
-        annotations:
-          summary: rs-llmctl availability is below SLO
-          description: Availability over 5m is below {availability_percent}%.
-      - alert: LlmctlHighErrorRate
-        expr: sum(rate(llmctl_request_errors_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {error_rate}
-        for: 10m
-        labels:
-          severity: page
-          service: llmctl
-        annotations:
-          summary: rs-llmctl error rate exceeds SLO
-          description: Error rate over 5m is above {error_rate_percent}%.
-      - alert: LlmctlFastBurnErrorBudget
-        expr: (sum(rate(llmctl_slo_violations_total[5m])) / sum(rate(llmctl_requests_total[5m])) > {fast_burn}) and (sum(rate(llmctl_slo_violations_total[1h])) / sum(rate(llmctl_requests_total[1h])) > {fast_burn})
-        for: 2m
-        labels:
-          severity: page
-          service: llmctl
-        annotations:
-          summary: rs-llmctl is burning error budget quickly
-          description: 5m and 1h burn-rate windows both exceed the fast-burn threshold.
-      - alert: LlmctlSlowBurnErrorBudget
-        expr: (sum(rate(llmctl_slo_violations_total[30m])) / sum(rate(llmctl_requests_total[30m])) > {slow_burn}) and (sum(rate(llmctl_slo_violations_total[6h])) / sum(rate(llmctl_requests_total[6h])) > {slow_burn})
-        for: 15m
-        labels:
-          severity: ticket
-          service: llmctl
-        annotations:
-          summary: rs-llmctl is steadily burning error budget
-          description: 30m and 6h burn-rate windows both exceed the slow-burn threshold.
-      - alert: LlmctlHighLatencyP95
-        expr: histogram_quantile(0.95, sum(rate(llmctl_request_latency_ms_bucket[5m])) by (le)) > {latency_p95_ms}
-        for: 15m
-        labels:
-          severity: ticket
-          service: llmctl
-        annotations:
-          summary: rs-llmctl p95 latency exceeds SLO
-          description: Request latency p95 is above {latency_p95_ms}ms.
-"#,
-        availability_percent = args.availability_percent,
-        error_rate = args.error_rate_percent / 100.0,
-        error_rate_percent = args.error_rate_percent,
-        fast_burn = (100.0 - args.availability_percent) / 100.0 * 14.4,
-        slow_burn = (100.0 - args.availability_percent) / 100.0 * 6.0,
-        latency_p95_ms = args.latency_p95_ms,
-    )
-}
-
-fn grafana_slo_dashboard(args: &AiopsSloPlanArgs) -> serde_json::Value {
-    json!({
-        "uid": "llmctl-slos",
-        "title": "rs-llmctl SLOs",
-        "schemaVersion": 39,
-        "version": 1,
-        "refresh": "30s",
-        "tags": ["llmctl", "slo", "aiops"],
-        "time": {
-            "from": "now-6h",
-            "to": "now"
-        },
-        "templating": {
-            "list": [
-                {
-                    "name": "datasource",
-                    "type": "datasource",
-                    "query": "prometheus",
-                    "current": {
-                        "text": "Prometheus",
-                        "value": "Prometheus"
-                    }
-                }
-            ]
-        },
-        "panels": [
-            grafana_timeseries_panel(
-                1,
-                "Availability",
-                0,
-                0,
-                "percent",
-                "100 * sum(rate(llmctl_requests_total{status!=\"error\"}[5m])) / sum(rate(llmctl_requests_total[5m]))".to_string(),
-                Some(args.availability_percent),
-            ),
-            grafana_timeseries_panel(
-                2,
-                "Error Rate",
-                12,
-                0,
-                "percentunit",
-                "sum(rate(llmctl_requests_total{status=\"error\"}[5m])) / sum(rate(llmctl_requests_total[5m]))".to_string(),
-                Some(args.error_rate_percent / 100.0),
-            ),
-            grafana_timeseries_panel(
-                3,
-                "Latency p95",
-                0,
-                8,
-                "ms",
-                "histogram_quantile(0.95, sum(rate(llmctl_request_latency_ms_bucket[5m])) by (le))".to_string(),
-                Some(args.latency_p95_ms as f64),
-            ),
-        ]
-    })
-}
-
-fn grafana_timeseries_panel(
-    id: u64,
-    title: &str,
-    x: u64,
-    y: u64,
-    unit: &str,
-    expr: String,
-    threshold: Option<f64>,
-) -> serde_json::Value {
-    json!({
-        "id": id,
-        "type": "timeseries",
-        "title": title,
-        "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-        },
-        "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": x,
-            "y": y
-        },
-        "targets": [
-            {
-                "refId": "A",
-                "expr": expr,
-                "legendFormat": title
-            }
-        ],
-        "fieldConfig": {
-            "defaults": {
-                "unit": unit,
-                "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                        {
-                            "color": "green",
-                            "value": null
-                        },
-                        {
-                            "color": "red",
-                            "value": threshold
-                        }
-                    ]
-                }
-            },
-            "overrides": []
-        },
-        "options": {
-            "legend": {
-                "displayMode": "list",
-                "placement": "bottom"
-            },
-            "tooltip": {
-                "mode": "single",
-                "sort": "none"
-            }
-        }
-    })
-}
-
 async fn eval_command(path: &Path, command: EvalCommand, as_json: bool) -> Result<()> {
     let cfg = load_config(path).await?;
     let path = state_file(&cfg, "eval-runs.jsonl")?;
@@ -3540,39 +2781,6 @@ fn policy_log_entry_hash(entry: &serde_json::Value) -> Result<String> {
     Ok(sha256_hex(canonical.as_bytes()))
 }
 
-fn incident_template(args: AiopsIncidentTemplateArgs) -> serde_json::Value {
-    json!({
-        "schema_version": 1,
-        "kind": "incident-evidence-template",
-        "generated_at": Utc::now(),
-        "severity": args.severity,
-        "team": args.team,
-        "cra_article_14": {
-            "operational_status": "active_control",
-            "early_warning_due": "within_24_hours",
-            "vulnerability_notification_due": "within_72_hours",
-            "final_vulnerability_report_due": "within_14_days_after_mitigation"
-        },
-        "sections": [
-            "summary",
-            "timeline",
-            "affected_models",
-            "affected_users_or_teams",
-            "security_impact",
-            "data_impact",
-            "mitigation",
-            "evidence"
-        ],
-        "evidence_commands": [
-            "llmctl security audit-config",
-            "llmctl audit report monthly --envelope",
-            "llmctl data export --envelope",
-            "llmctl lineage list",
-            "llmctl eval report"
-        ]
-    })
-}
-
 async fn compliance_command(path: &Path, command: ComplianceCommand, as_json: bool) -> Result<()> {
     let cfg = load_config(path).await?;
     let evidence = compliance_evidence(&cfg);
@@ -3733,7 +2941,7 @@ async fn amd_command(command: AmdCommand, as_json: bool) -> Result<()> {
     }
 }
 
-async fn load_config(path: &Path) -> Result<Config> {
+pub(crate) async fn load_config(path: &Path) -> Result<Config> {
     config::load(path)
         .await
         .with_context(|| format!("load {}", path.display()))
@@ -3746,7 +2954,7 @@ async fn read_startup_plan(path: &Path) -> Result<StartupPlan> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse startup plan {}", path.display()))
 }
 
-async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
+pub(crate) async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
     let plan = storage.connection_plan()?;
     if plan.backend == rs_llmctl::storage::StorageBackend::Sqlite {
         if let Some(parent) = storage.db_path.parent() {
@@ -3757,7 +2965,7 @@ async fn create_storage_dirs(storage: &StorageConfig) -> Result<()> {
     Ok(())
 }
 
-async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
+pub(crate) async fn init_storage(storage: &StorageConfig) -> Result<Storage> {
     create_storage_dirs(storage).await?;
     Storage::connect_config(storage).await
 }
@@ -3873,7 +3081,7 @@ async fn replace_model(
     )
 }
 
-fn upsert_model(models: &mut Vec<ModelConfig>, model: ModelConfig) {
+pub(crate) fn upsert_model(models: &mut Vec<ModelConfig>, model: ModelConfig) {
     if let Some(existing) = models.iter_mut().find(|m| m.alias == model.alias) {
         *existing = model;
     } else {
@@ -4003,7 +3211,7 @@ fn validate_add_key_args(id: &str, sha256: &str, subject: &str, team: &str) -> R
     Ok(())
 }
 
-fn validate_api_key_id(id: &str) -> Result<()> {
+pub(crate) fn validate_api_key_id(id: &str) -> Result<()> {
     if id.trim().is_empty() {
         bail!("api key id must not be empty");
     }
@@ -4654,7 +3862,7 @@ fn window(hours: i64) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
     (from, to)
 }
 
-fn emit<T: Serialize>(_: bool, value: &T) -> Result<()> {
+pub(crate) fn emit<T: Serialize>(_: bool, value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
