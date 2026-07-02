@@ -53,6 +53,7 @@ use uuid::Uuid;
 mod admin;
 mod auth;
 mod embeddings;
+mod health;
 mod lineage;
 mod local;
 mod models;
@@ -61,6 +62,10 @@ mod traffic;
 use auth::{auth_source_key, authenticate_request, authenticate_with_chat_scope};
 #[cfg(test)]
 use auth::{authenticate, forwarded_client_ip, is_trusted_proxy};
+use health::draining_response;
+pub use health::readiness_status;
+#[cfg(test)]
+use health::readiness_status_for;
 use lineage::{record_request_lineage_joins, runtime_lineage_from_headers_and_metadata};
 use models::*;
 use sse::{usage_tokens, SseUsageParser};
@@ -210,9 +215,9 @@ fn router_with_worker_control_native_engine_and_drain(
 
     Router::new()
         .route("/playground", get(playground))
-        .route("/healthz", get(healthz))
-        .route("/livez", get(livez))
-        .route("/readyz", get(readyz))
+        .route("/healthz", get(health::healthz))
+        .route("/livez", get(health::livez))
+        .route("/readyz", get(health::readyz))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings::proxy_embeddings))
@@ -354,89 +359,6 @@ fn playground_html() -> &'static str {
 
 async fn playground() -> impl IntoResponse {
     Html(playground_html())
-}
-
-async fn healthz() -> impl IntoResponse {
-    Json(json!({ "status": "ok" }))
-}
-
-async fn livez() -> impl IntoResponse {
-    Json(json!({ "status": "ok" }))
-}
-
-fn draining_response(state: &ServerState, request_id: Uuid) -> Option<Response> {
-    if state.draining.load(Ordering::SeqCst) {
-        Some(with_request_id(
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_draining",
-                "server is draining; retry on another node".to_string(),
-            ),
-            request_id,
-        ))
-    } else {
-        None
-    }
-}
-
-async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
-    let storage_ready = storage_ready(&state.storage).await;
-    let draining = state.draining.load(Ordering::SeqCst);
-    let active_models = active_routed_models(&state.cfg).len();
-    let ready = storage_ready && !draining && active_models > 0;
-    let http_status = if ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    (
-        http_status,
-        Json(readiness_status_for(&state.cfg, storage_ready, draining)),
-    )
-        .into_response()
-}
-
-pub async fn readiness_status(cfg: &Config, storage: &Storage) -> Value {
-    readiness_status_for(cfg, storage_ready(storage).await, false)
-}
-
-fn readiness_status_for(cfg: &Config, storage_ready: bool, draining: bool) -> Value {
-    let aliases: Vec<_> = active_routed_models(cfg)
-        .into_iter()
-        .map(|model| model.alias.as_str())
-        .collect();
-    let worker_plan = StartupPlan::from_config(cfg);
-    let ready = storage_ready && !draining && !aliases.is_empty();
-
-    json!({
-        "status": if ready { "ready" } else if draining { "draining" } else if aliases.is_empty() { "no_models" } else { "unavailable" },
-        "mode": cfg.mode,
-        "draining": draining,
-        "models": {
-            "configured": aliases.len(),
-            "aliases": aliases
-        },
-        "workers": {
-            "planned": worker_plan.workers.len()
-        },
-        "storage": {
-            "ready": storage_ready
-        },
-        "auth": {
-            "required": cfg.security.require_auth
-        },
-        "external_bind": {
-            "enabled": cfg.security.bind_external || is_external_host(&cfg.server.host)
-        }
-    })
-}
-
-async fn storage_ready(storage: &Storage) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(storage.pool())
-        .await
-        .is_ok()
 }
 
 async fn list_models(
