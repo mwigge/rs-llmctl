@@ -3,6 +3,11 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## 1.6.6 - 2026-07-02
+
+- Server maintainability: split the large `server.rs` surface into focused chat, dispatch, streaming, lifecycle, TLS, native-chat, state, and test modules while preserving the existing `/v1/chat/completions`, `/v1/embeddings`, health, readiness, model, quota, and audit behavior.
+- Verification: `cargo fmt --check`, `cargo check --lib`, and `cargo test --lib server::tests -- --nocapture` passed before the release cut.
+
 ## 1.6.5 - 2026-06-18
 
 - Native generation: new `mistral-rs` cargo feature wires the `mistralrs`
