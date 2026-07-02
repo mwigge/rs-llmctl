@@ -18,7 +18,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -59,6 +59,7 @@ mod health;
 mod lineage;
 mod local;
 mod models;
+mod responses;
 mod routing;
 mod sse;
 mod traffic;
@@ -72,6 +73,12 @@ use health::readiness_status_for;
 use lineage::{record_request_lineage_joins, runtime_lineage_from_headers_and_metadata};
 #[cfg(test)]
 use models::*;
+use responses::{
+    auth_error_response, build_response, corpus_header_name, error_response,
+    lineage_id_header_name, lineage_ids_header_name, model_count_header_name, model_header_name,
+    quota_decision_header_name, request_id_from_headers, request_id_header_name, response_headers,
+    upstream_model_header_name, with_chat_metadata, with_model_count, with_request_id,
+};
 #[cfg(test)]
 use routing::ModelRouteError;
 use routing::{
@@ -2441,146 +2448,6 @@ fn stream_status(input_tokens: u64, output_tokens: u64) -> &'static str {
     } else {
         "ok"
     }
-}
-
-fn response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in upstream_headers {
-        if is_safe_upstream_response_header(name) {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
-    headers
-}
-
-fn is_safe_upstream_response_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "content-type" | "cache-control" | "x-request-id"
-    )
-}
-
-fn build_response(
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Body,
-    request_id: Uuid,
-) -> Response {
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    with_request_id(response, request_id)
-}
-
-fn error_response(status: StatusCode, code: &str, message: String) -> Response {
-    (
-        status,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": code,
-                "code": code,
-                "status": status.as_u16()
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn auth_error_response(message: String) -> Response {
-    if message.contains("too many failed authentication attempts") {
-        error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message)
-    } else {
-        error_response(StatusCode::UNAUTHORIZED, "unauthorized", message)
-    }
-}
-
-fn request_id_from_headers(headers: &HeaderMap) -> Uuid {
-    headers
-        .get(request_id_header_name())
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .unwrap_or_else(Uuid::new_v4)
-}
-
-fn with_request_id(mut response: Response, request_id: Uuid) -> Response {
-    response.headers_mut().insert(
-        request_id_header_name(),
-        HeaderValue::from_str(&request_id.to_string()).expect("uuid is a valid header value"),
-    );
-    response
-}
-
-fn with_model_count(mut response: Response, count: usize) -> Response {
-    insert_header_value(
-        response.headers_mut(),
-        model_count_header_name(),
-        &count.to_string(),
-    );
-    response
-}
-
-fn with_chat_metadata(
-    mut response: Response,
-    model: &str,
-    upstream_model: &str,
-    quota_decision: &str,
-) -> Response {
-    insert_header_value(response.headers_mut(), model_header_name(), model);
-    insert_header_value(
-        response.headers_mut(),
-        upstream_model_header_name(),
-        upstream_model,
-    );
-    insert_header_value(
-        response.headers_mut(),
-        quota_decision_header_name(),
-        quota_decision,
-    );
-    response
-}
-
-fn insert_header_value(headers: &mut HeaderMap, name: HeaderName, value: &str) {
-    match HeaderValue::from_str(value) {
-        Ok(value) => {
-            headers.insert(name, value);
-        }
-        Err(err) => {
-            tracing::warn!(header = %name, error = %err, "skipping invalid response metadata header");
-        }
-    }
-}
-
-fn request_id_header_name() -> HeaderName {
-    HeaderName::from_static("x-request-id")
-}
-
-fn lineage_id_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-lineage-id")
-}
-
-fn lineage_ids_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-lineage-ids")
-}
-
-fn corpus_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-corpus")
-}
-
-fn model_count_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-model-count")
-}
-
-fn model_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-model")
-}
-
-fn upstream_model_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-upstream-model")
-}
-
-fn quota_decision_header_name() -> HeaderName {
-    HeaderName::from_static("x-llmctl-quota-decision")
 }
 
 #[cfg(test)]
