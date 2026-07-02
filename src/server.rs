@@ -12,7 +12,6 @@ use crate::observability::{
 use crate::quota::{
     check_quota, matching_quota_policies, quota_admission_scope, quota_is_subject_scoped, Principal,
 };
-use crate::rag::{lexical_search, SearchDocument};
 use crate::storage::{QuotaDecisionRecord, RequestLineageJoinRecord, Storage};
 use crate::worker::{
     PlannedWorker, StartupPlan, SwapExecution, SwapMode, TokioWorkerRunner, WorkerId,
@@ -44,10 +43,10 @@ use std::env;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
@@ -56,10 +55,15 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use uuid::Uuid;
 
+mod local;
 mod models;
 mod sse;
+mod traffic;
 use models::*;
 use sse::{usage_tokens, SseUsageParser};
+use traffic::{
+    AdmissionController, AdmissionError, AdmissionPermit, AuthFailureLimiter, CircuitBreakers,
+};
 
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 #[cfg(test)]
@@ -209,8 +213,11 @@ fn router_with_worker_control_native_engine_and_drain(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(proxy_embeddings))
-        .route("/v1/local/search", post(local_search))
-        .route("/v1/local/recommendations", post(local_recommendations))
+        .route("/v1/local/search", post(local::local_search))
+        .route(
+            "/v1/local/recommendations",
+            post(local::local_recommendations),
+        )
         .route("/v1/admin/swap", post(admin_swap))
         .layer(cors)
         .layer(trace_layer())
@@ -331,226 +338,6 @@ impl ServingLimits {
 
     fn upstream_timeout(&self) -> Duration {
         self.upstream_timeout
-    }
-}
-
-#[derive(Clone)]
-struct AdmissionController {
-    global: Arc<Semaphore>,
-    scoped: Arc<Mutex<BTreeMap<String, Arc<Semaphore>>>>,
-}
-
-impl AdmissionController {
-    fn new(max_in_flight: usize) -> Self {
-        Self {
-            global: Arc::new(Semaphore::new(max_in_flight.max(1))),
-            scoped: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    #[cfg(test)]
-    fn try_acquire_for(
-        &self,
-        scope: Option<(String, usize)>,
-    ) -> std::result::Result<AdmissionPermit, AdmissionError> {
-        self.try_acquire_for_all(scope.into_iter().collect())
-    }
-
-    fn try_acquire_for_all(
-        &self,
-        scopes: Vec<(String, usize)>,
-    ) -> std::result::Result<AdmissionPermit, AdmissionError> {
-        let global = self
-            .global
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AdmissionError::Busy)?;
-
-        let mut scoped_permits = Vec::with_capacity(scopes.len());
-        for (scope, limit) in scopes {
-            let permit = {
-                let semaphore = {
-                    let mut scoped = self.scoped.lock().map_err(|_| AdmissionError::Busy)?;
-                    scoped
-                        .entry(scope)
-                        .or_insert_with(|| Arc::new(Semaphore::new(limit.max(1))))
-                        .clone()
-                };
-                semaphore
-                    .try_acquire_owned()
-                    .map_err(|_| AdmissionError::Busy)?
-            };
-            scoped_permits.push(permit);
-        }
-
-        Ok(AdmissionPermit {
-            _global: global,
-            _scoped: scoped_permits,
-        })
-    }
-}
-
-struct AdmissionPermit {
-    _global: OwnedSemaphorePermit,
-    _scoped: Vec<OwnedSemaphorePermit>,
-}
-
-impl std::fmt::Debug for AdmissionPermit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdmissionPermit").finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdmissionError {
-    Busy,
-}
-
-#[derive(Debug, Clone, Default)]
-struct CircuitBreakers {
-    states: Arc<Mutex<BTreeMap<String, CircuitBreakerState>>>,
-}
-
-#[derive(Debug, Clone)]
-struct CircuitBreakerState {
-    consecutive_failures: u32,
-    opened_at: Option<Instant>,
-    half_open_probe_in_flight: bool,
-}
-
-impl CircuitBreakers {
-    fn allow_request(&self, upstream: &str, reset_after: Duration) -> bool {
-        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
-        let Some(state) = states.get_mut(upstream) else {
-            return true;
-        };
-        let Some(opened_at) = state.opened_at else {
-            return true;
-        };
-        if opened_at.elapsed() >= reset_after {
-            if state.half_open_probe_in_flight {
-                record_circuit_breaker_state(
-                    upstream,
-                    "half_open_busy",
-                    state.consecutive_failures,
-                );
-                false
-            } else {
-                state.half_open_probe_in_flight = true;
-                record_circuit_breaker_state(upstream, "half_open", state.consecutive_failures);
-                true
-            }
-        } else {
-            record_circuit_breaker_state(upstream, "open", state.consecutive_failures);
-            false
-        }
-    }
-
-    fn record_success(&self, upstream: &str) {
-        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
-        let state = states
-            .entry(upstream.to_string())
-            .or_insert(CircuitBreakerState {
-                consecutive_failures: 0,
-                opened_at: None,
-                half_open_probe_in_flight: false,
-            });
-        state.consecutive_failures = 0;
-        state.opened_at = None;
-        state.half_open_probe_in_flight = false;
-        record_circuit_breaker_state(upstream, "closed", 0);
-    }
-
-    fn record_failure(&self, upstream: &str, threshold: u32) {
-        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
-        let state = states
-            .entry(upstream.to_string())
-            .or_insert(CircuitBreakerState {
-                consecutive_failures: 0,
-                opened_at: None,
-                half_open_probe_in_flight: false,
-            });
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        state.half_open_probe_in_flight = false;
-        if threshold > 0 && state.consecutive_failures >= threshold {
-            state.opened_at = Some(Instant::now());
-            record_circuit_breaker_state(upstream, "open", state.consecutive_failures);
-        } else {
-            record_circuit_breaker_state(upstream, "closed", state.consecutive_failures);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct AuthFailureLimiter {
-    failures: Arc<Mutex<BTreeMap<String, AuthFailureWindow>>>,
-}
-
-#[derive(Debug, Clone)]
-struct AuthFailureWindow {
-    started: Instant,
-    count: u32,
-}
-
-impl AuthFailureLimiter {
-    fn is_limited(&self, key: &str, limit: u32) -> bool {
-        if limit == 0 {
-            return false;
-        }
-        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
-        let window = failures
-            .entry(key.to_string())
-            .or_insert(AuthFailureWindow {
-                started: Instant::now(),
-                count: 0,
-            });
-        if window.started.elapsed() >= Duration::from_secs(60) {
-            window.started = Instant::now();
-            window.count = 0;
-        }
-        window.count >= limit
-    }
-
-    fn record_failure(&self, key: &str, limit: u32) {
-        if limit == 0 {
-            return;
-        }
-        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
-        let window = failures
-            .entry(key.to_string())
-            .or_insert(AuthFailureWindow {
-                started: Instant::now(),
-                count: 0,
-            });
-        if window.started.elapsed() >= Duration::from_secs(60) {
-            window.started = Instant::now();
-            window.count = 0;
-        }
-        window.count = window.count.saturating_add(1);
-        let meter = global::meter(crate::SERVICE_NAME);
-        meter
-            .u64_counter("llmctl_auth_failures_total")
-            .with_description("Failed bearer authentication attempts by throttle state")
-            .build()
-            .add(
-                1,
-                &[
-                    KeyValue::new("limited", window.count >= limit),
-                    KeyValue::new(
-                        "status",
-                        if window.count >= limit {
-                            "limited"
-                        } else {
-                            "failed"
-                        },
-                    ),
-                ],
-            );
-    }
-
-    fn record_success(&self, key: &str) {
-        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
-        failures.remove(key);
     }
 }
 
@@ -724,175 +511,6 @@ async fn list_models(
         request_id,
     );
     with_model_count(response, state.cfg.models.len())
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalSearchRequest {
-    query: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-    #[serde(default)]
-    metadata: Option<Value>,
-    documents: Vec<SearchDocument>,
-}
-
-fn default_search_limit() -> usize {
-    10
-}
-
-async fn local_search(
-    State(state): State<Arc<ServerState>>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-    Json(request): Json<LocalSearchRequest>,
-) -> Response {
-    let request_id = request_id_from_headers(&headers);
-    if let Some(response) = draining_response(&state, request_id) {
-        return response;
-    }
-    let principal = match authenticate_request(
-        &state,
-        &headers,
-        auth_source_key(&state.cfg, &headers, connect_info),
-    ) {
-        Ok(principal) => principal,
-        Err(err) => {
-            return with_request_id(auth_error_response(err), request_id);
-        }
-    };
-
-    if !principal.has_scope("chat") {
-        return with_request_id(
-            error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "missing chat scope".to_string(),
-            ),
-            request_id,
-        );
-    }
-
-    let hits = lexical_search(&request.query, &request.documents, request.limit.min(50));
-    let lineage = runtime_lineage_from_headers_and_metadata(&headers, request.metadata.as_ref());
-    record_request_lineage_joins(&state, request_id, &lineage, None, "local.search").await;
-    record_audit(
-        &state,
-        Some(request_id),
-        principal,
-        "local.search",
-        "documents",
-        "allowed",
-        json!({ "documents": request.documents.len(), "hits": hits.len() }),
-    )
-    .await;
-    with_request_id(
-        Json(json!({
-            "object": "search.results",
-            "query": request.query,
-            "data": hits
-        }))
-        .into_response(),
-        request_id,
-    )
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalRecommendationRequest {
-    task: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-    #[serde(default)]
-    metadata: Option<Value>,
-    documents: Vec<SearchDocument>,
-}
-
-async fn local_recommendations(
-    State(state): State<Arc<ServerState>>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-    Json(request): Json<LocalRecommendationRequest>,
-) -> Response {
-    let request_id = request_id_from_headers(&headers);
-    if let Some(response) = draining_response(&state, request_id) {
-        return response;
-    }
-    let principal = match authenticate_request(
-        &state,
-        &headers,
-        auth_source_key(&state.cfg, &headers, connect_info),
-    ) {
-        Ok(principal) => principal,
-        Err(err) => {
-            return with_request_id(auth_error_response(err), request_id);
-        }
-    };
-
-    if !principal.has_scope("chat") {
-        return with_request_id(
-            error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "missing chat scope".to_string(),
-            ),
-            request_id,
-        );
-    }
-
-    let hits = lexical_search(&request.task, &request.documents, request.limit.min(50));
-    let recommendations = local_recommendation_items(&request.task, &hits);
-    let lineage = runtime_lineage_from_headers_and_metadata(&headers, request.metadata.as_ref());
-    record_request_lineage_joins(&state, request_id, &lineage, None, "local.recommendations").await;
-    record_audit(
-        &state,
-        Some(request_id),
-        principal,
-        "local.recommendations",
-        "documents",
-        "allowed",
-        json!({
-            "documents": request.documents.len(),
-            "hits": hits.len(),
-            "recommendations": recommendations.len()
-        }),
-    )
-    .await;
-    with_request_id(
-        Json(json!({
-            "object": "recommendation.results",
-            "task": request.task,
-            "data": hits,
-            "recommendations": recommendations
-        }))
-        .into_response(),
-        request_id,
-    )
-}
-
-fn local_recommendation_items(
-    task: &str,
-    hits: &[crate::rag::SearchHit],
-) -> Vec<BTreeMap<&'static str, String>> {
-    hits.iter()
-        .take(5)
-        .enumerate()
-        .map(|(index, hit)| {
-            let title = hit.title.clone().unwrap_or_else(|| hit.id.clone());
-            BTreeMap::from([
-                ("rank", (index + 1).to_string()),
-                ("document_id", hit.id.clone()),
-                ("title", title.clone()),
-                ("reason", recommendation_reason(task, &title)),
-            ])
-        })
-        .collect()
-}
-
-fn recommendation_reason(task: &str, title: &str) -> String {
-    let task = task.trim();
-    if task.is_empty() {
-        return format!("Use `{title}` as supporting local context.");
-    }
-    format!("Use `{title}` because it matches local context for `{task}`.")
 }
 
 #[derive(Debug, Deserialize)]
