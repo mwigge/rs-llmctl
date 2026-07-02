@@ -1,5 +1,6 @@
+#[cfg(test)]
 use crate::audit::UsageEvent;
-use crate::config::{is_external_host, Config, ExternalProviderKind};
+use crate::config::{is_external_host, Config};
 #[cfg(test)]
 use crate::config::{Mode, ModelConfig};
 use crate::guardrails;
@@ -65,8 +66,11 @@ mod routing;
 mod sse;
 mod traffic;
 use accounting::{
-    audit_reject, audit_reject_response, record_audit, record_quota_decision, record_swap_execution,
+    audit_reject, audit_reject_response, gen_ai_system_for_provider, record_audit,
+    record_quota_decision, record_swap_execution, record_usage, slo_status, UsageRecordInput,
 };
+#[cfg(test)]
+use accounting::{usage_span_attributes, webhook_payload};
 use auth::{auth_source_key, authenticate_request, authenticate_with_chat_scope};
 #[cfg(test)]
 use auth::{authenticate, forwarded_client_ip, is_trusted_proxy};
@@ -1884,92 +1888,6 @@ fn stable_upstream_id(upstream: &str) -> String {
     format!("upstream-{:x}", digest)[..25].to_string()
 }
 
-struct UsageRecordInput<'a> {
-    request_id: Uuid,
-    principal: &'a Principal,
-    model: &'a str,
-    input_tokens: u64,
-    output_tokens: u64,
-    latency_ms: u64,
-    status: &'a str,
-    accounting_mode: &'a str,
-    gen_ai_system: &'a str,
-}
-
-async fn record_usage(state: &ServerState, input: UsageRecordInput<'_>) {
-    let event = UsageEvent {
-        id: Uuid::new_v4(),
-        request_id: input.request_id,
-        at: Utc::now(),
-        model: input.model.to_string(),
-        actor: input.principal.subject.clone(),
-        team: input.principal.team.clone(),
-        input_tokens: input.input_tokens,
-        output_tokens: input.output_tokens,
-        latency_ms: input.latency_ms,
-        status: input.status.to_string(),
-    };
-    if let Err(err) = state.storage.insert_usage_event(&event).await {
-        tracing::warn!(error = %err, "failed to record usage event");
-    }
-    record_usage_telemetry(&event, input.accounting_mode, input.gen_ai_system);
-    dispatch_usage_webhook(state, &event, input.accounting_mode);
-}
-
-fn gen_ai_system_for_provider(provider: Option<&ResolvedExternalProvider>) -> &'static str {
-    match provider.map(|p| &p.kind) {
-        None => "llmctl.native",
-        Some(ExternalProviderKind::OpenAiCompatible) => "openai",
-        Some(ExternalProviderKind::VertexAi) => "vertex_ai",
-        Some(ExternalProviderKind::OpenRouter) => "openrouter",
-    }
-}
-
-/// Build the attribute set for a usage span: the existing `llmctl.*` attributes
-/// plus the OTel GenAI semantic-convention attributes
-/// (`gen_ai.system`, `gen_ai.operation.name`, `gen_ai.request.model`,
-/// `gen_ai.response.model`, `gen_ai.usage.*`) so traces align with the
-/// conventions Langfuse and other GenAI-aware OTel consumers expect.
-fn usage_span_attributes(
-    event: &UsageEvent,
-    accounting_mode: &str,
-    gen_ai_system: &str,
-) -> BTreeMap<String, Value> {
-    BTreeMap::from([
-        (
-            "llmctl.request_id".to_string(),
-            json!(event.request_id.to_string()),
-        ),
-        ("llmctl.model".to_string(), json!(event.model.as_str())),
-        ("llmctl.actor".to_string(), json!(event.actor.as_str())),
-        ("llmctl.team".to_string(), json!(event.team.as_str())),
-        ("llmctl.latency_ms".to_string(), json!(event.latency_ms)),
-        ("llmctl.status".to_string(), json!(event.status.as_str())),
-        (
-            "llmctl.token_accounting.mode".to_string(),
-            json!(accounting_mode),
-        ),
-        ("gen_ai.system".to_string(), json!(gen_ai_system)),
-        ("gen_ai.operation.name".to_string(), json!("chat")),
-        (
-            "gen_ai.request.model".to_string(),
-            json!(event.model.as_str()),
-        ),
-        (
-            "gen_ai.response.model".to_string(),
-            json!(event.model.as_str()),
-        ),
-        (
-            "gen_ai.usage.input_tokens".to_string(),
-            json!(event.input_tokens),
-        ),
-        (
-            "gen_ai.usage.output_tokens".to_string(),
-            json!(event.output_tokens),
-        ),
-    ])
-}
-
 /// Emits a `gen_ai.chat` lifecycle span covering one complete inference request.
 ///
 /// Span attributes follow the OTel GenAI semantic conventions.  Message content
@@ -2069,156 +1987,6 @@ fn emit_gen_ai_inference_span(
     }
 
     span.end();
-}
-
-/// JSON payload delivered to the configured usage webhook — the same
-/// usage/lineage metadata recorded in the audit trail and emitted as OTel
-/// attributes, shaped for ecosystems that consume callbacks rather than OTLP.
-fn webhook_payload(event: &UsageEvent, accounting_mode: &str) -> Value {
-    json!({
-        "type": "llmctl.usage",
-        "id": event.id.to_string(),
-        "request_id": event.request_id.to_string(),
-        "at": event.at.to_rfc3339(),
-        "model": event.model,
-        "actor": event.actor,
-        "team": event.team,
-        "input_tokens": event.input_tokens,
-        "output_tokens": event.output_tokens,
-        "latency_ms": event.latency_ms,
-        "status": event.status,
-        "token_accounting_mode": accounting_mode,
-    })
-}
-
-/// Fire-and-forget delivery of the usage webhook, if configured. Failures are
-/// logged at `warn` and never affect the in-flight request — the webhook is a
-/// best-effort sink, not part of the request's correctness contract.
-fn dispatch_usage_webhook(state: &ServerState, event: &UsageEvent, accounting_mode: &str) {
-    let webhook = &state.cfg.observability.webhook;
-    if !webhook.enabled {
-        return;
-    }
-    let Some(url) = webhook
-        .url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_string)
-    else {
-        return;
-    };
-
-    if let Err(err) = crate::observability::validate_http_endpoint(&url) {
-        tracing::warn!(url = %url, error = %err, "usage webhook URL rejected by SSRF guard");
-        return;
-    }
-
-    let payload = webhook_payload(event, accounting_mode);
-    let client = state.client.clone();
-    let headers = webhook.headers.clone();
-    let timeout = Duration::from_millis(webhook.timeout_ms.max(1));
-
-    tokio::spawn(async move {
-        let mut request = client.post(&url).json(&payload).timeout(timeout);
-        for (name, value) in &headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        match request.send().await {
-            Ok(response) if !response.status().is_success() => {
-                tracing::warn!(
-                    url = %url,
-                    status = %response.status(),
-                    "usage webhook delivery returned a non-success status"
-                );
-            }
-            Err(err) => {
-                tracing::warn!(url = %url, error = %err, "failed to deliver usage webhook");
-            }
-            Ok(_) => {}
-        }
-    });
-}
-
-fn record_usage_telemetry(event: &UsageEvent, accounting_mode: &str, gen_ai_system: &str) {
-    emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
-        TelemetrySignal::Span,
-        TelemetryEventName::RequestRouting,
-        Utc::now(),
-        usage_span_attributes(event, accounting_mode, gen_ai_system),
-    ));
-    let attributes = [
-        KeyValue::new("llmctl.model", event.model.clone()),
-        KeyValue::new("llmctl.actor", event.actor.clone()),
-        KeyValue::new("llmctl.team", event.team.clone()),
-        KeyValue::new("llmctl.status", event.status.clone()),
-        KeyValue::new("model", event.model.clone()),
-        KeyValue::new("team", event.team.clone()),
-        KeyValue::new("endpoint", "/v1/chat/completions"),
-        KeyValue::new("status", slo_status(&event.status)),
-        KeyValue::new("token_accounting_mode", accounting_mode.to_string()),
-    ];
-    let meter = global::meter(crate::SERVICE_NAME);
-    meter
-        .u64_counter("llmctl_requests_total")
-        .with_description(
-            "Total OpenAI-compatible model requests by endpoint, model, team, and status",
-        )
-        .build()
-        .add(1, &attributes);
-    if event.status != "ok" {
-        meter
-            .u64_counter("llmctl_request_errors_total")
-            .with_description(
-                "Failed OpenAI-compatible model requests by endpoint, model, team, and status",
-            )
-            .build()
-            .add(1, &attributes);
-    }
-    meter
-        .u64_counter("llmctl.tokens.input")
-        .with_description("Input tokens reported by model workers")
-        .build()
-        .add(event.input_tokens, &attributes);
-    meter
-        .u64_counter("llmctl.tokens.output")
-        .with_description("Output tokens reported by model workers")
-        .build()
-        .add(event.output_tokens, &attributes);
-    let genai_attributes = [KeyValue::new("gen_ai.system", gen_ai_system.to_string())];
-    crate::observability::genai_input_tokens_counter().add(event.input_tokens, &genai_attributes);
-    crate::observability::genai_output_tokens_counter().add(event.output_tokens, &genai_attributes);
-    meter
-        .u64_histogram("llmctl_request_latency_ms")
-        .with_description("Model request latency in milliseconds")
-        .build()
-        .record(event.latency_ms, &attributes);
-    if event.status != "ok" || event.latency_ms > DEFAULT_SLO_LATENCY_MS {
-        meter
-            .u64_counter("llmctl_slo_violations_total")
-            .with_description("Requests that violate the default latency or success SLO")
-            .build()
-            .add(1, &attributes);
-    }
-    tracing::info!(
-        request_id = %event.request_id,
-        model = %event.model,
-        actor = %event.actor,
-        team = %event.team,
-        input_tokens = event.input_tokens,
-        output_tokens = event.output_tokens,
-        latency_ms = event.latency_ms,
-        status = %event.status,
-        "model usage recorded"
-    );
-}
-
-fn slo_status(status: &str) -> &'static str {
-    if status == "ok" {
-        "ok"
-    } else {
-        "error"
-    }
 }
 
 fn stream_status(input_tokens: u64, output_tokens: u64) -> &'static str {
