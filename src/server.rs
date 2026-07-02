@@ -67,6 +67,7 @@ pub use health::readiness_status;
 #[cfg(test)]
 use health::readiness_status_for;
 use lineage::{record_request_lineage_joins, runtime_lineage_from_headers_and_metadata};
+#[cfg(test)]
 use models::*;
 use sse::{usage_tokens, SseUsageParser};
 use traffic::{
@@ -218,7 +219,7 @@ fn router_with_worker_control_native_engine_and_drain(
         .route("/healthz", get(health::healthz))
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
-        .route("/v1/models", get(list_models))
+        .route("/v1/models", get(models::list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings::proxy_embeddings))
         .route("/v1/local/search", post(local::local_search))
@@ -359,83 +360,6 @@ fn playground_html() -> &'static str {
 
 async fn playground() -> impl IntoResponse {
     Html(playground_html())
-}
-
-async fn list_models(
-    State(state): State<Arc<ServerState>>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-) -> Response {
-    let request_id = request_id_from_headers(&headers);
-    if let Some(response) = draining_response(&state, request_id) {
-        return response;
-    }
-    let principal = match authenticate_request(
-        &state,
-        &headers,
-        auth_source_key(&state.cfg, &headers, connect_info),
-    ) {
-        Ok(principal) => principal,
-        Err(err) => {
-            record_audit(
-                &state,
-                Some(request_id),
-                Principal::anonymous(),
-                "models.list",
-                "models",
-                "denied",
-                json!({ "reason": err }),
-            )
-            .await;
-            return with_request_id(auth_error_response(err), request_id);
-        }
-    };
-
-    if !principal.has_scope("models.read") {
-        record_audit(
-            &state,
-            Some(request_id),
-            principal,
-            "models.list",
-            "models",
-            "denied",
-            json!({ "reason": "missing models.read scope" }),
-        )
-        .await;
-        return with_request_id(
-            error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "missing models.read scope".to_string(),
-            ),
-            request_id,
-        );
-    }
-
-    record_audit(
-        &state,
-        Some(request_id),
-        principal,
-        "models.list",
-        "models",
-        "allowed",
-        json!({}),
-    )
-    .await;
-
-    let snap = CapabilitySnapshot::current();
-    let response = with_request_id(
-        Json(ModelList {
-            object: "list",
-            data: routed_models(&state.cfg)
-                .into_iter()
-                .map(|m| build_model_object(m, snap))
-                .collect(),
-        })
-        .into_response(),
-        request_id,
-    );
-    with_model_count(response, state.cfg.models.len())
 }
 
 async fn chat_completions(
