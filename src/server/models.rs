@@ -1,5 +1,18 @@
+use super::{
+    auth_error_response, auth_source_key, authenticate_request, draining_response, error_response,
+    record_audit, request_id_from_headers, routed_models, with_model_count, with_request_id,
+    ServerState,
+};
 use crate::config::ModelConfig;
+use crate::quota::Principal;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
+use serde_json::json;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 pub(super) struct ModelList {
@@ -149,4 +162,81 @@ pub(super) fn build_model_object(model: &ModelConfig, snap: CapabilitySnapshot) 
             tier: snap.tier,
         },
     }
+}
+
+pub(super) async fn list_models(
+    State(state): State<Arc<ServerState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id_from_headers(&headers);
+    if let Some(response) = draining_response(&state, request_id) {
+        return response;
+    }
+    let principal = match authenticate_request(
+        &state,
+        &headers,
+        auth_source_key(&state.cfg, &headers, connect_info),
+    ) {
+        Ok(principal) => principal,
+        Err(err) => {
+            record_audit(
+                &state,
+                Some(request_id),
+                Principal::anonymous(),
+                "models.list",
+                "models",
+                "denied",
+                json!({ "reason": err }),
+            )
+            .await;
+            return with_request_id(auth_error_response(err), request_id);
+        }
+    };
+
+    if !principal.has_scope("models.read") {
+        record_audit(
+            &state,
+            Some(request_id),
+            principal,
+            "models.list",
+            "models",
+            "denied",
+            json!({ "reason": "missing models.read scope" }),
+        )
+        .await;
+        return with_request_id(
+            error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "missing models.read scope".to_string(),
+            ),
+            request_id,
+        );
+    }
+
+    record_audit(
+        &state,
+        Some(request_id),
+        principal,
+        "models.list",
+        "models",
+        "allowed",
+        json!({}),
+    )
+    .await;
+
+    let snap = CapabilitySnapshot::current();
+    let response = with_request_id(
+        Json(ModelList {
+            object: "list",
+            data: routed_models(&state.cfg)
+                .into_iter()
+                .map(|m| build_model_object(m, snap))
+                .collect(),
+        })
+        .into_response(),
+        request_id,
+    );
+    with_model_count(response, state.cfg.models.len())
 }
