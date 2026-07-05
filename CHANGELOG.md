@@ -3,7 +3,7 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
-## Unreleased
+## 1.7.0 - 2026-07-05
 
 - Security/integrity fixes: closed an RPM-quota bypass under concurrency (counting
   insert moved inside the admission lock, fail-closed), a KV-cache cross-request
