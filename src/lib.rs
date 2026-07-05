@@ -34,6 +34,7 @@ pub mod integrations;
 pub mod model;
 pub mod native;
 pub mod observability;
+pub mod policy_sign;
 pub mod profiles;
 pub mod quota;
 pub mod rag;
