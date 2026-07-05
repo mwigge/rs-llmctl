@@ -77,9 +77,15 @@ pass/fail evidence without downloading models.
 
 ## What It Does
 
-- Serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints.
-- Ships a static, build-step-free chat page at `/playground` for poking at any
-  routed model from a browser with a model picker and a bearer API-key field.
+- Serves OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints,
+  honoring sampling parameters (`temperature`, `top_p`, `top_k`, `seed`, `stop`)
+  on the native path via a candle `LogitsProcessor` — deterministic greedy when
+  `temperature` is 0 or unset — with real per-token streaming.
+- Ships a static, build-step-free **chat page at `/playground`** and a read-only
+  **web admin UI at `/ui`** (Dashboard, Models, Quotas, Usage, Audit, Keys, and a
+  streaming chat tester) — both browser-usable with a bearer API-key field. The
+  admin UI reads `/v1/admin/*` endpoints (admin scope); model/config/key changes
+  stay in the `llmctl` CLI.
 - Screens inbound chat messages with regex/phrase-based guardrails — PII
   detection/redaction and prompt-injection ("jailbreak") phrase filtering —
   with flag/redact/block actions and audit-trail findings.

@@ -3,6 +3,33 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## Unreleased
+
+- Security/integrity fixes: closed an RPM-quota bypass under concurrency (counting
+  insert moved inside the admission lock, fail-closed), a KV-cache cross-request
+  contamination leak for Qwen3-MoE/Mistral GGUF (now fail-closed — those families
+  require a fresh session per request), and a guardrail-redaction bypass on the
+  proxy path (the outbound body is now redacted, matching the audit trail).
+- Lifecycle: routing now honors live worker state (503 instead of proxying to a
+  dead port), real drain waits for in-flight requests, `/readyz` reflects actual
+  ready workers, crashed workers are reaped, and hot-swap checks the VRAM/memory
+  budget (auto-downgrading to cold to avoid OOM).
+- Serving: the native path now honors `temperature`/`top_p`/`top_k`/`seed`/`stop`
+  via a candle `LogitsProcessor` (greedy when temperature is 0/unset), streams
+  real per-token deltas, runs decode off the async runtime (`spawn_blocking`),
+  reports exact prompt/completion token counts, and records usage/audit even on a
+  mid-stream client disconnect.
+- Storage/infra: atomic `config.toml` saves (temp + fsync + rename), Postgres
+  advisory-lock leak fixed, in-memory sqlite pools pinned to one connection,
+  rocm-smi GPU parsing de-duplicated, bounded eviction for in-memory rate/limit
+  maps, loopback-only dev CORS, and poison-tolerant hot-path locks.
+- Web admin UI: a read-only browser UI at `/ui` (Dashboard, Models, Quotas,
+  Usage, Audit, Keys, streaming chat tester) backed by `admin`-scoped
+  `/v1/admin/*` read endpoints; embedded, build-step-free, mutations stay in the CLI.
+- Maintainability: split the `native.rs` (6.7k) and `bin/llmctl.rs` (3.9k)
+  god-modules into cohesive modules; moved policy signing/verification into the
+  library with unit tests.
+
 ## 1.6.6 - 2026-07-02
 
 - Server maintainability: split the large `server.rs` surface into focused chat, dispatch, streaming, lifecycle, TLS, native-chat, state, and test modules while preserving the existing `/v1/chat/completions`, `/v1/embeddings`, health, readiness, model, quota, and audit behavior.
