@@ -3,6 +3,15 @@
 All notable release-facing changes are recorded here. Keep entries focused on
 operator behavior, packaging contents, service lifecycle, and verification.
 
+## [1.7.1] - 2026-07-05
+
+### Changed
+- Internal refactor: split the largest modules (native serving, worker, storage,
+  observability, client, model, config, amd, cli, reporting) into cohesive
+  submodules for maintainability. Behavior-preserving — generation loop and
+  tensor kernels kept whole; no functional change; tests unchanged, clippy
+  finding-neutral.
+
 ## 1.7.0 - 2026-07-05
 
 - Security/integrity fixes: closed an RPM-quota bypass under concurrency (counting
