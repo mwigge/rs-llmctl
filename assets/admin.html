@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rs-llmctl admin</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fbfbfd;
+      --panel: #ffffff;
+      --border: #0000001a;
+      --muted: #6b7280;
+      --accent: #2563eb;
+      --ok: #16a34a;
+      --warn: #d97706;
+      --err: #dc2626;
+      --radius: 0.6rem;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0e1116;
+        --panel: #171b22;
+        --border: #ffffff1f;
+        --muted: #9aa4b2;
+        --accent: #60a5fa;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      margin: 0;
+      background: var(--bg);
+      color: inherit;
+      line-height: 1.45;
+    }
+    header {
+      display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+      padding: 0.9rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { font-size: 1.05rem; margin: 0; font-weight: 650; }
+    header .grow { flex: 1; }
+    header input {
+      font: inherit; padding: 0.45rem 0.6rem; min-width: 18rem;
+      border-radius: var(--radius); border: 1px solid var(--border);
+      background: var(--bg); color: inherit;
+    }
+    header button {
+      font: inherit; padding: 0.45rem 0.8rem; cursor: pointer;
+      border-radius: var(--radius); border: 1px solid var(--border);
+      background: var(--accent); color: #fff;
+    }
+    #conn { font-size: 0.8rem; color: var(--muted); }
+    nav {
+      display: flex; gap: 0.25rem; flex-wrap: wrap;
+      padding: 0.6rem 1.25rem 0; border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    nav a {
+      padding: 0.5rem 0.85rem; cursor: pointer; font-size: 0.9rem;
+      border-radius: var(--radius) var(--radius) 0 0; color: var(--muted);
+      border: 1px solid transparent; border-bottom: none; user-select: none;
+    }
+    nav a.active { color: inherit; background: var(--bg); border-color: var(--border); }
+    main { max-width: 1080px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+    section { display: none; }
+    section.active { display: block; }
+    h2 { font-size: 1.1rem; margin: 0 0 0.25rem; }
+    .sub { color: var(--muted); font-size: 0.85rem; margin: 0 0 1.1rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.9rem; margin-bottom: 1.25rem; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 0.9rem 1rem;
+    }
+    .card .k { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .card .v { font-size: 1.5rem; font-weight: 650; margin-top: 0.2rem; }
+    .card .v small { font-size: 0.85rem; font-weight: 400; color: var(--muted); }
+    .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 1rem; font-size: 0.78rem; font-weight: 600; }
+    .pill.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+    .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+    .pill.err { background: color-mix(in srgb, var(--err) 18%, transparent); color: var(--err); }
+    .pill.muted { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--muted); }
+    .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+    table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+    th, td { text-align: left; padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { font-weight: 600; color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    tr:last-child td { border-bottom: none; }
+    td.wrap, th.wrap { white-space: normal; }
+    code { font-family: ui-monospace, monospace; font-size: 0.82rem; }
+    .toolbar { display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.9rem; flex-wrap: wrap; }
+    select, .toolbar button {
+      font: inherit; padding: 0.4rem 0.6rem; border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--panel); color: inherit; cursor: pointer;
+    }
+    .note { font-size: 0.82rem; color: var(--muted); }
+    .banner { padding: 0.7rem 0.9rem; border-radius: var(--radius); margin-bottom: 1rem; font-size: 0.88rem; display: none; }
+    .banner.show { display: block; }
+    .banner.err { background: color-mix(in srgb, var(--err) 14%, transparent); color: var(--err); }
+    .banner.info { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+    /* chat */
+    #chatlog { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); padding: 0.9rem; min-height: 14rem; max-height: 26rem; overflow-y: auto; margin-bottom: 0.75rem; }
+    .msg { margin-bottom: 0.7rem; white-space: pre-wrap; }
+    .msg .role { font-weight: 650; }
+    .msg.user .role { color: var(--accent); }
+    .msg.assistant .role { color: var(--ok); }
+    .msg.error .role { color: var(--err); }
+    #composer { display: flex; gap: 0.5rem; }
+    #composer textarea { flex: 1; resize: vertical; min-height: 3rem; font: inherit; padding: 0.55rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--panel); color: inherit; }
+    #composer button { font: inherit; padding: 0 1.1rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--accent); color: #fff; cursor: pointer; }
+    .empty { padding: 1.2rem; color: var(--muted); text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>rs-llmctl <span class="note">admin</span></h1>
+    <input id="api-key" type="password" autocomplete="off" placeholder="admin bearer key (sk-…)" />
+    <button id="refresh">Refresh</button>
+    <span class="grow"></span>
+    <span id="conn"></span>
+  </header>
+
+  <nav>
+    <a data-view="dashboard" class="active">Dashboard</a>
+    <a data-view="models">Models</a>
+    <a data-view="quotas">Quotas</a>
+    <a data-view="usage">Usage</a>
+    <a data-view="audit">Audit</a>
+    <a data-view="keys">Keys</a>
+    <a data-view="chat">Chat tester</a>
+  </nav>
+
+  <main>
+    <div id="banner" class="banner"></div>
+
+    <section id="view-dashboard" class="active">
+      <h2>Dashboard</h2>
+      <p class="sub">Live serving status. A richer view of <code>/readyz</code>.</p>
+      <div id="status-cards" class="cards"></div>
+      <div id="status-workers" class="tablewrap"></div>
+    </section>
+
+    <section id="view-models">
+      <h2>Models</h2>
+      <p class="sub">Configured inventory joined to storage records and readiness. Manage via the <code>llmctl</code> CLI.</p>
+      <div id="models-table" class="tablewrap"></div>
+    </section>
+
+    <section id="view-quotas">
+      <h2>Quotas</h2>
+      <p class="sub">Configured policies with trailing-24h team usage. Manage via the <code>llmctl</code> CLI.</p>
+      <div id="quotas-table" class="tablewrap"></div>
+    </section>
+
+    <section id="view-usage">
+      <h2>Usage</h2>
+      <p class="sub">Windowed usage summary and quota decisions.</p>
+      <div class="toolbar">
+        <label>Window
+          <select id="usage-window">
+            <option value="1h">1h</option>
+            <option value="6h">6h</option>
+            <option value="24h" selected>24h</option>
+            <option value="7d">7d</option>
+            <option value="30d">30d</option>
+          </select>
+        </label>
+        <button id="usage-reload">Reload</button>
+      </div>
+      <div id="usage-cards" class="cards"></div>
+      <h3 style="font-size:0.95rem;margin:1rem 0 0.4rem;">By model</h3>
+      <div id="usage-bymodel" class="tablewrap"></div>
+      <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;">Quota decisions</h3>
+      <div id="usage-decisions" class="tablewrap"></div>
+    </section>
+
+    <section id="view-audit">
+      <h2>Audit</h2>
+      <p class="sub">Audit events in the selected window.</p>
+      <div class="toolbar">
+        <label>Window
+          <select id="audit-window">
+            <option value="1h">1h</option>
+            <option value="6h">6h</option>
+            <option value="24h" selected>24h</option>
+            <option value="7d">7d</option>
+            <option value="30d">30d</option>
+          </select>
+        </label>
+        <button id="audit-reload">Reload</button>
+      </div>
+      <div id="audit-table" class="tablewrap"></div>
+    </section>
+
+    <section id="view-keys">
+      <h2>API keys</h2>
+      <p class="sub">Key metadata only — secret hashes are never exposed. Manage via the <code>llmctl</code> CLI.</p>
+      <div id="keys-table" class="tablewrap"></div>
+    </section>
+
+    <section id="view-chat">
+      <h2>Chat tester</h2>
+      <p class="sub">Streaming chat against <code>/v1/chat/completions</code> using the key above.</p>
+      <div class="toolbar">
+        <label>Model <select id="chat-model"><option value="">loading…</option></select></label>
+        <button id="chat-reload-models">Reload models</button>
+      </div>
+      <div id="chatlog"><div class="empty">Pick a model and send a message.</div></div>
+      <form id="composer">
+        <textarea id="chat-prompt" placeholder="Ask something…"></textarea>
+        <button type="submit" id="chat-send">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const apiKey = $('api-key');
+    const banner = $('banner');
+    const conn = $('conn');
+    apiKey.value = sessionStorage.getItem('llmctl-admin-key') || '';
+    apiKey.addEventListener('change', () => sessionStorage.setItem('llmctl-admin-key', apiKey.value.trim()));
+
+    function authHeaders(extra) {
+      const h = Object.assign({}, extra || {});
+      const k = apiKey.value.trim();
+      if (k) h['Authorization'] = `Bearer ${k}`;
+      return h;
+    }
+    function showError(msg) { banner.className = 'banner err show'; banner.textContent = msg; }
+    function showInfo(msg) { banner.className = 'banner info show'; banner.textContent = msg; }
+    function clearBanner() { banner.className = 'banner'; }
+
+    async function api(path) {
+      const res = await fetch(path, { headers: authHeaders() });
+      if (res.status === 401) throw new Error('401 — enter a valid admin key');
+      if (res.status === 403) throw new Error('403 — key is missing the admin scope');
+      if (!res.ok) throw new Error(`HTTP ${res.status} on ${path}`);
+      return res.json();
+    }
+    const esc = (v) => (v === null || v === undefined) ? '' : String(v).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+    function pill(text, kind) { return `<span class="pill ${kind}">${esc(text)}</span>`; }
+
+    function table(cols, rows) {
+      if (!rows.length) return '<div class="empty">No data.</div>';
+      const head = cols.map(c => `<th class="${c.wrap ? 'wrap' : ''}">${esc(c.label)}</th>`).join('');
+      const body = rows.map(r => '<tr>' + cols.map(c => `<td class="${c.wrap ? 'wrap' : ''}">${c.cell ? c.cell(r) : esc(r[c.key])}</td>`).join('') + '</tr>').join('');
+      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+    function fmtDur(secs) {
+      secs = Number(secs) || 0;
+      const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+      if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; if (m) return `${m}m`; return `${secs}s`;
+    }
+
+    // ---- Dashboard ----
+    async function loadDashboard() {
+      const s = await api('/v1/admin/status');
+      const statusKind = s.ready ? 'ok' : (s.draining ? 'warn' : 'err');
+      const cards = [
+        ['Status', pill(s.status, statusKind)],
+        ['Serving backend', `${esc(s.serving_backend)} <small>(${esc(s.mode)})</small>`],
+        ['Ready workers', s.workers.live_ready === null ? '<small>native</small>' : `${esc(s.workers.live_ready)} <small>/ ${esc(s.workers.planned)}</small>`],
+        ['In-flight', `${esc(s.admission.in_flight)} <small>/ ${esc(s.admission.max_in_flight)}</small>`],
+        ['Models routed', `${esc(s.models.routed_active)} <small>/ ${esc(s.models.configured)} cfg</small>`],
+        ['Uptime', fmtDur(s.uptime_seconds)],
+        ['SLO', pill(s.slo_status, s.slo_status === 'ok' ? 'ok' : (s.slo_status === 'draining' ? 'warn' : 'err'))],
+        ['Auth', s.auth.required ? pill('required', 'ok') : pill('open', 'warn')],
+      ];
+      $('status-cards').innerHTML = cards.map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+      const detail = s.workers.detail || [];
+      if (s.serving_backend === 'worker') {
+        $('status-workers').innerHTML = table(
+          [{ label: 'Worker', key: 'worker' }, { label: 'Admitting', cell: r => pill(r.admitting ? 'yes' : 'no', r.admitting ? 'ok' : 'muted') }, { label: 'In-flight', key: 'in_flight' }],
+          detail);
+      } else {
+        $('status-workers').innerHTML = table([{ label: 'Native engine', key: 'engine' }, { label: 'Resident', cell: r => pill(r.resident ? 'yes' : 'no', 'ok') }], detail);
+      }
+    }
+
+    // ---- Models ----
+    async function loadModels() {
+      const d = await api('/v1/admin/models');
+      $('models-table').innerHTML = table([
+        { label: 'Alias', key: 'alias' },
+        { label: 'Family', cell: r => esc(r.family || '—') },
+        { label: 'Role', key: 'role' },
+        { label: 'Weight', key: 'weight' },
+        { label: 'State', cell: r => pill(r.state, r.state === 'active' ? 'ok' : 'muted') },
+        { label: 'Routed', cell: r => pill(r.routed ? 'yes' : 'no', r.routed ? 'ok' : 'muted') },
+        { label: 'Readiness', cell: r => r.readiness ? pill(r.readiness, r.readiness === 'qualified' ? 'ok' : 'warn') : '<small>n/a</small>' },
+        { label: 'Path', wrap: true, cell: r => `<code>${esc(r.path)}</code>` },
+      ], d.models || []);
+    }
+
+    // ---- Quotas ----
+    async function loadQuotas() {
+      const d = await api('/v1/admin/quotas');
+      $('quotas-table').innerHTML = table([
+        { label: 'Subject', key: 'subject' },
+        { label: 'Team', key: 'team' },
+        { label: 'Req/min', key: 'requests_per_minute' },
+        { label: 'Tokens/day', key: 'tokens_per_day' },
+        { label: 'Max concurrency', key: 'max_concurrency' },
+        { label: 'Tokens (24h)', cell: r => esc(r.usage.tokens_used) },
+        { label: 'Allowed (24h)', cell: r => esc(r.usage.allowed_requests) },
+        { label: 'Allowed models', wrap: true, cell: r => esc((r.allowed_models || []).join(', ') || 'all') },
+      ], d.quotas || []);
+    }
+
+    // ---- Usage ----
+    async function loadUsage() {
+      const w = $('usage-window').value;
+      const d = await api(`/v1/admin/usage?window=${encodeURIComponent(w)}`);
+      const u = d.usage_summary || {};
+      const cards = [
+        ['Requests', u.request_count ?? 0],
+        ['Input tokens', u.input_tokens ?? 0],
+        ['Output tokens', u.output_tokens ?? 0],
+        ['Total tokens', u.total_tokens ?? 0],
+        ['Avg latency', u.average_latency_ms != null ? `${Math.round(u.average_latency_ms)} <small>ms</small>` : '—'],
+        ['Quota decisions', d.quota_decision_count ?? 0],
+      ];
+      $('usage-cards').innerHTML = cards.map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+      $('usage-bymodel').innerHTML = table([
+        { label: 'Model', key: 'key' },
+        { label: 'Requests', key: 'request_count' },
+        { label: 'Input', key: 'input_tokens' },
+        { label: 'Output', key: 'output_tokens' },
+        { label: 'Total', key: 'total_tokens' },
+        { label: 'Avg latency', cell: r => r.average_latency_ms != null ? `${Math.round(r.average_latency_ms)} ms` : '—' },
+      ], u.by_model || []);
+      $('usage-decisions').innerHTML = table([
+        { label: 'When', cell: r => esc(r.at) },
+        { label: 'Actor', key: 'actor' },
+        { label: 'Team', key: 'team' },
+        { label: 'Model', key: 'model' },
+        { label: 'Allowed', cell: r => pill(r.allowed ? 'yes' : 'no', r.allowed ? 'ok' : 'err') },
+        { label: 'Reason', wrap: true, key: 'reason' },
+      ], d.quota_decisions || []);
+    }
+
+    // ---- Audit ----
+    async function loadAudit() {
+      const w = $('audit-window').value;
+      const d = await api(`/v1/admin/audit?window=${encodeURIComponent(w)}`);
+      $('audit-table').innerHTML = table([
+        { label: 'When', cell: r => esc(r.at) },
+        { label: 'Actor', key: 'actor' },
+        { label: 'Team', key: 'team' },
+        { label: 'Action', key: 'action' },
+        { label: 'Resource', key: 'resource' },
+        { label: 'Outcome', cell: r => pill(r.outcome, r.outcome === 'allowed' ? 'ok' : (r.outcome === 'denied' ? 'err' : 'warn')) },
+      ], d.events || []);
+    }
+
+    // ---- Keys ----
+    async function loadKeys() {
+      const d = await api('/v1/admin/keys');
+      $('keys-table').innerHTML = table([
+        { label: 'ID', key: 'id' },
+        { label: 'Subject', key: 'subject' },
+        { label: 'Team', key: 'team' },
+        { label: 'Scopes', wrap: true, cell: r => esc((r.scopes || []).join(', ')) },
+        { label: 'Owner', cell: r => esc(r.owner || '—') },
+        { label: 'Purpose', cell: r => esc(r.purpose || '—') },
+        { label: 'Last four', cell: r => r.last_four ? `<code>${esc(r.last_four)}</code>` : '—' },
+        { label: 'Status', cell: r => pill(r.status, r.status === 'active' ? 'ok' : 'warn') },
+        { label: 'Expires', cell: r => esc(r.expires_at || '—') },
+      ], d.keys || []);
+    }
+
+    // ---- Chat tester ----
+    const chatHistory = [];
+    async function loadChatModels() {
+      const sel = $('chat-model');
+      try {
+        const res = await fetch('/v1/models', { headers: authHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json();
+        const models = Array.isArray(body.data) ? body.data : [];
+        sel.innerHTML = models.length ? models.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('') : '<option value="">no models</option>';
+      } catch (e) { sel.innerHTML = '<option value="">failed to load</option>'; }
+    }
+    function chatAppend(role, text) {
+      const log = $('chatlog');
+      if (log.querySelector('.empty')) log.innerHTML = '';
+      const el = document.createElement('div');
+      el.className = `msg ${role}`;
+      el.innerHTML = `<span class="role">${role}: </span>`;
+      const span = document.createElement('span'); span.textContent = text; el.appendChild(span);
+      log.appendChild(el); log.scrollTop = log.scrollHeight;
+      return span;
+    }
+    async function sendChat(ev) {
+      ev.preventDefault();
+      const text = $('chat-prompt').value.trim();
+      const model = $('chat-model').value;
+      if (!text || !model) return;
+      chatHistory.push({ role: 'user', content: text });
+      chatAppend('user', text);
+      $('chat-prompt').value = '';
+      $('chat-send').disabled = true;
+      const out = chatAppend('assistant', '');
+      try {
+        const res = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ model, messages: chatHistory, stream: true }),
+        });
+        if (!res.ok || !res.body) { const t = await res.text().catch(() => ''); throw new Error(`HTTP ${res.status}: ${t}`); }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '', acc = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop();
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const payload = t.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            try {
+              const j = JSON.parse(payload);
+              const piece = j?.choices?.[0]?.delta?.content || '';
+              if (piece) { acc += piece; out.textContent = acc; $('chatlog').scrollTop = $('chatlog').scrollHeight; }
+            } catch (_) { /* ignore keepalive / partial */ }
+          }
+        }
+        if (!acc) out.textContent = '(empty response)';
+        chatHistory.push({ role: 'assistant', content: acc });
+      } catch (e) {
+        out.parentElement.className = 'msg error';
+        out.textContent = String(e);
+      } finally {
+        $('chat-send').disabled = false;
+        $('chat-prompt').focus();
+      }
+    }
+
+    // ---- Nav + refresh ----
+    const loaders = { dashboard: loadDashboard, models: loadModels, quotas: loadQuotas, usage: loadUsage, audit: loadAudit, keys: loadKeys, chat: loadChatModels };
+    let current = 'dashboard';
+    async function activate(view) {
+      current = view;
+      document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', a.dataset.view === view));
+      document.querySelectorAll('section').forEach(s => s.classList.toggle('active', s.id === `view-${view}`));
+      await run(loaders[view]);
+    }
+    async function run(fn) {
+      clearBanner();
+      conn.textContent = 'loading…';
+      try { await fn(); conn.textContent = 'ok · ' + new Date().toLocaleTimeString(); }
+      catch (e) { conn.textContent = 'error'; showError(String(e.message || e)); }
+    }
+    document.querySelectorAll('nav a').forEach(a => a.addEventListener('click', () => activate(a.dataset.view)));
+    $('refresh').addEventListener('click', () => activate(current));
+    $('usage-reload').addEventListener('click', () => run(loadUsage));
+    $('audit-reload').addEventListener('click', () => run(loadAudit));
+    $('chat-reload-models').addEventListener('click', () => run(loadChatModels));
+    $('composer').addEventListener('submit', sendChat);
+    activate('dashboard');
+  </script>
+</body>
+</html>

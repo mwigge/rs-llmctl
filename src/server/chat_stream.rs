@@ -466,6 +466,7 @@ mod tests {
         Arc::new(ServerState {
             cfg: Arc::new(Config::default()),
             storage,
+            started_at: std::time::Instant::now(),
             client: reqwest::Client::new(),
             upstreams: BTreeMap::new(),
             admission: crate::server::AdmissionController::new(1),

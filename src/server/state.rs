@@ -6,7 +6,7 @@ use crate::worker::{TokioWorkerRunner, WorkerAdmissionRegistry, WorkerSupervisor
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub type NativeEngineRegistry = BTreeMap<String, Arc<dyn native::NativeEngine>>;
@@ -15,6 +15,9 @@ pub type NativeEngineRegistry = BTreeMap<String, Arc<dyn native::NativeEngine>>;
 pub struct ServerState {
     pub(super) cfg: Arc<Config>,
     pub(super) storage: Storage,
+    /// Process wall-clock start of this router instance, used to report uptime
+    /// on the admin status endpoint.
+    pub(super) started_at: Instant,
     pub(super) client: reqwest::Client,
     pub(super) upstreams: BTreeMap<String, String>,
     pub(super) admission: AdmissionController,

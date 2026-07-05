@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 mod accounting;
 mod admin;
+mod admin_ui;
 mod auth;
 mod chat;
 mod chat_dispatch;
@@ -230,6 +231,7 @@ fn router_with_worker_control_native_engine_and_drain(
     let state = ServerState {
         cfg: Arc::new(cfg),
         storage,
+        started_at: Instant::now(),
         client,
         upstreams,
         admission,
@@ -244,6 +246,13 @@ fn router_with_worker_control_native_engine_and_drain(
 
     Router::new()
         .route("/playground", get(playground))
+        .route("/ui", get(admin_ui::admin_ui))
+        .route("/v1/admin/status", get(admin_ui::admin_status))
+        .route("/v1/admin/models", get(admin_ui::admin_models))
+        .route("/v1/admin/quotas", get(admin_ui::admin_quotas))
+        .route("/v1/admin/usage", get(admin_ui::admin_usage))
+        .route("/v1/admin/audit", get(admin_ui::admin_audit))
+        .route("/v1/admin/keys", get(admin_ui::admin_keys))
         .route("/healthz", get(health::healthz))
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))

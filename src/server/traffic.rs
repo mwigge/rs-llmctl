@@ -27,6 +27,13 @@ impl AdmissionController {
         }
     }
 
+    /// Number of global admission permits currently available. The count of
+    /// in-flight requests is `max_in_flight - available_permits()`. Read-only;
+    /// used by the admin status endpoint.
+    pub(super) fn available_permits(&self) -> usize {
+        self.global.available_permits()
+    }
+
     #[cfg(test)]
     pub(super) fn try_acquire_for(
         &self,
