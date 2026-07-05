@@ -27,7 +27,8 @@ use rs_llmctl::reporting;
 use rs_llmctl::runtime;
 use rs_llmctl::storage::Storage;
 use rs_llmctl::worker::{
-    StartupPlan, SwapPlan, TokioWorkerRunner, WorkerId, WorkerLaunchPlan, WorkerSupervisor,
+    StartupPlan, SwapPlan, TokioWorkerRunner, WorkerId, WorkerLaunchPlan, WorkerState,
+    WorkerSupervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -257,25 +258,38 @@ async fn server_command(path: &Path, command: ServerCommand, as_json: bool) -> R
                 // would waste RAM and time.
                 let mut supervisor = WorkerSupervisor::new(TokioWorkerRunner::new());
                 let statuses = supervisor.start_all(&plan).await;
-                let worker_count = statuses.len();
+                // Boot readiness must reflect live workers: a worker that failed
+                // to spawn or never became ready must not count toward readiness.
+                let planned_count = statuses.len();
+                let ready_count = statuses
+                    .iter()
+                    .filter(|status| status.state == WorkerState::Ready)
+                    .count();
                 let worker_control = Arc::new(AsyncMutex::new(supervisor));
                 emit(
                     as_json,
                     &json!({
-                        "status": "ready",
+                        "status": if ready_count > 0 { "ready" } else { "no_ready_workers" },
                         "bind": format!("{}:{}", cfg.server.host, cfg.server.port),
                         "backend": "llama-server-subprocess",
-                        "workers": worker_count,
+                        "workers": planned_count,
+                        "ready_workers": ready_count,
                         "native_engines": 0
                     }),
                 )?;
-                rs_llmctl::server::serve_with_storage_worker_control_and_shutdown(
-                    cfg,
-                    storage,
-                    Some(worker_control),
-                    rs_llmctl::server::shutdown_signal(),
-                )
-                .await
+                // Supervision loop: detect crashed workers and mark them
+                // not-ready so routing avoids the dead port.
+                let reaper = rs_llmctl::server::spawn_worker_reaper(worker_control.clone());
+                let serve_result =
+                    rs_llmctl::server::serve_with_storage_worker_control_and_shutdown(
+                        cfg,
+                        storage,
+                        Some(worker_control),
+                        rs_llmctl::server::shutdown_signal(),
+                    )
+                    .await;
+                reaper.abort();
+                serve_result
             } else {
                 let engines = load_native_engines_from_config(&cfg)?;
                 #[cfg(feature = "llama-cpp-native")]

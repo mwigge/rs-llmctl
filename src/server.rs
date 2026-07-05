@@ -83,7 +83,7 @@ use health::readiness_status_for;
 pub use lifecycle::{
     serve, serve_with_shutdown, serve_with_storage, serve_with_storage_and_native_engine,
     serve_with_storage_and_native_engines, serve_with_storage_and_shutdown,
-    serve_with_storage_worker_control_and_shutdown, shutdown_signal,
+    serve_with_storage_worker_control_and_shutdown, shutdown_signal, spawn_worker_reaper,
 };
 use lineage::{record_request_lineage_joins, runtime_lineage_from_headers_and_metadata};
 #[cfg(test)]
@@ -202,16 +202,19 @@ fn router_with_worker_control_and_native_engines(
         storage,
         serving_limits,
         worker_control,
+        None,
         native_engines,
         Arc::new(AtomicBool::new(false)),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn router_with_worker_control_native_engine_and_drain(
     cfg: Config,
     storage: Storage,
     serving_limits: ServingLimits,
     worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    worker_admissions: Option<crate::worker::WorkerAdmissionRegistry>,
     native_engines: NativeEngineRegistry,
     draining: Arc<AtomicBool>,
 ) -> Router {
@@ -233,6 +236,7 @@ fn router_with_worker_control_native_engine_and_drain(
         serving_limits,
         native_engines,
         worker_control,
+        worker_admissions,
         draining: draining.clone(),
         circuit_breakers: CircuitBreakers::default(),
         auth_failures: AuthFailureLimiter::default(),

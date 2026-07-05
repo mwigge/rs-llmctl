@@ -12,12 +12,19 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
 const DEFAULT_GPU_LAYERS: u32 = 99;
 const READY_PROBE_ATTEMPTS: usize = 120;
 const READY_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// Upper bound on how long `drain` waits for in-flight requests to finish
+/// before proceeding to tear the worker down.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval used while waiting for a worker's in-flight count to reach 0.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkerId(String);
@@ -525,6 +532,76 @@ impl CommandSpec {
     }
 }
 
+/// Live admission gate for a single worker, shared between the supervisor and
+/// the request-routing path.
+///
+/// Routing consults `is_admitting()` to decide whether a worker may receive new
+/// requests, and holds an [`InFlightGuard`] for the duration of each proxied
+/// request so `drain` can wait for outstanding work to finish before the worker
+/// is torn down. This is the piece that connects live worker lifecycle state to
+/// the request path — without it, `drain`/`stop` only flip an enum while the
+/// router keeps proxying to a dead port.
+#[derive(Debug)]
+pub struct WorkerAdmission {
+    admitting: AtomicBool,
+    in_flight: AtomicUsize,
+}
+
+impl WorkerAdmission {
+    fn ready() -> Arc<Self> {
+        Arc::new(Self {
+            admitting: AtomicBool::new(true),
+            in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    /// Whether the worker is currently accepting new requests.
+    pub fn is_admitting(&self) -> bool {
+        self.admitting.load(Ordering::SeqCst)
+    }
+
+    /// Number of requests currently in flight against this worker.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    fn set_admitting(&self, value: bool) {
+        self.admitting.store(value, Ordering::SeqCst);
+    }
+
+    /// Attempts to admit a new request. Returns a guard that keeps the worker's
+    /// in-flight count raised until dropped, or `None` when the worker is not
+    /// currently admitting (draining/stopping/stopped/failed).
+    pub fn try_enter(self: &Arc<Self>) -> Option<InFlightGuard> {
+        if !self.is_admitting() {
+            return None;
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        // Re-check after incrementing to close the race where `drain` flipped
+        // `admitting` to false between the check above and the increment.
+        if !self.is_admitting() {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(InFlightGuard {
+            admission: self.clone(),
+        })
+    }
+}
+
+/// RAII guard that decrements a worker's in-flight count when dropped. Held for
+/// the duration of a proxied request.
+#[derive(Debug)]
+pub struct InFlightGuard {
+    admission: Arc<WorkerAdmission>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.admission.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkerState {
@@ -607,6 +684,14 @@ pub trait WorkerRunner {
     ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
         async { Ok(()) }.boxed()
     }
+
+    /// Returns the ids of workers whose underlying process has exited since the
+    /// last poll. Used by the supervisor's crash-reaping loop to detect dead
+    /// workers so routing can avoid them. Runners without a real process
+    /// (test fakes) report none by default.
+    fn poll_exited(&mut self) -> Vec<WorkerId> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -630,6 +715,14 @@ impl WorkerRunner for TokioWorkerRunner {
                 return Err(WorkerRunnerError::new(
                     "candle-native runtime is planned as an in-process worker, but the engine implementation is not available yet",
                 ));
+            }
+
+            // Ensure any prior child for this worker id is fully terminated (and
+            // its bound port released) before the replacement binds the same
+            // fixed port. Without this, spawning the replacement first and then
+            // dropping the old `Child` transiently double-binds the port.
+            if let Some(mut existing) = self.children.remove(&planned.worker.id) {
+                let _ = existing.kill().await;
             }
 
             let child = planned.command.clone().into_tokio_command().spawn()?;
@@ -684,12 +777,40 @@ impl WorkerRunner for TokioWorkerRunner {
         }
         .boxed()
     }
+
+    fn poll_exited(&mut self) -> Vec<WorkerId> {
+        let mut exited = Vec::new();
+        let ids: Vec<WorkerId> = self.children.keys().cloned().collect();
+        for id in ids {
+            if let Some(child) = self.children.get_mut(&id) {
+                // `try_wait` reaps without blocking; `Ok(Some(_))` means the
+                // process has exited, `Err` means it can no longer be waited on.
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => {
+                        self.children.remove(&id);
+                        exited.push(id);
+                    }
+                    Ok(None) => {}
+                }
+            }
+        }
+        exited
+    }
 }
+
+/// Shared, lock-free-to-read registry mapping each worker to its live admission
+/// gate. The supervisor owns the authoritative copy and the request-routing
+/// path holds a clone (see [`WorkerSupervisor::admissions`]), so routing can
+/// consult live worker admission state without contending on the supervisor's
+/// async mutex — which a swap/drain may hold for the duration of a model load.
+pub type WorkerAdmissionRegistry = Arc<std::sync::RwLock<BTreeMap<WorkerId, Arc<WorkerAdmission>>>>;
 
 #[derive(Debug)]
 pub struct WorkerSupervisor<R> {
     runner: R,
     statuses: BTreeMap<WorkerId, WorkerStatus>,
+    admissions: WorkerAdmissionRegistry,
+    drain_timeout: Duration,
 }
 
 impl<R> WorkerSupervisor<R> {
@@ -697,7 +818,32 @@ impl<R> WorkerSupervisor<R> {
         Self {
             runner,
             statuses: BTreeMap::new(),
+            admissions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
+    }
+
+    /// Returns a clone of the shared admission registry for the request path to
+    /// consult without locking the supervisor.
+    pub fn admissions(&self) -> WorkerAdmissionRegistry {
+        self.admissions.clone()
+    }
+
+    fn insert_admission(&self, worker_id: WorkerId, admission: Arc<WorkerAdmission>) {
+        if let Ok(mut registry) = self.admissions.write() {
+            registry.insert(worker_id, admission);
+        }
+    }
+
+    fn get_admission(&self, worker_id: &WorkerId) -> Option<Arc<WorkerAdmission>> {
+        self.admissions.read().ok()?.get(worker_id).cloned()
+    }
+
+    /// Overrides how long `drain` waits for in-flight requests to finish.
+    #[must_use]
+    pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
+        self.drain_timeout = drain_timeout;
+        self
     }
 
     pub fn runner(&self) -> &R {
@@ -706,6 +852,26 @@ impl<R> WorkerSupervisor<R> {
 
     pub fn statuses(&self) -> Vec<WorkerStatus> {
         self.statuses.values().cloned().collect()
+    }
+
+    /// Current lifecycle state of a worker, if known.
+    pub fn worker_state(&self, worker_id: &WorkerId) -> Option<WorkerState> {
+        self.statuses.get(worker_id).map(|status| status.state)
+    }
+
+    /// Live admission gate for a worker. Routing clones this to gate requests
+    /// and to hold an in-flight guard while proxying, without holding the
+    /// supervisor lock for the request's lifetime.
+    pub fn worker_admission(&self, worker_id: &WorkerId) -> Option<Arc<WorkerAdmission>> {
+        self.get_admission(worker_id)
+    }
+
+    /// Number of workers currently reporting [`WorkerState::Ready`].
+    pub fn ready_worker_count(&self) -> usize {
+        self.statuses
+            .values()
+            .filter(|status| status.state == WorkerState::Ready)
+            .count()
     }
 }
 
@@ -749,12 +915,19 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
                 });
 
                 match self.runner.wait_ready(planned).await {
-                    Ok(()) => self.update_status(&worker_id, |status| {
-                        status.state = WorkerState::Ready;
-                        status.last_error = None;
-                    }),
+                    Ok(()) => {
+                        // A freshly-ready worker admits new requests. Install a
+                        // fresh admission gate so any stale (draining) gate from
+                        // a prior incarnation is replaced.
+                        self.insert_admission(worker_id.clone(), WorkerAdmission::ready());
+                        self.update_status(&worker_id, |status| {
+                            status.state = WorkerState::Ready;
+                            status.last_error = None;
+                        })
+                    }
                     Err(error) => {
                         let _ = self.runner.stop(&worker_id).await;
+                        self.stop_admitting(&worker_id);
                         self.update_status(&worker_id, |status| {
                             status.pid = None;
                             status.state = WorkerState::Failed;
@@ -763,15 +936,29 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
                     }
                 }
             }
-            Err(error) => self.update_status(&worker_id, |status| {
-                status.pid = None;
-                status.state = WorkerState::Failed;
-                status.last_error = Some(error.to_string());
-            }),
+            Err(error) => {
+                self.stop_admitting(&worker_id);
+                self.update_status(&worker_id, |status| {
+                    status.pid = None;
+                    status.state = WorkerState::Failed;
+                    status.last_error = Some(error.to_string());
+                })
+            }
         }
     }
 
+    /// Drains a worker: stops admitting new requests, waits (up to the drain
+    /// timeout) for in-flight requests to finish, then marks it draining. This
+    /// is the real drain gate — routing stops selecting the worker as soon as
+    /// admission is closed, and teardown waits for outstanding work.
     pub async fn drain(&mut self, worker_id: &WorkerId) -> WorkerStatus {
+        self.stop_admitting(worker_id);
+        if let Some(admission) = self.get_admission(worker_id) {
+            let deadline = Instant::now() + self.drain_timeout;
+            while admission.in_flight() > 0 && Instant::now() < deadline {
+                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+            }
+        }
         self.update_status(worker_id, |status| {
             status.state = WorkerState::Draining;
             status.last_error = None;
@@ -779,6 +966,7 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
     }
 
     pub async fn stop(&mut self, worker_id: &WorkerId) -> WorkerStatus {
+        self.stop_admitting(worker_id);
         self.update_status(worker_id, |status| {
             status.state = WorkerState::Stopping;
             status.last_error = None;
@@ -795,6 +983,40 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
                 status.last_error = Some(error.to_string());
             }),
         }
+    }
+
+    /// Closes a worker's admission gate so routing immediately stops selecting
+    /// it. Safe to call for unknown workers.
+    fn stop_admitting(&self, worker_id: &WorkerId) {
+        if let Some(admission) = self.get_admission(worker_id) {
+            admission.set_admitting(false);
+        }
+    }
+
+    /// Detects workers whose process has crashed and marks them not-ready so
+    /// routing avoids them. Returns the statuses of any workers reaped. Intended
+    /// to be called periodically by a supervision loop.
+    pub fn reap_crashed(&mut self) -> Vec<WorkerStatus> {
+        let exited = self.runner.poll_exited();
+        let mut reaped = Vec::new();
+        for worker_id in exited {
+            // Only workers we believed were live are worth transitioning; a
+            // worker already stopped/stopping/failed needs no change.
+            let was_live = matches!(
+                self.worker_state(&worker_id),
+                Some(WorkerState::Ready | WorkerState::Warming | WorkerState::Draining)
+            );
+            if !was_live {
+                continue;
+            }
+            self.stop_admitting(&worker_id);
+            reaped.push(self.update_status(&worker_id, |status| {
+                status.pid = None;
+                status.state = WorkerState::Failed;
+                status.last_error = Some("worker process exited unexpectedly".to_string());
+            }));
+        }
+        reaped
     }
 
     pub async fn restart(&mut self, planned: &PlannedWorker) -> WorkerStatus {
@@ -929,6 +1151,29 @@ impl SwapPlan {
     }
 }
 
+/// Resource footprints and budget used to decide whether a hot swap can safely
+/// co-resident the active and replacement models. All values are in the same
+/// unit (bytes) and against the same resource (VRAM on a GPU box, otherwise
+/// system memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapBudget {
+    /// Resident footprint of the currently-active worker.
+    pub active_bytes: u64,
+    /// Resident footprint of the replacement worker.
+    pub replacement_bytes: u64,
+    /// Total budget both models must fit within to co-reside.
+    pub budget_bytes: u64,
+}
+
+impl SwapBudget {
+    /// Whether the active and replacement models can be resident simultaneously
+    /// (as a hot swap requires) without exceeding the budget.
+    #[must_use]
+    pub fn hot_swap_fits(&self) -> bool {
+        self.active_bytes.saturating_add(self.replacement_bytes) <= self.budget_bytes
+    }
+}
+
 impl<R: WorkerRunner> WorkerSupervisor<R> {
     pub async fn execute_swap(
         &mut self,
@@ -936,7 +1181,31 @@ impl<R: WorkerRunner> WorkerSupervisor<R> {
         active: &WorkerId,
         replacement: &PlannedWorker,
     ) -> SwapExecution {
-        match mode {
+        self.execute_swap_with_budget(mode, active, replacement, None)
+            .await
+    }
+
+    /// Executes a swap, optionally enforcing a resource budget for hot swaps.
+    ///
+    /// A hot swap loads the replacement while the active model is still
+    /// resident. On a constrained box that double-allocation OOMs. When `budget`
+    /// is supplied and the two models cannot co-reside, the hot swap is
+    /// automatically downgraded to a cold swap (which stops the active worker
+    /// before loading the replacement) so the operation stays within budget
+    /// instead of risking OOM during a "zero-downtime" swap. `None` preserves
+    /// the caller-selected mode unchanged.
+    pub async fn execute_swap_with_budget(
+        &mut self,
+        mode: SwapMode,
+        active: &WorkerId,
+        replacement: &PlannedWorker,
+        budget: Option<SwapBudget>,
+    ) -> SwapExecution {
+        let effective_mode = match (mode, budget) {
+            (SwapMode::Hot, Some(budget)) if !budget.hot_swap_fits() => SwapMode::Cold,
+            (mode, _) => mode,
+        };
+        match effective_mode {
             SwapMode::Cold => self.execute_cold_swap(active, replacement).await,
             SwapMode::Hot => self.execute_hot_swap(active, replacement).await,
         }
@@ -1049,6 +1318,12 @@ mod tests {
         fail_ready_for: Vec<WorkerId>,
         spawned: Vec<WorkerId>,
         stopped: Vec<WorkerId>,
+        /// Ordered spawn/stop event log, used to prove interleaving (e.g. that a
+        /// downgraded swap stops the active worker before spawning the
+        /// replacement, so both are never resident at once).
+        events: Vec<String>,
+        /// Workers whose process the next `poll_exited` should report as exited.
+        exited: Vec<WorkerId>,
     }
 
     impl WorkerRunner for FakeRunner {
@@ -1057,6 +1332,8 @@ mod tests {
             planned: &'a PlannedWorker,
         ) -> BoxFuture<'a, Result<SpawnedWorker, WorkerRunnerError>> {
             self.spawned.push(planned.worker.id.clone());
+            self.events
+                .push(format!("spawn:{}", planned.worker.id.as_str()));
             if self.fail_spawn_for.contains(&planned.worker.id) {
                 return ready(Err(WorkerRunnerError::new("spawn failed"))).boxed();
             }
@@ -1071,6 +1348,7 @@ mod tests {
             worker_id: &'a WorkerId,
         ) -> BoxFuture<'a, Result<(), WorkerRunnerError>> {
             self.stopped.push(worker_id.clone());
+            self.events.push(format!("stop:{}", worker_id.as_str()));
             if self.fail_stop_for.contains(worker_id) {
                 return ready(Err(WorkerRunnerError::new("stop failed"))).boxed();
             }
@@ -1087,6 +1365,10 @@ mod tests {
             }
 
             ready(Ok(())).boxed()
+        }
+
+        fn poll_exited(&mut self) -> Vec<WorkerId> {
+            std::mem::take(&mut self.exited)
         }
     }
 
@@ -1344,6 +1626,189 @@ mod tests {
             .find(|status| status.worker_id == active.worker.id)
             .expect("active status");
         assert_eq!(active_status.state, WorkerState::Ready);
+    }
+
+    // Bug 4 regression: a hot swap whose active+replacement footprints exceed
+    // the resource budget must NOT double-load (start replacement while active
+    // is still resident). Before the fix, `execute_hot_swap` always spawned the
+    // replacement first; here the over-budget hot swap is downgraded to a cold
+    // swap so the active worker is stopped before the replacement is spawned.
+    #[tokio::test]
+    async fn hot_swap_over_budget_downgrades_to_cold_to_avoid_double_allocation() {
+        let active = planned_worker("old");
+        let replacement = planned_worker("new");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 20_000,
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&startup_plan(vec![active.clone()]))
+            .await;
+
+        // active 6GB + replacement 6GB = 12GB > 10GB budget → cannot co-reside.
+        let budget = SwapBudget {
+            active_bytes: 6_000_000_000,
+            replacement_bytes: 6_000_000_000,
+            budget_bytes: 10_000_000_000,
+        };
+        assert!(!budget.hot_swap_fits());
+
+        let execution = supervisor
+            .execute_swap_with_budget(SwapMode::Hot, &active.worker.id, &replacement, Some(budget))
+            .await;
+
+        assert!(execution.success);
+        // Downgraded to cold: mode reported as Cold, and the event log proves the
+        // active worker was stopped BEFORE the replacement was ever spawned.
+        assert_eq!(execution.mode, SwapMode::Cold);
+        assert_eq!(
+            supervisor.runner().events,
+            vec![
+                "spawn:old".to_string(),
+                "stop:old".to_string(),
+                "spawn:new".to_string(),
+            ]
+        );
+    }
+
+    // Companion: when active+replacement fit the budget, the hot swap proceeds
+    // as requested (replacement warmed before the active worker is drained).
+    #[tokio::test]
+    async fn hot_swap_within_budget_stays_hot() {
+        let active = planned_worker("old");
+        let replacement = planned_worker("new");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 21_000,
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&startup_plan(vec![active.clone()]))
+            .await;
+
+        let budget = SwapBudget {
+            active_bytes: 4_000_000_000,
+            replacement_bytes: 4_000_000_000,
+            budget_bytes: 10_000_000_000,
+        };
+        assert!(budget.hot_swap_fits());
+
+        let execution = supervisor
+            .execute_swap_with_budget(SwapMode::Hot, &active.worker.id, &replacement, Some(budget))
+            .await;
+
+        assert!(execution.success);
+        assert_eq!(execution.mode, SwapMode::Hot);
+        // Hot: replacement spawned before the active worker is stopped.
+        assert_eq!(
+            supervisor.runner().events,
+            vec![
+                "spawn:old".to_string(),
+                "spawn:new".to_string(),
+                "stop:old".to_string(),
+            ]
+        );
+    }
+
+    // Bug 3 regression: drain must close the worker's admission gate so routing
+    // immediately stops selecting it. Before the fix, drain only flipped the
+    // status enum while the admission gate (and routing) stayed open.
+    #[tokio::test]
+    async fn drain_closes_admission_gate_so_routing_stops_selecting_worker() {
+        let worker = planned_worker("chat");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 22_000,
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&startup_plan(vec![worker.clone()]))
+            .await;
+
+        let admission = supervisor
+            .worker_admission(&worker.worker.id)
+            .expect("ready worker exposes an admission gate");
+        assert!(admission.is_admitting());
+        assert!(admission.try_enter().is_some());
+
+        let drained = supervisor.drain(&worker.worker.id).await;
+
+        assert_eq!(drained.state, WorkerState::Draining);
+        assert!(!admission.is_admitting());
+        assert!(
+            admission.try_enter().is_none(),
+            "a draining worker must not admit new requests"
+        );
+    }
+
+    // Bug 3 regression: drain must wait for in-flight requests to finish before
+    // completing, rather than tearing the worker down under live traffic.
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_requests_before_completing() {
+        let worker = planned_worker("chat");
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 23_000,
+            ..FakeRunner::default()
+        })
+        .with_drain_timeout(Duration::from_millis(150));
+        supervisor
+            .start_all(&startup_plan(vec![worker.clone()]))
+            .await;
+
+        let admission = supervisor
+            .worker_admission(&worker.worker.id)
+            .expect("admission gate");
+        let guard = admission.try_enter().expect("admitted");
+        assert_eq!(admission.in_flight(), 1);
+
+        // With an in-flight request held, drain blocks until the drain timeout.
+        let started = Instant::now();
+        supervisor.drain(&worker.worker.id).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "drain returned before waiting out in-flight work: {:?}",
+            started.elapsed()
+        );
+
+        // Dropping the guard releases the in-flight count.
+        drop(guard);
+        assert_eq!(admission.in_flight(), 0);
+    }
+
+    // Bug 3 regression: a crashed worker must be detected and marked not-ready so
+    // routing avoids the dead port. Before the fix there was no reaping loop and
+    // a crashed worker kept its Ready status (and open admission).
+    #[tokio::test]
+    async fn reap_crashed_marks_exited_worker_not_ready() {
+        let worker = planned_worker("chat");
+        // The fake reports the worker's process as exited on the next poll,
+        // simulating a crash after it became ready.
+        let mut supervisor = WorkerSupervisor::new(FakeRunner {
+            next_pid: 24_000,
+            exited: vec![worker.worker.id.clone()],
+            ..FakeRunner::default()
+        });
+        supervisor
+            .start_all(&startup_plan(vec![worker.clone()]))
+            .await;
+        assert_eq!(
+            supervisor.worker_state(&worker.worker.id),
+            Some(WorkerState::Ready)
+        );
+
+        let reaped = supervisor.reap_crashed();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].state, WorkerState::Failed);
+        assert_eq!(
+            supervisor.worker_state(&worker.worker.id),
+            Some(WorkerState::Failed)
+        );
+        assert!(
+            !supervisor
+                .worker_admission(&worker.worker.id)
+                .expect("admission gate")
+                .is_admitting(),
+            "a crashed worker must stop admitting requests"
+        );
     }
 
     #[test]

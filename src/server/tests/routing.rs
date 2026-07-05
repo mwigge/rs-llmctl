@@ -135,11 +135,28 @@ fn readiness_counts_only_active_routed_models() {
         vec![model("active", 1, "chat"), model("inactive", 0, "chat")],
     );
 
-    let status = readiness_status_for(&cfg, true, false);
+    let status = readiness_status_for(&cfg, true, false, None);
 
     assert_eq!(status["status"], "ready");
     assert_eq!(status["models"]["configured"], 1);
     assert_eq!(status["models"]["aliases"], json!(["active"]));
+}
+
+// Regression: with a live worker supervisor present, readiness must reflect
+// ACTUAL ready workers. Config still lists an active model, but every worker is
+// down (`live_ready == Some(false)`), so the node must not report ready.
+// Before the fix, readiness derived from config alone and returned "ready".
+#[test]
+fn readiness_reflects_dead_workers_not_just_config() {
+    let cfg = config_with_models(Mode::HotSwap, vec![model("active", 1, "chat")]);
+
+    let down = readiness_status_for(&cfg, true, false, Some(false));
+    assert_eq!(down["status"], "no_ready_workers");
+    assert_eq!(down["workers"]["live_ready"], json!(false));
+
+    let up = readiness_status_for(&cfg, true, false, Some(true));
+    assert_eq!(up["status"], "ready");
+    assert_eq!(up["workers"]["live_ready"], json!(true));
 }
 
 #[test]

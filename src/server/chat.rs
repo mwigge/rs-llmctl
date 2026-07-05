@@ -268,6 +268,18 @@ pub(super) async fn chat_completions(
         state.upstreams.contains_key(&route.upstream_alias) || state.upstreams.contains_key("*");
 
     if route.external_provider.is_some() || has_subprocess_upstream {
+        // Gate on live worker state before proxying: a supervised worker that is
+        // draining/stopping/stopped/crashed must not receive the request, even
+        // though its static upstream entry still exists. The guard keeps the
+        // worker's in-flight count raised so drain can wait for it to finish.
+        let _worker_guard = if route.external_provider.is_none() {
+            match admit_to_worker(&state, request_id, &route.upstream_alias).await {
+                Ok(guard) => guard,
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
         let tool_audit = request.tool_audit_detail();
         let gen_ai = gen_ai_params_from_request(&request);
         let upstream_timeout = model_upstream_timeout(&state, &model);
@@ -368,6 +380,49 @@ pub(super) async fn chat_completions(
         request,
     )
     .await
+}
+
+/// Gates a request on the live admission state of the supervised worker serving
+/// `alias`. Returns:
+/// - `Ok(None)` when there is no external worker supervisor (native in-process
+///   serving), leaving routing to the native engine path unchanged.
+/// - `Ok(Some(guard))` when the worker is admitting; the guard holds the
+///   worker's in-flight count raised until dropped so drain can wait for it.
+/// - `Err(response)` — a 503 `model_unavailable` — when the worker is unknown,
+///   not yet ready, or draining/stopping/stopped/crashed.
+async fn admit_to_worker(
+    state: &ServerState,
+    request_id: uuid::Uuid,
+    alias: &str,
+) -> Result<Option<crate::worker::InFlightGuard>, Response> {
+    let worker_id = crate::worker::WorkerId::new(alias);
+    // Fast path: read the shared admission registry without locking the
+    // supervisor (which a swap/drain may hold across a long model load).
+    let admission = if let Some(registry) = state.worker_admissions.as_ref() {
+        registry
+            .read()
+            .ok()
+            .and_then(|registry| registry.get(&worker_id).cloned())
+    } else if let Some(worker_control) = state.worker_control.as_ref() {
+        // Fallback for callers that wired a supervisor without exposing its
+        // registry: read under the supervisor lock.
+        worker_control.lock().await.worker_admission(&worker_id)
+    } else {
+        // No external worker supervisor (native in-process serving): leave
+        // routing to the native engine path unchanged.
+        return Ok(None);
+    };
+    match admission.and_then(|admission| admission.try_enter()) {
+        Some(guard) => Ok(Some(guard)),
+        None => Err(with_request_id(
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_unavailable",
+                format!("model {alias} is not currently serving; retry shortly"),
+            ),
+            request_id,
+        )),
+    }
 }
 
 pub(super) fn quota_admission_scopes(cfg: &Config, principal: &Principal) -> Vec<(String, usize)> {

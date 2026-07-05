@@ -2,7 +2,7 @@ use super::{AdmissionController, AuthFailureLimiter, CircuitBreakers, DEFAULT_MA
 use crate::config::Config;
 use crate::native;
 use crate::storage::Storage;
-use crate::worker::{TokioWorkerRunner, WorkerSupervisor};
+use crate::worker::{TokioWorkerRunner, WorkerAdmissionRegistry, WorkerSupervisor};
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -21,6 +21,10 @@ pub struct ServerState {
     pub(super) serving_limits: ServingLimits,
     pub(super) native_engines: NativeEngineRegistry,
     pub(super) worker_control: Option<Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+    /// Lock-free-to-read view of live worker admission gates, cloned from the
+    /// supervisor. Present when `worker_control` is; lets the request path gate
+    /// on live worker state without contending on the supervisor mutex.
+    pub(super) worker_admissions: Option<WorkerAdmissionRegistry>,
     pub(super) draining: Arc<AtomicBool>,
     pub(super) circuit_breakers: CircuitBreakers,
     pub(super) auth_failures: AuthFailureLimiter,

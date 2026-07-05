@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn readiness_status_reports_draining_as_not_ready() {
-    let status = readiness_status_for(&Config::default(), true, true);
+    let status = readiness_status_for(&Config::default(), true, true, None);
     assert_eq!(status["status"], "draining");
     assert_eq!(status["draining"], true);
 }

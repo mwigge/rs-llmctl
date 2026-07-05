@@ -138,6 +138,7 @@ where
         .with_context(|| format!("bind {addr}"))?;
     let limits = ServingLimits::from_config(&cfg);
     let draining = Arc::new(AtomicBool::new(false));
+    let worker_admissions = worker_admissions_for(worker_control.as_ref()).await;
     let shutdown = drain_before_shutdown(
         shutdown,
         draining.clone(),
@@ -151,6 +152,7 @@ where
             storage,
             limits,
             worker_control,
+            worker_admissions,
             native_engines,
             draining,
         )
@@ -182,6 +184,7 @@ where
         .with_context(|| format!("bind {addr}"))?;
     let limits = ServingLimits::from_config(&cfg);
     let draining = Arc::new(AtomicBool::new(false));
+    let worker_admissions = worker_admissions_for(worker_control.as_ref()).await;
     let shutdown = drain_before_shutdown(
         shutdown,
         draining.clone(),
@@ -192,6 +195,7 @@ where
         storage,
         limits,
         worker_control,
+        worker_admissions,
         native_engines,
         draining.clone(),
     );
@@ -254,6 +258,44 @@ fn emit_runtime_heartbeat(cfg: &Config, draining: bool) {
         Utc::now(),
         attributes,
     ));
+}
+
+/// Extracts the shared admission registry from the worker supervisor (locking it
+/// once at startup) so the request path can gate on live worker state without
+/// contending on the supervisor mutex during swaps/drains.
+async fn worker_admissions_for(
+    worker_control: Option<&Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>>,
+) -> Option<crate::worker::WorkerAdmissionRegistry> {
+    match worker_control {
+        Some(control) => Some(control.lock().await.admissions()),
+        None => None,
+    }
+}
+
+/// Default interval between crash-reaping sweeps.
+const WORKER_REAP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Spawns a background supervision loop that periodically reaps crashed workers,
+/// marking any whose process has exited as not-ready so the request router stops
+/// selecting the dead port. The returned handle should be aborted on shutdown.
+pub fn spawn_worker_reaper(
+    worker_control: Arc<AsyncMutex<WorkerSupervisor<TokioWorkerRunner>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WORKER_REAP_INTERVAL).await;
+            let reaped = {
+                let mut supervisor = worker_control.lock().await;
+                supervisor.reap_crashed()
+            };
+            for status in reaped {
+                tracing::warn!(
+                    worker = status.worker_id.as_str(),
+                    "worker process exited unexpectedly; marked not-ready"
+                );
+            }
+        }
+    })
 }
 
 pub async fn shutdown_signal() {

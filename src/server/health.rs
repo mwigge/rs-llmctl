@@ -38,7 +38,12 @@ pub(super) async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
     let storage_ready = storage_ready(&state.storage).await;
     let draining = state.draining.load(Ordering::SeqCst);
     let active_models = active_routed_models(&state.cfg).len();
-    let ready = storage_ready && !draining && active_models > 0;
+    // When an external worker supervisor is present, readiness must reflect
+    // ACTUAL live workers, not just configured models: `Some(false)` here means
+    // every supervised worker is down, so the node is not ready even though the
+    // config still lists models.
+    let live_ready = live_worker_readiness(&state).await;
+    let ready = storage_ready && !draining && active_models > 0 && live_ready.unwrap_or(true);
     let http_status = if ready {
         StatusCode::OK
     } else {
@@ -47,25 +52,66 @@ pub(super) async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
 
     (
         http_status,
-        Json(readiness_status_for(&state.cfg, storage_ready, draining)),
+        Json(readiness_status_for(
+            &state.cfg,
+            storage_ready,
+            draining,
+            live_ready,
+        )),
     )
         .into_response()
 }
 
-pub async fn readiness_status(cfg: &Config, storage: &Storage) -> Value {
-    readiness_status_for(cfg, storage_ready(storage).await, false)
+/// Reports whether at least one supervised worker is live and ready. Returns
+/// `None` when there is no external worker supervisor (native in-process
+/// serving), in which case readiness falls back to configured models.
+///
+/// Prefers the lock-free admission registry: a worker admits requests only while
+/// ready, so "any worker admitting" is exactly "at least one live-ready worker",
+/// computed without contending on the supervisor mutex a swap may hold.
+async fn live_worker_readiness(state: &ServerState) -> Option<bool> {
+    if let Some(registry) = state.worker_admissions.as_ref() {
+        let any_ready = registry
+            .read()
+            .map(|registry| registry.values().any(|admission| admission.is_admitting()))
+            .unwrap_or(false);
+        return Some(any_ready);
+    }
+    let worker_control = state.worker_control.as_ref()?;
+    let supervisor = worker_control.lock().await;
+    Some(supervisor.ready_worker_count() > 0)
 }
 
-pub(super) fn readiness_status_for(cfg: &Config, storage_ready: bool, draining: bool) -> Value {
+pub async fn readiness_status(cfg: &Config, storage: &Storage) -> Value {
+    readiness_status_for(cfg, storage_ready(storage).await, false, None)
+}
+
+pub(super) fn readiness_status_for(
+    cfg: &Config,
+    storage_ready: bool,
+    draining: bool,
+    live_ready: Option<bool>,
+) -> Value {
     let aliases: Vec<_> = active_routed_models(cfg)
         .into_iter()
         .map(|model| model.alias.as_str())
         .collect();
     let worker_plan = StartupPlan::from_config(cfg);
-    let ready = storage_ready && !draining && !aliases.is_empty();
+    let ready = storage_ready && !draining && !aliases.is_empty() && live_ready.unwrap_or(true);
+    let status = if ready {
+        "ready"
+    } else if draining {
+        "draining"
+    } else if aliases.is_empty() {
+        "no_models"
+    } else if live_ready == Some(false) {
+        "no_ready_workers"
+    } else {
+        "unavailable"
+    };
 
     json!({
-        "status": if ready { "ready" } else if draining { "draining" } else if aliases.is_empty() { "no_models" } else { "unavailable" },
+        "status": status,
         "mode": cfg.mode,
         "draining": draining,
         "models": {
@@ -73,7 +119,8 @@ pub(super) fn readiness_status_for(cfg: &Config, storage_ready: bool, draining: 
             "aliases": aliases
         },
         "workers": {
-            "planned": worker_plan.workers.len()
+            "planned": worker_plan.workers.len(),
+            "live_ready": live_ready
         },
         "storage": {
             "ready": storage_ready
