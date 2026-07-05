@@ -6,6 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Caps on how many distinct scopes/upstreams/keys each in-memory map tracks
+/// before idle entries are pruned, so a stream of distinct subjects cannot leak
+/// memory unboundedly.
+const SCOPED_ADMISSION_MAX_TRACKED: usize = 4096;
+const CIRCUIT_BREAKER_MAX_TRACKED: usize = 4096;
+const AUTH_FAILURE_MAX_TRACKED: usize = 8192;
+
 #[derive(Clone)]
 pub(super) struct AdmissionController {
     global: Arc<Semaphore>,
@@ -43,6 +50,14 @@ impl AdmissionController {
             let permit = {
                 let semaphore = {
                     let mut scoped = self.scoped.lock().map_err(|_| AdmissionError::Busy)?;
+                    // Bound growth from many distinct scopes: drop entries that
+                    // no in-flight request holds. A held permit keeps an extra
+                    // `Arc` clone alive, so `strong_count == 1` means only the
+                    // map references the semaphore and it can be safely
+                    // recreated on demand.
+                    if scoped.len() >= SCOPED_ADMISSION_MAX_TRACKED {
+                        scoped.retain(|_, sem| Arc::strong_count(sem) > 1);
+                    }
                     scoped
                         .entry(scope)
                         .or_insert_with(|| Arc::new(Semaphore::new(limit.max(1))))
@@ -92,7 +107,10 @@ struct CircuitBreakerState {
 
 impl CircuitBreakers {
     pub(super) fn allow_request(&self, upstream: &str, reset_after: Duration) -> bool {
-        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
+        // Recover from a poisoned lock instead of panicking: a single request
+        // that panicked while holding this lock must not wedge circuit
+        // breaking for every subsequent request (fail-open degradation).
+        let mut states = lock_recover(&self.states);
         let Some(state) = states.get_mut(upstream) else {
             return true;
         };
@@ -119,7 +137,8 @@ impl CircuitBreakers {
     }
 
     pub(super) fn record_success(&self, upstream: &str) {
-        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
+        let mut states = lock_recover(&self.states);
+        prune_idle_circuit_breakers(&mut states);
         let state = states
             .entry(upstream.to_string())
             .or_insert(CircuitBreakerState {
@@ -134,7 +153,8 @@ impl CircuitBreakers {
     }
 
     pub(super) fn record_failure(&self, upstream: &str, threshold: u32) {
-        let mut states = self.states.lock().expect("circuit breaker mutex poisoned");
+        let mut states = lock_recover(&self.states);
+        prune_idle_circuit_breakers(&mut states);
         let state = states
             .entry(upstream.to_string())
             .or_insert(CircuitBreakerState {
@@ -169,13 +189,15 @@ impl AuthFailureLimiter {
         if limit == 0 {
             return false;
         }
-        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
-        let window = failures
-            .entry(key.to_string())
-            .or_insert(AuthFailureWindow {
-                started: Instant::now(),
-                count: 0,
-            });
+        // Recover from a poisoned lock instead of panicking, so one panicked
+        // request can't wedge auth throttling for everyone.
+        let mut failures = lock_recover(&self.failures);
+        // Read-only check path: use `get_mut` (not `entry`) so merely testing a
+        // key never inserts an entry — that would let unauthenticated traffic
+        // with fresh keys grow the map unboundedly.
+        let Some(window) = failures.get_mut(key) else {
+            return false;
+        };
         if window.started.elapsed() >= Duration::from_secs(60) {
             window.started = Instant::now();
             window.count = 0;
@@ -187,7 +209,8 @@ impl AuthFailureLimiter {
         if limit == 0 {
             return;
         }
-        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
+        let mut failures = lock_recover(&self.failures);
+        prune_stale_auth_windows(&mut failures);
         let window = failures
             .entry(key.to_string())
             .or_insert(AuthFailureWindow {
@@ -221,7 +244,42 @@ impl AuthFailureLimiter {
     }
 
     pub(super) fn record_success(&self, key: &str) {
-        let mut failures = self.failures.lock().expect("auth limiter mutex poisoned");
+        let mut failures = lock_recover(&self.failures);
         failures.remove(key);
     }
+}
+
+/// Locks a mutex, recovering the guard if the lock was poisoned by a panic
+/// while held. Hot-path traffic controls must degrade gracefully rather than
+/// propagate a poison panic to every subsequent request.
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drops circuit-breaker entries that carry no state (closed, no failures, no
+/// in-flight probe) when the map grows large. A recreated entry is equivalent,
+/// so this is behavior-preserving.
+fn prune_idle_circuit_breakers(states: &mut BTreeMap<String, CircuitBreakerState>) {
+    if states.len() < CIRCUIT_BREAKER_MAX_TRACKED {
+        return;
+    }
+    states.retain(|_, state| {
+        state.opened_at.is_some()
+            || state.consecutive_failures > 0
+            || state.half_open_probe_in_flight
+    });
+}
+
+/// Drops auth-failure windows that have expired (older than the 60s window) or
+/// carry no failures when the map grows large. Such entries are treated as
+/// absent by `is_limited`/`record_failure`, so removing them is
+/// behavior-preserving.
+fn prune_stale_auth_windows(failures: &mut BTreeMap<String, AuthFailureWindow>) {
+    if failures.len() < AUTH_FAILURE_MAX_TRACKED {
+        return;
+    }
+    failures
+        .retain(|_, window| window.count > 0 && window.started.elapsed() < Duration::from_secs(60));
 }

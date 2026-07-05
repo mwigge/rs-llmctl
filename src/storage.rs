@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::any::{install_default_drivers, AnyPoolOptions};
 use sqlx::pool::PoolConnection;
-use sqlx::{Any, AnyPool, Row};
+use sqlx::{Any, AnyPool, Connection, Row};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -121,6 +121,12 @@ fn backend_for_url(database_url: &str) -> Result<StorageBackend> {
     }
 }
 
+/// True when `database_url` targets an in-memory SQLite database, whose pooled
+/// connections are each a distinct empty database (see [`Storage::connect_any`]).
+fn is_in_memory_sqlite(database_url: &str) -> bool {
+    database_url.contains(":memory:") || database_url.contains("mode=memory")
+}
+
 fn dialect_name(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Sqlite => "sqlite",
@@ -172,16 +178,13 @@ fn migration_statements(dialect: SqlDialect) -> Vec<String> {
         SqlDialect::Postgres => "",
     };
 
+    // NOTE: a `schema_migrations` table used to be created here, but nothing
+    // ever wrote to or read from it — it was dead versioning scaffolding.
+    // Removing it (rather than wiring a real migration ledger) is the
+    // lower-risk cleanup: the schema is applied idempotently via
+    // `CREATE TABLE IF NOT EXISTS` / `add_column_if_missing`, so no version
+    // ledger is required for correctness, and no code depends on the table.
     vec![
-        format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                id TEXT PRIMARY KEY NOT NULL,
-                checksum TEXT NOT NULL,
-                applied_at {time_type} NOT NULL
-            )
-            "#
-        ),
         format!(
             r#"
             CREATE TABLE IF NOT EXISTS audit_events (
@@ -322,10 +325,30 @@ impl QuotaAdmissionGuard {
     /// you on every code path. The `Drop` impl is only a safety net.
     pub async fn release(mut self) -> Result<()> {
         if let Some(mut connection) = self.postgres_connection.take() {
-            sqlx::query("SELECT pg_advisory_unlock($1)")
+            match sqlx::query("SELECT pg_advisory_unlock($1)")
                 .bind(self.advisory_lock_key)
                 .execute(&mut *connection)
-                .await?;
+                .await
+            {
+                Ok(_) => {}
+                Err(err) => {
+                    // The unlock failed, so this connection's session STILL
+                    // holds the advisory lock. Returning it to the pool (which
+                    // is what dropping a `PoolConnection` does) would hand the
+                    // next borrower a locked connection and stall it. Instead,
+                    // detach it from the pool and close it: ending the Postgres
+                    // session releases every session-level advisory lock it
+                    // held server-side. The pool simply opens a fresh
+                    // connection in its place.
+                    if let Err(close_err) = connection.detach().close().await {
+                        tracing::warn!(
+                            error = %close_err,
+                            "failed to close detached connection after advisory-unlock error"
+                        );
+                    }
+                    return Err(err).context("release quota admission advisory lock");
+                }
+            }
         }
         Ok(())
     }
@@ -333,25 +356,28 @@ impl QuotaAdmissionGuard {
 
 impl Drop for QuotaAdmissionGuard {
     fn drop(&mut self) {
-        if let Some(mut connection) = self.postgres_connection.take() {
+        if let Some(connection) = self.postgres_connection.take() {
             // Reaching here means `release()` was never called, which is a
-            // bug: the unlock below is a detached, fire-and-forget fallback
-            // whose outcome we can't observe.
+            // bug. We cannot run the explicit unlock here: `Drop` can't await,
+            // and spawning onto the Tokio runtime panics when the guard is
+            // dropped off a runtime thread. Instead, detach the connection from
+            // the pool and drop it. Closing the connection ends its Postgres
+            // session, which releases every session-level advisory lock it held
+            // server-side. Critically, the still-locked connection is never
+            // returned to the pool where it could stall the next borrower.
             tracing::warn!(
                 "quota admission guard dropped without release(); \
-                 unlocking advisory lock as a fallback"
+                 closing its connection to release the advisory lock"
             );
             record_quota_admission_release_failure_metric("dropped_without_release");
-            let advisory_lock_key = self.advisory_lock_key;
-            tokio::spawn(async move {
-                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                    .bind(advisory_lock_key)
-                    .execute(&mut *connection)
-                    .await;
-            });
+            drop(connection.detach());
         }
     }
 }
+
+/// Cap on how many distinct admission scopes keep a resident lock before idle
+/// entries are pruned (see [`Storage::scoped_admission_lock`]).
+const QUOTA_ADMISSION_LOCK_MAX_TRACKED: usize = 4096;
 
 fn record_quota_admission_release_failure_metric(reason: &'static str) {
     opentelemetry::global::meter(crate::SERVICE_NAME)
@@ -518,8 +544,19 @@ impl Storage {
         max_connections: u32,
     ) -> Result<Self> {
         install_default_drivers();
+        // Every connection to an in-memory SQLite database is a DISTINCT,
+        // initially empty database. `migrate()` runs on a single pooled
+        // connection, so any *other* pooled connection would see "no such
+        // table" at runtime. Pin the pool to one connection so all queries
+        // share the single migrated database. (A file-backed SQLite path or
+        // Postgres is required for real connection concurrency.)
+        let effective_max = if dialect == SqlDialect::Sqlite && is_in_memory_sqlite(database_url) {
+            1
+        } else {
+            max_connections
+        };
         let pool = AnyPoolOptions::new()
-            .max_connections(max_connections)
+            .max_connections(effective_max)
             .connect(database_url)
             .await
             .with_context(|| format!("open {} database", dialect_name(dialect)))?;
@@ -620,7 +657,15 @@ impl Storage {
         let mut locks = self
             .quota_admission_locks
             .lock()
-            .expect("quota admission lock map poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bound growth from many distinct scopes: when the map grows large,
+        // drop entries no admission guard currently holds. An outstanding
+        // `QuotaAdmissionGuard` keeps an extra `Arc` clone alive (via its
+        // `OwnedMutexGuard`), so `strong_count == 1` means only the map
+        // references the lock and it can be recreated on demand.
+        if locks.len() >= QUOTA_ADMISSION_LOCK_MAX_TRACKED {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
         locks
             .entry(scope.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
@@ -1399,7 +1444,19 @@ async fn add_column_if_missing(
             });
             if !exists {
                 let alter = format!("ALTER TABLE {table} ADD COLUMN {column_sql}");
-                sqlx::query(&alter).execute(pool).await?;
+                if let Err(err) = sqlx::query(&alter).execute(pool).await {
+                    // TOCTOU guard: another process/connection may have added
+                    // the column between the PRAGMA check above and this ALTER
+                    // (SQLite has no `ADD COLUMN IF NOT EXISTS`). It reports the
+                    // race as a "duplicate column name" error, which is benign
+                    // here — the column now exists, which is the desired
+                    // postcondition. Any other error is a real failure.
+                    let message = err.to_string().to_ascii_lowercase();
+                    if !message.contains("duplicate column") {
+                        return Err(err)
+                            .with_context(|| format!("add column `{column_sql}` to {table}"));
+                    }
+                }
             }
         }
     }
@@ -1762,6 +1819,60 @@ mod tests {
             rewrite_placeholders(SqlDialect::Postgres, "SELECT pg_advisory_lock(?)"),
             "SELECT pg_advisory_lock($1)"
         );
+    }
+
+    #[test]
+    fn detects_in_memory_sqlite_targets() {
+        assert!(is_in_memory_sqlite("sqlite://:memory:"));
+        assert!(is_in_memory_sqlite("sqlite::memory:"));
+        assert!(is_in_memory_sqlite(
+            "sqlite://file:foo?mode=memory&cache=shared"
+        ));
+        assert!(!is_in_memory_sqlite(
+            "sqlite:///var/lib/rs-llmctl/state.db?mode=rwc"
+        ));
+    }
+
+    /// Bug 15 regression: an in-memory sqlite store opened while requesting a
+    /// multi-connection pool must be pinned to a single connection and still be
+    /// able to query a migrated table.
+    ///
+    /// Fail-before: without the clamp, `connect_any` honored `max_connections =
+    /// 5`. `migrate()` created the schema on one pooled connection, but every
+    /// other connection to an in-memory sqlite database is a DISTINCT empty
+    /// database, so a query routed to a fresh connection failed at runtime with
+    /// "no such table: audit_events". The clamp forces one shared connection.
+    #[tokio::test]
+    async fn in_memory_sqlite_pool_is_pinned_to_single_connection() -> Result<()> {
+        // Request 5 connections deliberately; the fix must clamp this to 1 so
+        // migration and every subsequent query share the one in-memory DB.
+        let storage = Storage::connect_any("sqlite::memory:", SqlDialect::Sqlite, 5).await?;
+        assert_eq!(
+            storage.pool.options().get_max_connections(),
+            1,
+            "in-memory sqlite pool must be clamped to a single connection"
+        );
+
+        // The single shared connection sees the migrated schema.
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM audit_events")
+            .fetch_one(&storage.pool)
+            .await
+            .context("query migrated audit_events table")?;
+        let count: i64 = row.try_get("count")?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    /// A file-backed sqlite target must NOT be clamped — real connection
+    /// concurrency is preserved there (only in-memory needs a single owner).
+    #[tokio::test]
+    async fn file_backed_sqlite_pool_is_not_clamped() -> Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let db_path = dir.path().join("state.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let storage = Storage::connect_any(&url, SqlDialect::Sqlite, 5).await?;
+        assert_eq!(storage.pool.options().get_max_connections(), 5);
+        Ok(())
     }
 
     /// Exercises the storage layer against a real Postgres instance.

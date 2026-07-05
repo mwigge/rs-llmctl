@@ -821,13 +821,50 @@ pub async fn load(path: &Path) -> Result<Config> {
 }
 
 pub async fn save(path: &Path, cfg: &Config) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    use tokio::io::AsyncWriteExt;
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
         fs::create_dir_all(parent).await?;
     }
     let body = toml::to_string_pretty(cfg)?;
-    fs::write(path, body).await?;
+
+    // Atomic write: serialize into a sibling temp file in the same directory,
+    // fsync it, then rename it over the target. `rename(2)` within a single
+    // directory is atomic, so a crash or full disk mid-write cannot leave a
+    // truncated live config.toml — which holds the API-key hash table and the
+    // security posture. A plain `fs::write` (truncate-then-write) could.
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        SAVE_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let tmp_path = dir.join(format!(".{file_name}.tmp-{unique}"));
+
+    let write_result = async {
+        let mut file = fs::File::create(&tmp_path).await?;
+        file.write_all(body.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&tmp_path, path).await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+
+    if write_result.is_err() {
+        // Best-effort cleanup so a failed save doesn't leak temp files.
+        let _ = fs::remove_file(&tmp_path).await;
+    }
+    write_result.with_context(|| format!("atomically write config {}", path.display()))?;
     Ok(())
 }
+
+static SAVE_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Validate that a configuration is safe enough for production or external bind.
 ///
@@ -1055,5 +1092,56 @@ status = "retiring"
         assert_eq!(key.last_four.as_deref(), Some("cdef"));
         assert_eq!(key.fingerprint.as_deref(), Some("sha256:0123456789abcdef"));
         assert_eq!(key.status, "retiring");
+    }
+
+    #[tokio::test]
+    async fn save_writes_complete_valid_toml_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let cfg = Config::default();
+        save(&path, &cfg).await.expect("save");
+
+        // The saved file must be complete, valid TOML that round-trips.
+        let reloaded = load(&path).await.expect("reload saved config");
+        assert_eq!(reloaded.mode, cfg.mode);
+
+        // The atomic-rename strategy must not leave sibling temp files behind.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read_dir");
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["config.toml".to_string()]);
+        assert!(
+            names.iter().all(|name| !name.contains(".tmp-")),
+            "no temp files should remain: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_overwrites_existing_config_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        // Pre-existing (larger) content: proves the temp+rename path replaces
+        // rather than truncating in place, so a live reader never observes a
+        // half-written file.
+        let mut first = Config::default();
+        first.quotas.push(QuotaConfig {
+            subject: "team-a".to_string(),
+            team: "team-a".to_string(),
+            requests_per_minute: 10,
+            tokens_per_day: 1000,
+            max_concurrency: 2,
+            allowed_models: vec!["m1".to_string(), "m2".to_string()],
+        });
+        save(&path, &first).await.expect("first save");
+
+        let second = Config::default();
+        save(&path, &second).await.expect("second save");
+
+        let reloaded = load(&path).await.expect("reload");
+        assert!(reloaded.quotas.is_empty());
     }
 }

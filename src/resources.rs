@@ -219,14 +219,46 @@ pub fn parse_nvidia_smi_csv(output: &str) -> Vec<GpuSnapshot> {
         .collect()
 }
 
+/// Parses `rocm-smi --showmeminfo vram` text into one snapshot per physical
+/// card.
+///
+/// `rocm-smi` prints *several* matching lines per card, e.g.:
+///
+/// ```text
+/// GPU[0]  : VRAM Total Memory (B): 17163091968
+/// GPU[0]  : VRAM Total Used Memory (B): 178872320
+/// ```
+///
+/// A naive "one snapshot per matching line" reading turned a single 16 GB card
+/// into two "GPUs" and misread the *Used* line as another card's total,
+/// ~doubling planned VRAM. We instead anchor on the canonical total-VRAM line
+/// (skipping `Used`/`Free` lines) and de-dupe by the `GPU[N]` index so each
+/// card yields exactly one snapshot.
 pub fn parse_rocm_smi_text(output: &str) -> Vec<GpuSnapshot> {
-    let mut gpus = Vec::new();
+    use std::collections::BTreeMap;
+
+    let mut by_index: BTreeMap<u32, GpuSnapshot> = BTreeMap::new();
+    let mut without_index: Vec<GpuSnapshot> = Vec::new();
+
     for line in output.lines() {
         let lower = line.to_ascii_lowercase();
         if !lower.contains("vram") && !lower.contains("memory") {
             continue;
         }
-        let Some(value) = line
+        // Only the "Total Memory" line reports a card's total VRAM. Used/Free
+        // (and any per-process) lines must not be counted as extra cards.
+        if lower.contains("used") || lower.contains("free") {
+            continue;
+        }
+
+        let index = parse_rocm_gpu_index(line);
+        // Strip the leading "GPU[N]" marker so its index digits are not
+        // mistaken for the VRAM value.
+        let value_region = match line.find(']') {
+            Some(pos) => &line[pos + 1..],
+            None => line,
+        };
+        let Some(value) = value_region
             .split(|ch: char| !ch.is_ascii_digit())
             .filter(|part| !part.is_empty())
             .filter_map(|part| part.parse::<u64>().ok())
@@ -239,14 +271,41 @@ pub fn parse_rocm_smi_text(output: &str) -> Vec<GpuSnapshot> {
         } else {
             mib_to_bytes(value)
         };
-        gpus.push(GpuSnapshot {
-            vendor: GpuVendor::Amd,
-            name: format!("AMD GPU {}", gpus.len()),
-            total_vram_bytes,
-            free_vram_bytes: None,
-        });
+
+        match index {
+            Some(index) => {
+                // First (canonical total) line for this card wins; later lines
+                // for the same index are ignored.
+                by_index.entry(index).or_insert_with(|| GpuSnapshot {
+                    vendor: GpuVendor::Amd,
+                    name: format!("AMD GPU {index}"),
+                    total_vram_bytes,
+                    free_vram_bytes: None,
+                });
+            }
+            None => {
+                let position = by_index.len() + without_index.len();
+                without_index.push(GpuSnapshot {
+                    vendor: GpuVendor::Amd,
+                    name: format!("AMD GPU {position}"),
+                    total_vram_bytes,
+                    free_vram_bytes: None,
+                });
+            }
+        }
     }
+
+    let mut gpus: Vec<GpuSnapshot> = by_index.into_values().collect();
+    gpus.extend(without_index);
     gpus
+}
+
+/// Extracts the card index `N` from a `rocm-smi` line's `GPU[N]` marker.
+fn parse_rocm_gpu_index(line: &str) -> Option<u32> {
+    let start = line.find("GPU[")? + "GPU[".len();
+    let rest = &line[start..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse().ok()
 }
 
 fn nvidia_smi_gpus() -> Vec<GpuSnapshot> {
@@ -560,6 +619,41 @@ mod tests {
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, GpuVendor::Amd);
         assert_eq!(gpus[0].total_vram_bytes, 8192 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rocm_smi_single_card_multiline_yields_one_gpu() {
+        // Representative `rocm-smi --showmeminfo vram` output for ONE 16 GB
+        // card: a Total line and a Used line, plus header/separator noise.
+        // Bug 16 regression: before the fix this produced two "GPUs" (the Used
+        // line misread as a second card's total), ~doubling planned VRAM.
+        let output = "\
+========================= ROCm System Management Interface =========================
+================================= Memory Usage (Bytes) =============================
+GPU[0]\t\t: VRAM Total Memory (B): 17163091968
+GPU[0]\t\t: VRAM Total Used Memory (B): 178872320
+====================================================================================
+";
+        let gpus = parse_rocm_smi_text(output);
+        assert_eq!(gpus.len(), 1, "one card must yield exactly one GPU");
+        assert_eq!(gpus[0].vendor, GpuVendor::Amd);
+        assert_eq!(gpus[0].total_vram_bytes, 17_163_091_968);
+        assert_eq!(gpus[0].name, "AMD GPU 0");
+    }
+
+    #[test]
+    fn rocm_smi_two_cards_yield_two_gpus_deduped_by_index() {
+        let output = "\
+GPU[0]\t\t: VRAM Total Memory (B): 17163091968
+GPU[0]\t\t: VRAM Total Used Memory (B): 178872320
+GPU[1]\t\t: VRAM Total Memory (B): 17163091968
+GPU[1]\t\t: VRAM Total Used Memory (B): 512000000
+";
+        let gpus = parse_rocm_smi_text(output);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].name, "AMD GPU 0");
+        assert_eq!(gpus[1].name, "AMD GPU 1");
+        assert!(gpus.iter().all(|g| g.total_vram_bytes == 17_163_091_968));
     }
 
     #[test]

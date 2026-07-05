@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 #[cfg(test)]
 use uuid::Uuid;
@@ -336,8 +336,39 @@ fn cors_layer(cfg: &Config) -> CorsLayer {
         }
         layer
     } else {
-        layer.allow_origin(Any)
+        // Dev default (not production, not external bind). Restrict CORS to
+        // loopback origins rather than `Any`: this layer allows the
+        // `AUTHORIZATION` header, and when `require_auth = false` anonymous
+        // `chat` + `models.read` are served. Combining `Any` origin with an
+        // authorized/credentialed local endpoint would let ANY website loaded
+        // in the operator's browser silently drive this local server. Loopback
+        // origins keep the bundled playground working without that exposure.
+        layer.allow_origin(AllowOrigin::predicate(|origin, _request_parts| {
+            is_loopback_origin(origin)
+        }))
     }
+}
+
+/// True when a CORS `Origin` header names a loopback host (localhost, IPv4
+/// `127.0.0.1`, or IPv6 `::1`), regardless of scheme or port. Used to scope the
+/// dev-default CORS policy to the operator's own machine.
+fn is_loopback_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some((_scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let host = if let Some(after_bracket) = rest.strip_prefix('[') {
+        // IPv6 literal, e.g. http://[::1]:8080 — host is inside the brackets.
+        match after_bracket.split_once(']') {
+            Some((host, _)) => host,
+            None => return false,
+        }
+    } else {
+        rest.split([':', '/']).next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 /// Static HTML+JS chat page for exercising the OpenAI-compatible endpoints

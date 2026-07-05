@@ -331,6 +331,11 @@ pub(crate) fn load_real_candle_decoder(
 pub(crate) struct RealCandleDecoder {
     tokenizer: tokenizers::tokenizer::Tokenizer,
     model: Mutex<RealCandleModel>,
+    /// Device the model's weights were loaded onto (`best_device()`:
+    /// Metal/CUDA/CPU). Per-step input tensors MUST be built on this device;
+    /// building them on `Device::Cpu` while the model lives on a GPU causes a
+    /// device-mismatch failure on the first forward pass (Bug 17).
+    device: candle_core::Device,
     family: CandleModelFamily,
     /// BOS token id to prepend to the generation prompt's `input_ids`, if the
     /// GGUF tokenizer metadata configures `add_bos_token = true`. See
@@ -607,6 +612,7 @@ pub(crate) fn load_real_candle_decoder(
     Ok(NativeCandleDecoder::Real(RealCandleDecoder {
         tokenizer,
         model: Mutex::new(model),
+        device,
         family,
         bos_token_id,
         served: std::sync::atomic::AtomicBool::new(false),
@@ -714,7 +720,7 @@ impl RealCandleDecoder {
         {
             let _enter = prefill_span.enter();
             let step_input = input_ids.clone();
-            let logits = model.next_token_logits(&step_input, offset)?;
+            let logits = model.next_token_logits(&step_input, offset, &self.device)?;
             let next = logits_processor
                 .sample(&logits)
                 .map_err(|err| anyhow::anyhow!("native token sampling failed: {err}"))?;
@@ -754,7 +760,7 @@ impl RealCandleDecoder {
             if finish_reason == "length" {
                 for _ in 1..max_tokens {
                     let step_input = vec![*input_ids.last().expect("input ids are non-empty")];
-                    let logits = model.next_token_logits(&step_input, offset)?;
+                    let logits = model.next_token_logits(&step_input, offset, &self.device)?;
                     let next = logits_processor
                         .sample(&logits)
                         .map_err(|err| anyhow::anyhow!("native token sampling failed: {err}"))?;
@@ -954,9 +960,9 @@ impl RealCandleModel {
         &mut self,
         input_ids: &[u32],
         offset: usize,
+        device: &candle_core::Device,
     ) -> Result<candle_core::Tensor> {
-        let device = candle_core::Device::Cpu;
-        let input = candle_core::Tensor::new(input_ids, &device)
+        let input = candle_core::Tensor::new(input_ids, device)
             .and_then(|tensor| tensor.reshape((1, input_ids.len())))
             .with_context(|| "failed to create native input tensor")?;
         let logits = match self {

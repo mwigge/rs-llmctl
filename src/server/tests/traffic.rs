@@ -1,4 +1,39 @@
 use super::*;
+use axum::http::HeaderValue;
+
+#[test]
+fn dev_cors_allows_only_loopback_origins() {
+    // The dev-default CORS policy must accept loopback origins (so the bundled
+    // playground works) but reject arbitrary external websites — otherwise any
+    // site in the operator's browser could drive this local, potentially
+    // authenticated endpoint. Before the fix this branch used `Any`.
+    for allowed in [
+        "http://localhost",
+        "http://localhost:8080",
+        "https://localhost:3000",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+        "http://LocalHost:1234",
+    ] {
+        assert!(
+            is_loopback_origin(&HeaderValue::from_static(allowed)),
+            "{allowed} should be treated as loopback"
+        );
+    }
+
+    for denied in [
+        "https://evil.example.com",
+        "http://attacker.test:8080",
+        "http://127.0.0.1.evil.com",
+        "http://notlocalhost",
+        "null",
+    ] {
+        assert!(
+            !is_loopback_origin(&HeaderValue::from_static(denied)),
+            "{denied} must not be treated as loopback"
+        );
+    }
+}
 
 #[test]
 fn circuit_breaker_opens_after_threshold_and_half_opens_after_reset() {
