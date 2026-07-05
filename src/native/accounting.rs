@@ -244,6 +244,20 @@ impl NativeTokenCounter for TokenizersNativeTokenCounter {
     }
 }
 
+/// Builds a [`NativeTokenUsage`] from the exact token counts observed during
+/// native decoding. `prompt_tokens` is the number of tokens actually fed to the
+/// model (the templated prompt plus any prepended BOS) and `completion_tokens`
+/// is the number of tokens the decode loop actually produced. Because both are
+/// real model-token counts — not a re-tokenization of the decoded string — the
+/// usage is labeled [`TokenAccountingMode::NativeExact`] (Bug 12).
+pub fn native_exact_usage(prompt_tokens: u64, completion_tokens: u64) -> NativeTokenUsage {
+    NativeTokenUsage::with_mode(
+        prompt_tokens,
+        completion_tokens,
+        TokenAccountingMode::NativeExact,
+    )
+}
+
 pub fn usage_from_native_tokens(
     counter: &dyn NativeTokenAccountingAdapter,
     request: &NativeChatRequest,

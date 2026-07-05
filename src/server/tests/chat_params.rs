@@ -6,11 +6,38 @@ fn make_chat_request(messages: Vec<native::NativeChatMessage>) -> ChatCompletion
         messages,
         temperature: Some(0.7),
         max_tokens: Some(512),
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop: None,
+        n: None,
         stream: false,
         metadata: None,
         tools: None,
         tool_choice: None,
     }
+}
+
+#[test]
+fn stop_sequences_normalizes_string_and_array_forms() {
+    use serde_json::json;
+    let mut request = make_chat_request(Vec::new());
+    // Absent → None.
+    assert_eq!(request.stop_sequences(), None);
+    // Single string → one-element vec.
+    request.stop = Some(json!("STOP"));
+    assert_eq!(request.stop_sequences(), Some(vec!["STOP".to_string()]));
+    // Array of strings, dropping empty entries.
+    request.stop = Some(json!(["</s>", "", "END"]));
+    assert_eq!(
+        request.stop_sequences(),
+        Some(vec!["</s>".to_string(), "END".to_string()])
+    );
+    // Array with only empty entries collapses to None.
+    request.stop = Some(json!([""]));
+    assert_eq!(request.stop_sequences(), None);
 }
 
 #[test]

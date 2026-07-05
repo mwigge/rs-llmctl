@@ -47,6 +47,26 @@ pub(super) struct ChatCompletionRequest {
     pub(super) temperature: Option<f32>,
     #[serde(default)]
     pub(super) max_tokens: Option<u32>,
+    // Sampling parameters that were previously silently dropped by serde:
+    // declaring them here is what lets them be threaded into the native
+    // decoder's `LogitsProcessor` instead of vanishing on deserialization.
+    #[serde(default)]
+    pub(super) top_p: Option<f32>,
+    #[serde(default)]
+    pub(super) top_k: Option<u32>,
+    #[serde(default)]
+    pub(super) presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub(super) frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub(super) seed: Option<u64>,
+    /// OpenAI accepts either a single string or an array of strings.
+    #[serde(default)]
+    pub(super) stop: Option<Value>,
+    /// Number of completions requested. Declared so it is not silently
+    /// dropped; the native runtime only serves `n = 1`.
+    #[serde(default)]
+    pub(super) n: Option<u32>,
     #[serde(default)]
     pub(super) stream: bool,
     #[serde(default)]
@@ -55,6 +75,29 @@ pub(super) struct ChatCompletionRequest {
     pub(super) tools: Option<Value>,
     #[serde(default)]
     pub(super) tool_choice: Option<Value>,
+}
+
+/// Normalizes an OpenAI `stop` value (string, array of strings, or absent)
+/// into a list of stop sequences, dropping empty/non-string entries.
+pub(super) fn normalize_stop_sequences(stop: Option<&Value>) -> Option<Vec<String>> {
+    let sequences: Vec<String> = match stop? {
+        Value::String(single) => vec![single.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .filter(|sequence| !sequence.is_empty())
+    .collect();
+    (!sequences.is_empty()).then_some(sequences)
+}
+
+impl ChatCompletionRequest {
+    pub(super) fn stop_sequences(&self) -> Option<Vec<String>> {
+        normalize_stop_sequences(self.stop.as_ref())
+    }
 }
 
 #[derive(Debug, Clone)]

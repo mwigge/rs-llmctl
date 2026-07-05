@@ -84,6 +84,21 @@ impl NativeEngine for NativeSchedulerEngine {
         )
     }
 
+    fn chat_stream_tokens(
+        &self,
+        request: NativeChatRequest,
+        token_tx: NativeTokenSender,
+    ) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        scheduled_native_chat(
+            self.inner.clone(),
+            self.permits.clone(),
+            self.waiting.clone(),
+            self.config,
+            request,
+            NativeScheduledOperation::StreamTokens(token_tx),
+        )
+    }
+
     fn embeddings(
         &self,
         request: NativeEmbeddingRequest,
@@ -92,10 +107,11 @@ impl NativeEngine for NativeSchedulerEngine {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeScheduledOperation {
     Chat,
     Stream,
+    /// Streaming that forwards each decoded token delta through the channel.
+    StreamTokens(NativeTokenSender),
 }
 
 struct NativeSchedulerWaitGuard {
@@ -181,6 +197,9 @@ async fn run_scheduled_native_chat(
     match operation {
         NativeScheduledOperation::Chat => inner.chat(request).await,
         NativeScheduledOperation::Stream => inner.chat_stream(request).await,
+        NativeScheduledOperation::StreamTokens(token_tx) => {
+            inner.chat_stream_tokens(request, token_tx).await
+        }
     }
 }
 

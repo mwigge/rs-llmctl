@@ -43,6 +43,28 @@ pub trait NativeEngine: Send + Sync {
         self.chat(request)
     }
 
+    /// Runs a streaming chat, forwarding each decoded content delta to
+    /// `token_tx` as it is produced so the SSE layer can emit one
+    /// `chat.completion.chunk` per token (Bug 10). The returned response still
+    /// carries the full content and final usage.
+    ///
+    /// The default implementation targets engines without incremental decode:
+    /// it runs the buffered `chat` path and emits the whole response as a single
+    /// token, preserving prior behavior for those backends.
+    fn chat_stream_tokens(
+        &self,
+        request: NativeChatRequest,
+        token_tx: NativeTokenSender,
+    ) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        Box::pin(async move {
+            let response = self.chat(request).await?;
+            if !response.content.is_empty() {
+                let _ = token_tx.send(response.content.clone());
+            }
+            Ok(response)
+        })
+    }
+
     fn embeddings(
         &self,
         request: NativeEmbeddingRequest,
@@ -356,6 +378,12 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             tools: None,
             tool_choice: None,
             metadata: BTreeMap::from([("test.id".to_string(), Value::String(id.to_string()))]),
@@ -574,6 +602,12 @@ mod tests {
             ],
             temperature: Some(0.2),
             max_tokens: Some(128),
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             tools: None,
             tool_choice: None,
             metadata: BTreeMap::new(),
@@ -610,6 +644,12 @@ mod tests {
             ],
             temperature: None,
             max_tokens: Some(64),
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             tools: None,
             tool_choice: None,
             metadata: BTreeMap::new(),
@@ -3321,6 +3361,12 @@ mod gguf_tokenizer_tests {
             }],
             temperature: None,
             max_tokens: Some(32),
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
             tools: None,
             tool_choice: None,
             metadata: BTreeMap::new(),

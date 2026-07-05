@@ -18,10 +18,36 @@ pub struct NativeChatRequest {
     pub messages: Vec<NativeChatMessage>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Nucleus-sampling cutoff. `None` (or 0/≥1) disables top-p filtering.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Top-k sampling cutoff. `None` (or 0) disables top-k filtering.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// RNG seed for sampling reproducibility. `None` uses [`DEFAULT_SAMPLING_SEED`].
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Stop sequences: generation ends (and output is truncated) when any of
+    /// these strings first appears in the decoded output.
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
+    /// Carried through for accounting/telemetry; not yet applied to logits in
+    /// the candle sampler.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// Carried through for accounting/telemetry; not yet applied to logits in
+    /// the candle sampler.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
     pub tools: Option<Value>,
     pub tool_choice: Option<Value>,
     pub metadata: BTreeMap<String, Value>,
 }
+
+/// Default RNG seed used for sampling when a request does not specify one.
+/// Matches the candle examples' fixed default so nonzero-temperature output is
+/// reproducible for a given prompt when no explicit seed is provided.
+pub const DEFAULT_SAMPLING_SEED: u64 = 299792458;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

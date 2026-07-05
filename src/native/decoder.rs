@@ -109,7 +109,7 @@ impl NativeCandleEngineFactory {
 
         Ok(Box::new(ArtifactBackedCandleEngine {
             alias: plan.alias.clone(),
-            decoder,
+            decoder: Arc::new(decoder),
         }))
     }
 }
@@ -139,17 +139,10 @@ pub struct NativeEngineLoadPlan {
 #[derive(Debug)]
 pub struct ArtifactBackedCandleEngine {
     alias: String,
-    decoder: NativeCandleDecoder,
-}
-
-impl ArtifactBackedCandleEngine {
-    fn generate_text(&self, request: &NativeChatRequest) -> Result<String> {
-        self.decoder.generate(request)
-    }
-
-    fn usage(&self, request: &NativeChatRequest, content: &str) -> Result<NativeTokenUsage> {
-        self.decoder.usage(request, content)
-    }
+    // Behind an `Arc` so a clone can be moved into a `spawn_blocking` closure:
+    // the candle decode loop is fully synchronous and must not run on a Tokio
+    // worker thread (see `chat`).
+    decoder: Arc<NativeCandleDecoder>,
 }
 
 impl NativeEngine for ArtifactBackedCandleEngine {
@@ -158,18 +151,72 @@ impl NativeEngine for ArtifactBackedCandleEngine {
     }
 
     fn chat(&self, request: NativeChatRequest) -> BoxFuture<'_, Result<NativeChatResponse>> {
-        Box::pin(async move {
-            let content = self.generate_text(&request)?;
-            let usage = self.usage(&request, &content)?;
-            Ok(NativeChatResponse {
-                model: request.model,
-                content,
-                tool_calls: None,
-                finish_reason: "stop".to_string(),
-                usage,
-            })
-        })
+        let decoder = self.decoder.clone();
+        Box::pin(async move { spawn_blocking_decode(decoder, request, None).await })
     }
+
+    fn chat_stream_tokens(
+        &self,
+        request: NativeChatRequest,
+        token_tx: NativeTokenSender,
+    ) -> BoxFuture<'_, Result<NativeChatResponse>> {
+        let decoder = self.decoder.clone();
+        Box::pin(async move { spawn_blocking_decode(decoder, request, Some(token_tx)).await })
+    }
+}
+
+/// Runs the synchronous candle decode loop on the blocking thread pool so the
+/// Tokio executor is never stalled by a multi-thousand-step forward pass held
+/// under a `std::sync::Mutex` (Bug 6). When `token_tx` is `Some`, each decoded
+/// content delta is forwarded as it is produced (Bug 10); the returned response
+/// carries the exact prompt/completion token counts from the decode loop (Bug
+/// 12). All `!Send` state (the model mutex guard, the tokenizer) stays inside
+/// the closure — only the `Arc<NativeCandleDecoder>`, the owned request, and the
+/// `Send` channel sender cross the boundary.
+async fn spawn_blocking_decode(
+    decoder: Arc<NativeCandleDecoder>,
+    request: NativeChatRequest,
+    token_tx: Option<NativeTokenSender>,
+) -> Result<NativeChatResponse> {
+    tokio::task::spawn_blocking(move || {
+        let model = request.model.clone();
+        let mut sink = |piece: &str| {
+            if let Some(tx) = token_tx.as_ref() {
+                // A closed receiver (client disconnected) is not an error here;
+                // generation continues so terminal accounting still runs.
+                let _ = tx.send(piece.to_string());
+            }
+        };
+        let generation = decoder.generate_streaming(&request, &mut sink)?;
+        Ok(NativeChatResponse {
+            model,
+            content: generation.text,
+            tool_calls: None,
+            finish_reason: generation.finish_reason,
+            usage: native_exact_usage(generation.prompt_tokens, generation.completion_tokens),
+        })
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("native decode task failed to join: {err}"))?
+}
+
+/// Sender used to forward decoded content deltas out of the (synchronous)
+/// decode loop as they are produced, so the SSE layer can emit each token as
+/// its own `chat.completion.chunk` (Bug 10).
+pub type NativeTokenSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Result of a native generation, carrying the exact token counts observed by
+/// the decode loop. `prompt_tokens` is the number of tokens actually fed to the
+/// model (the templated prompt plus any prepended BOS); `completion_tokens` is
+/// the number of tokens the loop actually produced. Neither is a
+/// re-tokenization of the decoded string, so they can be billed as
+/// [`TokenAccountingMode::NativeExact`] (Bug 12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeGeneration {
+    pub text: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub finish_reason: String,
 }
 
 #[derive(Debug)]
@@ -190,12 +237,19 @@ impl NativeCandleDecoder {
         load_real_candle_decoder(family, model_path, artifacts)
     }
 
-    pub(crate) fn generate(&self, request: &NativeChatRequest) -> Result<String> {
+    /// Runs a generation, forwarding each decoded content delta to `on_token`
+    /// as it is produced and returning the decoded text plus the exact token
+    /// counts the loop observed.
+    pub(crate) fn generate_streaming(
+        &self,
+        request: &NativeChatRequest,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<NativeGeneration> {
         #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
-        let _ = request;
+        let _ = (request, on_token);
         match self {
             #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
-            Self::Real(decoder) => decoder.generate(request),
+            Self::Real(decoder) => decoder.generate_streaming(request, on_token),
             #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
             Self::Unavailable => bail!(
                 "native autoregressive decoding requires the native-candle and native-tokenizers features"
@@ -203,15 +257,11 @@ impl NativeCandleDecoder {
         }
     }
 
-    fn usage(&self, request: &NativeChatRequest, content: &str) -> Result<NativeTokenUsage> {
-        match self {
-            #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
-            Self::Real(decoder) => decoder.usage(request, content),
-            #[cfg(not(all(feature = "native-candle", feature = "native-tokenizers")))]
-            Self::Unavailable => {
-                usage_from_native_tokens(&EstimatedNativeTokenCounter, request, content)
-            }
-        }
+    /// Convenience wrapper returning only the decoded text (no streaming).
+    /// Retained for the readiness/self-test paths and unit tests.
+    pub(crate) fn generate(&self, request: &NativeChatRequest) -> Result<String> {
+        let mut noop = |_: &str| {};
+        Ok(self.generate_streaming(request, &mut noop)?.text)
     }
 }
 
@@ -565,7 +615,11 @@ pub(crate) fn load_real_candle_decoder(
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 impl RealCandleDecoder {
-    fn generate(&self, request: &NativeChatRequest) -> Result<String> {
+    fn generate_streaming(
+        &self,
+        request: &NativeChatRequest,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<NativeGeneration> {
         let mut model = self
             .model
             .lock()
@@ -587,15 +641,66 @@ impl RealCandleDecoder {
             bail!("native prompt tokenization produced no tokens");
         }
 
+        // Bug 12: input tokens are counted on the ACTUAL prompt fed to the model
+        // (templated + BOS), not a separate canonical serialization.
+        let prompt_tokens = input_ids.len() as u64;
+
         let max_tokens = request
             .max_tokens
             .and_then(|tokens| usize::try_from(tokens).ok())
             .unwrap_or(128)
             .clamp(1, 4096);
+
+        // Bug 11: real sampling. temperature 0/None stays deterministic greedy
+        // (Sampling::ArgMax); nonzero temperature builds a top-k/top-p sampler
+        // seeded from the request for reproducibility.
+        let seed = request.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        let mut logits_processor = candle_transformers::generation::LogitsProcessor::from_sampling(
+            seed,
+            sampling_from_request(request),
+        );
+        let stop_sequences: &[String] = request.stop.as_deref().unwrap_or(&[]);
+
         let mut generated = Vec::new();
         let mut offset = 0usize;
         let family_str = self.family.as_str();
         let input_token_count = input_ids.len();
+
+        // Incremental decode state: track how many chars of the decoded output
+        // have already been forwarded so each step emits only the new suffix.
+        let mut emitted_chars = 0usize;
+        let mut finish_reason = "length";
+
+        // Emits any newly-decoded content beyond `emitted_chars`, honoring stop
+        // sequences. Returns `true` when a stop sequence was hit (generation
+        // should end). `on_token` only sees the pre-stop portion.
+        let flush_delta = |generated: &[u32],
+                           on_token: &mut dyn FnMut(&str),
+                           emitted_chars: &mut usize|
+         -> Result<bool> {
+            let full = self
+                .tokenizer
+                .decode(generated, true)
+                .map_err(|err| anyhow::anyhow!("failed to decode native output tokens: {err}"))?;
+            // Truncate at the earliest stop sequence, if any.
+            let (visible, hit_stop) = match stop_sequences
+                .iter()
+                .filter_map(|needle| full.find(needle.as_str()))
+                .min()
+            {
+                Some(idx) => (&full[..idx], true),
+                None => (full.as_str(), false),
+            };
+            let visible_chars = visible.chars().count();
+            if visible_chars > *emitted_chars {
+                let delta: String = visible.chars().skip(*emitted_chars).collect();
+                if !delta.is_empty() {
+                    on_token(&delta);
+                }
+                *emitted_chars = visible_chars;
+            }
+            Ok(hit_stop)
+        };
 
         // Prefill span: step 0 only. Covers the cost of processing the
         // full input prompt with empty KV cache.
@@ -609,25 +714,20 @@ impl RealCandleDecoder {
         {
             let _enter = prefill_span.enter();
             let step_input = input_ids.clone();
-            let next = model.forward_next(&step_input, offset)?;
+            let logits = model.next_token_logits(&step_input, offset)?;
+            let next = logits_processor
+                .sample(&logits)
+                .map_err(|err| anyhow::anyhow!("native token sampling failed: {err}"))?;
             offset = offset.saturating_add(step_input.len());
             input_ids.push(next);
-            generated.push(next);
             if is_eos_token(&self.tokenizer, next) {
-                // EOS on first token — skip the generation loop entirely.
-                let prefill_secs = prefill_start.elapsed().as_secs_f64();
-                if prefill_secs > 0.0 {
-                    crate::observability::native_model_tokens_per_second().record(
-                        input_token_count as f64 / prefill_secs,
-                        &[
-                            opentelemetry::KeyValue::new("model.family", family_str),
-                            opentelemetry::KeyValue::new("phase", "prefill"),
-                        ],
-                    );
+                // EOS on the very first token — nothing to emit.
+                finish_reason = "stop";
+            } else {
+                generated.push(next);
+                if flush_delta(&generated, on_token, &mut emitted_chars)? {
+                    finish_reason = "stop";
                 }
-                return self.tokenizer.decode(&generated, true).map_err(|err| {
-                    anyhow::anyhow!("failed to decode native output tokens: {err}")
-                });
             }
         }
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
@@ -651,18 +751,27 @@ impl RealCandleDecoder {
         let gen_start = std::time::Instant::now();
         {
             let _enter = gen_span.enter();
-            for _ in 1..max_tokens {
-                let step_input = vec![*input_ids.last().expect("input ids are non-empty")];
-                let next = model.forward_next(&step_input, offset)?;
-                offset = offset.saturating_add(step_input.len());
-                input_ids.push(next);
-                generated.push(next);
-                if is_eos_token(&self.tokenizer, next) {
-                    break;
+            if finish_reason == "length" {
+                for _ in 1..max_tokens {
+                    let step_input = vec![*input_ids.last().expect("input ids are non-empty")];
+                    let logits = model.next_token_logits(&step_input, offset)?;
+                    let next = logits_processor
+                        .sample(&logits)
+                        .map_err(|err| anyhow::anyhow!("native token sampling failed: {err}"))?;
+                    offset = offset.saturating_add(step_input.len());
+                    input_ids.push(next);
+                    if is_eos_token(&self.tokenizer, next) {
+                        finish_reason = "stop";
+                        break;
+                    }
+                    generated.push(next);
+                    if flush_delta(&generated, on_token, &mut emitted_chars)? {
+                        finish_reason = "stop";
+                        break;
+                    }
                 }
             }
-            // generated.len() includes the prefill's first token; gen count is the rest.
-            let gen_tokens = generated.len().saturating_sub(1);
+            let gen_tokens = generated.len();
             tracing::Span::current().record("output_tokens", gen_tokens);
             let gen_secs = gen_start.elapsed().as_secs_f64();
             if gen_secs > 0.0 && gen_tokens > 0 {
@@ -676,14 +785,58 @@ impl RealCandleDecoder {
             }
         }
 
-        self.tokenizer
+        // Final text: decode the produced tokens, truncated at any stop
+        // sequence so the returned content matches what was streamed.
+        let mut text = self
+            .tokenizer
             .decode(&generated, true)
-            .map_err(|err| anyhow::anyhow!("failed to decode native output tokens: {err}"))
-    }
+            .map_err(|err| anyhow::anyhow!("failed to decode native output tokens: {err}"))?;
+        if let Some(idx) = stop_sequences
+            .iter()
+            .filter_map(|needle| text.find(needle.as_str()))
+            .min()
+        {
+            text.truncate(idx);
+        }
 
-    fn usage(&self, request: &NativeChatRequest, content: &str) -> Result<NativeTokenUsage> {
-        let counter = TokenizersNativeTokenCounter::from_tokenizer(self.tokenizer.clone());
-        usage_from_native_tokens(&counter, request, content)
+        Ok(NativeGeneration {
+            text,
+            prompt_tokens,
+            // Bug 12: real generated-token count from the decode loop, not a
+            // re-tokenization of the decoded string.
+            completion_tokens: generated.len() as u64,
+            finish_reason: finish_reason.to_string(),
+        })
+    }
+}
+
+/// Maps a request's sampling parameters onto candle's [`Sampling`] strategy.
+///
+/// Backward-compatible default: `temperature` of `None` or ~0 yields
+/// [`Sampling::ArgMax`] (deterministic greedy), preserving the pre-sampling
+/// behavior. A nonzero temperature selects top-k, top-p, combined, or plain
+/// temperature sampling depending on which cutoffs the request provides.
+///
+/// [`Sampling`]: candle_transformers::generation::Sampling
+#[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+pub(crate) fn sampling_from_request(
+    request: &NativeChatRequest,
+) -> candle_transformers::generation::Sampling {
+    use candle_transformers::generation::Sampling;
+    let temperature = request.temperature.map(f64::from).filter(|t| *t >= 1e-7);
+    let Some(temperature) = temperature else {
+        return Sampling::ArgMax;
+    };
+    let top_k = request.top_k.map(|k| k as usize).filter(|k| *k > 0);
+    let top_p = request
+        .top_p
+        .map(f64::from)
+        .filter(|p| *p > 0.0 && *p < 1.0);
+    match (top_k, top_p) {
+        (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+        (Some(k), None) => Sampling::TopK { k, temperature },
+        (None, Some(p)) => Sampling::TopP { p, temperature },
+        (None, None) => Sampling::All { temperature },
     }
 }
 
@@ -724,6 +877,12 @@ pub fn generate_gemma4_sources(
                 }],
                 temperature: Some(0.0),
                 max_tokens: Some(max_tokens),
+                top_p: None,
+                top_k: None,
+                seed: None,
+                stop: None,
+                presence_penalty: None,
+                frequency_penalty: None,
                 tools: None,
                 tool_choice: None,
                 metadata: BTreeMap::new(),
@@ -787,7 +946,15 @@ impl RealCandleModel {
         }
     }
 
-    fn forward_next(&mut self, input_ids: &[u32], offset: usize) -> Result<u32> {
+    /// Runs one forward pass and returns the 1-D next-token logits tensor.
+    /// Token selection (greedy or sampled) is performed by the caller via a
+    /// [`candle_transformers::generation::LogitsProcessor`], so sampling
+    /// parameters from the request are honored (Bug 11).
+    fn next_token_logits(
+        &mut self,
+        input_ids: &[u32],
+        offset: usize,
+    ) -> Result<candle_core::Tensor> {
         let device = candle_core::Device::Cpu;
         let input = candle_core::Tensor::new(input_ids, &device)
             .and_then(|tensor| tensor.reshape((1, input_ids.len())))
@@ -803,11 +970,11 @@ impl RealCandleModel {
             Self::MistralGguf(model) => model.forward(&input, offset),
         }
         .with_context(|| "native Candle model forward pass failed")?;
-        let logits_shape = logits.dims().to_vec();
         let next_logits = match logits.dims() {
             [_, seq_len, _] => logits
                 .narrow(1, seq_len.saturating_sub(1), 1)
-                .and_then(|tensor| tensor.squeeze(1)),
+                .and_then(|tensor| tensor.squeeze(1))
+                .and_then(|tensor| tensor.squeeze(0)),
             [seq_len, _] => logits
                 .narrow(0, seq_len.saturating_sub(1), 1)
                 .and_then(|tensor| tensor.squeeze(0)),
@@ -815,16 +982,7 @@ impl RealCandleModel {
             dims => bail!("native Candle model returned unsupported logits shape: {dims:?}"),
         }
         .with_context(|| "failed to select native next-token logits")?;
-        let next_logits_shape = next_logits.dims().to_vec();
-        let next_token = next_logits
-            .argmax(candle_core::D::Minus1)
-            .and_then(|tensor| tensor.to_scalar::<u32>())
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to select next native token from logits shape {logits_shape:?} and next-token logits shape {next_logits_shape:?}: {err}"
-                )
-            })?;
-        Ok(next_token)
+        Ok(next_logits)
     }
 }
 
@@ -1047,5 +1205,121 @@ mod kv_cache_guard_tests {
         // A family whose cache is genuinely cleared may serve many requests.
         assert!(admit_fresh_kv_session(KvCacheReset::Cleared, &served).is_ok());
         assert!(admit_fresh_kv_session(KvCacheReset::Cleared, &served).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sampling_and_accounting_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn request_with(
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        seed: Option<u64>,
+    ) -> NativeChatRequest {
+        NativeChatRequest {
+            model: "test".to_string(),
+            messages: Vec::new(),
+            temperature,
+            max_tokens: Some(16),
+            top_p,
+            top_k,
+            seed,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tools: None,
+            tool_choice: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    // Bug 12: `native_exact_usage` reports the exact loop-observed token counts
+    // (and the `NativeExact` label), not a re-tokenization of the decoded text.
+    #[test]
+    fn native_exact_usage_uses_loop_counts_not_retokenization() {
+        // What the decode loop actually produced.
+        let generated_token_count = 3u64;
+        // A re-tokenization of the decoded string would give a *different*
+        // number — that mismatch is exactly the Bug 12 defect.
+        let retokenized = EstimatedNativeTokenCounter
+            .count_text("internationalization")
+            .expect("estimate");
+        assert_ne!(
+            retokenized, generated_token_count,
+            "test precondition: re-tokenization must differ from the loop count"
+        );
+
+        let usage = native_exact_usage(5, generated_token_count);
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, generated_token_count);
+        assert_ne!(usage.output_tokens, retokenized);
+        assert_eq!(usage.accounting_mode, TokenAccountingMode::NativeExact);
+    }
+
+    // Bug 11: temperature 0/None stays deterministic greedy (ArgMax), preserving
+    // the pre-sampling behavior.
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+    #[test]
+    fn zero_or_absent_temperature_maps_to_greedy_argmax() {
+        use candle_transformers::generation::Sampling;
+        assert_eq!(
+            sampling_from_request(&request_with(None, None, None, None)),
+            Sampling::ArgMax
+        );
+        assert_eq!(
+            sampling_from_request(&request_with(Some(0.0), Some(0.9), Some(40), None)),
+            Sampling::ArgMax,
+            "temperature 0 must stay greedy even if top-p/top-k are set"
+        );
+    }
+
+    // Bug 11: nonzero temperature builds a sampling strategy configured from the
+    // request's top-p/top-k parameters.
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+    #[test]
+    fn nonzero_temperature_selects_sampling_strategy_from_request() {
+        use candle_transformers::generation::Sampling;
+        match sampling_from_request(&request_with(Some(0.7), None, None, None)) {
+            Sampling::All { temperature } => {
+                assert!((temperature - f64::from(0.7f32)).abs() < 1e-6)
+            }
+            other => panic!("expected All sampling, got {other:?}"),
+        }
+        assert!(matches!(
+            sampling_from_request(&request_with(Some(0.7), Some(0.9), None, None)),
+            Sampling::TopP { .. }
+        ));
+        assert!(matches!(
+            sampling_from_request(&request_with(Some(0.7), None, Some(40), None)),
+            Sampling::TopK { .. }
+        ));
+        assert!(matches!(
+            sampling_from_request(&request_with(Some(0.7), Some(0.9), Some(40), None)),
+            Sampling::TopKThenTopP { .. }
+        ));
+    }
+
+    // Bug 11: a fixed seed makes nonzero-temperature sampling reproducible.
+    #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
+    #[test]
+    fn fixed_seed_makes_sampling_reproducible() {
+        use candle_transformers::generation::LogitsProcessor;
+        let request = request_with(Some(0.8), Some(0.95), None, Some(1234));
+        let seed = request.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        // A skewed logit vector so multinomial sampling has a real distribution.
+        let logits = candle_core::Tensor::new(
+            &[0.1f32, 2.5, 0.3, 1.7, 0.9, 3.1, 0.2, 1.1],
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits tensor");
+
+        let mut first = LogitsProcessor::from_sampling(seed, sampling_from_request(&request));
+        let mut second = LogitsProcessor::from_sampling(seed, sampling_from_request(&request));
+        let a = first.sample(&logits).expect("sample a");
+        let b = second.sample(&logits).expect("sample b");
+        assert_eq!(a, b, "same seed + params must reproduce the same token");
     }
 }
