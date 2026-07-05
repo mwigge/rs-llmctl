@@ -1,9 +1,10 @@
 use crate::config::QuotaConfig;
-use crate::storage::Storage;
+use crate::storage::{QuotaDecisionRecord, Storage};
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Principal {
@@ -244,6 +245,45 @@ pub async fn check_quota(
     })
 }
 
+/// Atomically checks the quota for `principal`/`model` and records the
+/// admission decision while holding the per-scope admission lock.
+///
+/// The requests-per-minute check counts previously recorded quota-decision
+/// rows. If the counting row were written after releasing the lock, several
+/// concurrent same-scope requests could all read the same stale count and each
+/// pass a limit they should collectively exhaust. Inserting the counting row
+/// inside the locked section makes check-and-record atomic: a request only
+/// releases the lock once its decision is visible to the next one.
+///
+/// The insert fails closed — if the counting row cannot be persisted the whole
+/// admission returns an error rather than admitting an unrecorded request,
+/// because a dropped row would under-count RPM and let later requests slip past
+/// the limit.
+pub async fn admit_request(
+    storage: &Storage,
+    quotas: &[QuotaConfig],
+    principal: &Principal,
+    model: &str,
+    request_id: Option<Uuid>,
+    policy_json: serde_json::Value,
+) -> Result<QuotaDecision> {
+    let scope = quota_admission_scope(principal);
+    storage
+        .with_quota_admission(&scope, || async {
+            let decision = check_quota(storage, quotas, principal, model).await?;
+            let record = QuotaDecisionRecord::new(
+                request_id,
+                principal,
+                model,
+                &decision,
+                policy_json.clone(),
+            );
+            storage.insert_quota_decision(&record).await?;
+            Ok(decision)
+        })
+        .await
+}
+
 pub fn matching_quota_policy<'a>(
     quotas: &'a [QuotaConfig],
     principal: &Principal,
@@ -380,6 +420,51 @@ mod tests {
 
         assert!(!decision.allowed);
         assert!(decision.reason.contains("requests_per_minute"));
+        Ok(())
+    }
+
+    // Regression for the RPM quota bypass under concurrency: several
+    // same-scope requests admitted at once must not all read a stale count of
+    // zero and pass a limit of one. `admit_request` records the counting row
+    // inside the admission lock, so exactly one is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_respect_requests_per_minute_limit_of_one() -> Result<()> {
+        use std::sync::Arc;
+
+        let storage = Storage::in_memory().await?;
+        let quotas = Arc::new(vec![quota("alice", "", 1, 100, &["llama"])]);
+        let principal = Arc::new(principal("alice", "platform"));
+
+        let concurrency = 8;
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let storage = storage.clone();
+            let quotas = Arc::clone(&quotas);
+            let principal = Arc::clone(&principal);
+            handles.push(tokio::spawn(async move {
+                admit_request(
+                    &storage,
+                    &quotas,
+                    &principal,
+                    "llama",
+                    Some(Uuid::new_v4()),
+                    json!({}),
+                )
+                .await
+            }));
+        }
+
+        let mut admitted = 0;
+        for handle in handles {
+            if handle.await.expect("admission task panicked")?.allowed {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(
+            admitted, 1,
+            "requests_per_minute limit of 1 must admit exactly one concurrent request"
+        );
         Ok(())
     }
 

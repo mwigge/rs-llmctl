@@ -181,6 +181,42 @@ fn fallback_aliases(cfg: &Config, selected_alias: &str) -> Vec<String> {
         .collect()
 }
 
+/// Applies guardrail message redactions to a raw chat-completions body so the
+/// payload proxied upstream carries the redacted content instead of the
+/// original (unredacted) text.
+///
+/// The proxy path forwards the request body verbatim, so redactions applied to
+/// the parsed request struct alone never reach the worker/upstream. This
+/// rewrites the same message contents on the original JSON — preserving every
+/// other request field untouched — so the forwarded body matches the redacted
+/// content the audit trail already reports as `redacted: true`.
+///
+/// Each `(index, redacted_text)` replaces `messages[index].content`. Indices
+/// that don't resolve to an object message are skipped (mirroring the parsed
+/// struct's `messages.get_mut(index)`).
+pub(super) fn apply_message_redactions(
+    body: &[u8],
+    redactions: &[(usize, String)],
+) -> std::result::Result<Bytes, String> {
+    if redactions.is_empty() {
+        return Ok(Bytes::copy_from_slice(body));
+    }
+
+    let mut value: Value =
+        serde_json::from_slice(body).map_err(|_| "request body must be valid JSON".to_string())?;
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Err("request body messages must be a JSON array".to_string());
+    };
+    for (index, redacted_text) in redactions {
+        if let Some(message) = messages.get_mut(*index).and_then(Value::as_object_mut) {
+            message.insert("content".to_string(), Value::String(redacted_text.clone()));
+        }
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|err| err.to_string())
+}
+
 pub(super) fn rewrite_chat_model(
     body: &[u8],
     route: &ResolvedModelRoute,

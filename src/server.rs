@@ -98,8 +98,9 @@ use responses::{
 #[cfg(test)]
 use routing::ModelRouteError;
 use routing::{
-    active_routed_models, model_route_error_response, resolve_model_route, rewrite_chat_model,
-    routed_models, ResolvedExternalProvider, ResolvedModelRoute,
+    active_routed_models, apply_message_redactions, model_route_error_response,
+    resolve_model_route, rewrite_chat_model, routed_models, ResolvedExternalProvider,
+    ResolvedModelRoute,
 };
 use sse::{usage_tokens, SseUsageParser};
 use state::ServerState;

@@ -7,7 +7,6 @@ use crate::observability::{
     emit_runtime_telemetry, RuntimeTelemetryEvent, TelemetryEventName, TelemetrySignal,
 };
 use crate::quota::Principal;
-use crate::storage::QuotaDecisionRecord;
 use crate::worker::SwapExecution;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -199,24 +198,16 @@ pub(super) async fn record_swap_execution(
     .await;
 }
 
-pub(super) async fn record_quota_decision(
-    state: &ServerState,
+/// Emits quota-decision telemetry. The counting row itself is persisted
+/// atomically under the admission lock by [`crate::quota::admit_request`]
+/// (fail-closed), so this is telemetry only — it must not write the counting
+/// row, or the requests-per-minute count would be double-incremented.
+pub(super) fn record_quota_decision(
     request_id: Option<Uuid>,
     principal: &Principal,
     model: &str,
     decision: &crate::quota::QuotaDecision,
-    policy_json: Value,
 ) {
-    let record = QuotaDecisionRecord::new(
-        request_id,
-        principal,
-        model.to_string(),
-        decision,
-        policy_json,
-    );
-    if let Err(err) = state.storage.insert_quota_decision(&record).await {
-        tracing::warn!(error = %err, "failed to record quota decision");
-    }
     emit_runtime_telemetry(&RuntimeTelemetryEvent::new(
         TelemetrySignal::Span,
         TelemetryEventName::QuotaDecision,

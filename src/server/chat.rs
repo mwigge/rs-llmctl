@@ -1,19 +1,18 @@
 use super::{
-    audit_reject, audit_reject_response, authenticate_with_chat_scope, chat_route_audit_detail,
-    dispatch_chat_request, dispatch_native_chat, draining_response, elapsed_ms, error_response,
-    gen_ai_params_from_request, gen_ai_system_for_provider, json_upstream,
-    model_route_error_response, model_upstream_timeout, record_admission_busy_telemetry,
-    record_audit, record_quota_decision, record_request_lineage_joins, record_usage,
-    request_id_from_headers, resolve_model_route, runtime_lineage_from_headers_and_metadata,
-    stream_upstream, with_request_id, AdmissionError, ChatCompletionRequest, DispatchFailure,
-    NativeChatContext, ServerState, UpstreamRequestContext, UsageRecordInput,
+    apply_message_redactions, audit_reject, audit_reject_response, authenticate_with_chat_scope,
+    chat_route_audit_detail, dispatch_chat_request, dispatch_native_chat, draining_response,
+    elapsed_ms, error_response, gen_ai_params_from_request, gen_ai_system_for_provider,
+    json_upstream, model_route_error_response, model_upstream_timeout,
+    record_admission_busy_telemetry, record_audit, record_quota_decision,
+    record_request_lineage_joins, record_usage, request_id_from_headers, resolve_model_route,
+    runtime_lineage_from_headers_and_metadata, stream_upstream, with_request_id, AdmissionError,
+    ChatCompletionRequest, DispatchFailure, NativeChatContext, ServerState, UpstreamRequestContext,
+    UsageRecordInput,
 };
 use crate::config::Config;
 use crate::guardrails;
 use crate::native;
-use crate::quota::{
-    check_quota, matching_quota_policies, quota_admission_scope, quota_is_subject_scoped, Principal,
-};
+use crate::quota::{matching_quota_policies, quota_is_subject_scoped, Principal};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -87,6 +86,11 @@ pub(super) async fn chat_completions(
     };
     let model = route.requested_alias.clone();
 
+    // Body forwarded on the proxy path. Kept in sync with any guardrail
+    // redactions applied below so the worker/upstream never receives content
+    // the audit trail reports as redacted.
+    let mut outbound_body = body.clone();
+
     if state.cfg.guardrails.is_active() {
         let message_texts: Vec<(usize, String)> = request
             .messages
@@ -137,9 +141,33 @@ pub(super) async fn chat_completions(
             .await;
         }
 
-        for (index, redacted_text) in verdict.redactions {
-            if let Some(message) = request.messages.get_mut(index) {
-                message.content = Some(Value::String(redacted_text));
+        if !verdict.redactions.is_empty() {
+            // Apply the same redactions to the raw body that gets proxied
+            // upstream, not just the parsed request struct — otherwise the
+            // worker/upstream path would forward the original secret while the
+            // audit records `redacted: true`.
+            match apply_message_redactions(&body, &verdict.redactions) {
+                Ok(redacted) => outbound_body = redacted,
+                Err(err) => {
+                    return audit_reject(
+                        &state,
+                        request_id,
+                        principal,
+                        "chat.completions",
+                        model,
+                        "rejected",
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "request body must be valid JSON".to_string(),
+                        json!({ "reason": err }),
+                    )
+                    .await;
+                }
+            }
+            for (index, redacted_text) in &verdict.redactions {
+                if let Some(message) = request.messages.get_mut(*index) {
+                    message.content = Some(Value::String(redacted_text.clone()));
+                }
             }
         }
     }
@@ -152,13 +180,15 @@ pub(super) async fn chat_completions(
         "chat.completions",
     )
     .await;
-    let admission_scope = quota_admission_scope(&principal);
-    let quota = match state
-        .storage
-        .with_quota_admission(&admission_scope, || async {
-            check_quota(&state.storage, &state.cfg.quotas, &principal, &model).await
-        })
-        .await
+    let quota = match crate::quota::admit_request(
+        &state.storage,
+        &state.cfg.quotas,
+        &principal,
+        &model,
+        Some(request_id),
+        json!({ "configured_quotas": state.cfg.quotas.len() }),
+    )
+    .await
     {
         Ok(decision) => decision,
         Err(err) => {
@@ -177,15 +207,7 @@ pub(super) async fn chat_completions(
             .await;
         }
     };
-    record_quota_decision(
-        &state,
-        Some(request_id),
-        &principal,
-        &model,
-        &quota,
-        json!({ "configured_quotas": state.cfg.quotas.len() }),
-    )
-    .await;
+    record_quota_decision(Some(request_id), &principal, &model, &quota);
 
     if !quota.allowed {
         let reason = quota.reason.clone();
@@ -250,7 +272,13 @@ pub(super) async fn chat_completions(
         let gen_ai = gen_ai_params_from_request(&request);
         let upstream_timeout = model_upstream_timeout(&state, &model);
         return match dispatch_chat_request(
-            &state, &route, &body, request_id, &principal, &model, started,
+            &state,
+            &route,
+            &outbound_body,
+            request_id,
+            &principal,
+            &model,
+            started,
         )
         .await
         {

@@ -215,6 +215,47 @@ impl NativeCandleDecoder {
     }
 }
 
+/// Outcome of attempting to reset a native model's KV cache before a new
+/// generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvCacheReset {
+    /// The KV cache was genuinely cleared; the next generation starts from a
+    /// clean state.
+    Cleared,
+    /// The model cannot clear its KV cache (candle 0.10.2's
+    /// `quantized_qwen3_moe` / `quantized_llama` expose no reset and their
+    /// inner `ConcatKvCache` has no `reset()`), so any prior request's KV
+    /// state is retained across `generate()` calls.
+    Retained,
+}
+
+/// Fail-closed guard against KV-cache cross-request contamination.
+///
+/// A model whose cache is [`KvCacheReset::Retained`] is only safe to serve on
+/// a fresh session — its very first generation, when the cache is still empty.
+/// Serving a second generation off the same retained cache would reuse (and
+/// leak) the previous request's KV state, producing corrupted output and
+/// potentially exposing another request's context. This refuses that case, so
+/// such families must be served from a fresh session (model reload) per
+/// request instead of a shared, un-clearable cache.
+///
+/// `served` records whether this decoder has already produced a generation; it
+/// is flipped to `true` on first use.
+pub(crate) fn admit_fresh_kv_session(
+    reset: KvCacheReset,
+    served: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let already_served = served.swap(true, std::sync::atomic::Ordering::SeqCst);
+    if reset == KvCacheReset::Retained && already_served {
+        bail!(
+            "native model KV cache cannot be cleared for this family in candle 0.10.2; \
+             refusing to serve a second request off retained KV state to avoid \
+             cross-request contamination — a fresh session (model reload) is required per request"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_candle_family_format_supported(
     family: CandleModelFamily,
     format: NativeModelFormat,
@@ -245,6 +286,10 @@ pub(crate) struct RealCandleDecoder {
     /// GGUF tokenizer metadata configures `add_bos_token = true`. See
     /// [`gguf_bos_token_to_prepend`] and [`prepend_bos_if_configured`].
     bos_token_id: Option<u32>,
+    /// Whether this decoder has already produced a generation. Used by
+    /// [`admit_fresh_kv_session`] to fail closed for families whose KV cache
+    /// cannot be cleared between requests (see [`RealCandleModel::reset_kv_cache`]).
+    served: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
@@ -514,6 +559,7 @@ pub(crate) fn load_real_candle_decoder(
         model: Mutex::new(model),
         family,
         bos_token_id,
+        served: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -524,7 +570,11 @@ impl RealCandleDecoder {
             .model
             .lock()
             .map_err(|_| anyhow::anyhow!("native Candle model lock is poisoned"))?;
-        model.clear_kv_cache();
+        let reset = model.reset_kv_cache();
+        // Fail closed if this family cannot clear its KV cache and has already
+        // served a request: reusing retained KV state across requests corrupts
+        // output and can leak a prior request's context.
+        admit_fresh_kv_session(reset, &self.served)?;
 
         let prompt = format_native_chat_prompt(self.family, &request.messages);
         let encoding = self
@@ -684,31 +734,55 @@ pub fn generate_gemma4_sources(
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers"))]
 impl RealCandleModel {
-    fn clear_kv_cache(&mut self) {
+    /// Resets the KV cache before a new generation, reporting whether the
+    /// cache was genuinely cleared. Families that candle 0.10.2 cannot reset
+    /// return [`KvCacheReset::Retained`] so the caller can fail closed instead
+    /// of serving off stale cross-request state (see [`admit_fresh_kv_session`]).
+    fn reset_kv_cache(&mut self) -> KvCacheReset {
         match self {
-            Self::Qwen3(model) => model.clear_kv_cache(),
-            Self::Qwen3Gguf(model) => model.clear_kv_cache(),
+            Self::Qwen3(model) => {
+                model.clear_kv_cache();
+                KvCacheReset::Cleared
+            }
+            Self::Qwen3Gguf(model) => {
+                model.clear_kv_cache();
+                KvCacheReset::Cleared
+            }
             // candle 0.10.2's quantized_qwen3_moe does not expose a public
             // clear_kv_cache() method; the inner ConcatKvCache also lacks reset().
-            // Independent sessions must reload the model. Filed as follow-up.
+            // The cache cannot be cleared, so retained state must not be reused.
             Self::Qwen3MoeGguf(_) => {
                 tracing::warn!(
-                    "Qwen3 MoE clear_kv_cache is a no-op in candle 0.10.2 — \
-                     independent sessions must reload the model"
+                    "Qwen3 MoE KV cache cannot be cleared in candle 0.10.2 — \
+                     a fresh session (model reload) is required per request"
                 );
+                KvCacheReset::Retained
             }
-            Self::DeepSeek2(model) => model.clear_kv_cache(),
-            Self::Gemma3(model) => model.clear_kv_cache(),
-            Self::Gemma4Gguf(model) => model.clear_kv_cache(),
-            Self::Mistral(model) => model.clear_kv_cache(),
+            Self::DeepSeek2(model) => {
+                model.clear_kv_cache();
+                KvCacheReset::Cleared
+            }
+            Self::Gemma3(model) => {
+                model.clear_kv_cache();
+                KvCacheReset::Cleared
+            }
+            Self::Gemma4Gguf(model) => {
+                model.clear_kv_cache();
+                KvCacheReset::Cleared
+            }
+            Self::Mistral(model) => {
+                model.clear_kv_cache();
+                KvCacheReset::Cleared
+            }
             // candle 0.10.2's quantized_llama also does not expose a public
-            // clear_kv_cache(). Same pattern as Qwen3 MoE — independent
-            // sessions must reload the model.
+            // clear_kv_cache(). Same pattern as Qwen3 MoE — retained state must
+            // not be reused across requests.
             Self::MistralGguf(_) => {
                 tracing::warn!(
-                    "Mistral GGUF clear_kv_cache is a no-op in candle 0.10.2 — \
-                     independent sessions must reload the model"
+                    "Mistral GGUF KV cache cannot be cleared in candle 0.10.2 — \
+                     a fresh session (model reload) is required per request"
                 );
+                KvCacheReset::Retained
             }
         }
     }
@@ -938,5 +1012,40 @@ impl Qwen3CandleEngineLoader {
 
     pub fn load(&self, plan: &NativeEngineLoadPlan) -> Result<Box<dyn NativeEngine>> {
         NativeCandleEngineFactory::default().load(plan)
+    }
+}
+
+#[cfg(test)]
+mod kv_cache_guard_tests {
+    use super::{admit_fresh_kv_session, KvCacheReset};
+    use std::sync::atomic::AtomicBool;
+
+    // Regression for KV-cache cross-request contamination: a model family whose
+    // cache cannot be cleared (Qwen3 MoE / Mistral GGUF) must not serve a second
+    // request off the retained state of the first. `generate()` runs exactly
+    // this sequence — `reset_kv_cache()` then `admit_fresh_kv_session()` against
+    // the decoder's `served` flag — so driving the guard twice on one flag
+    // mirrors two `generate()` calls on the same engine.
+    #[test]
+    fn retained_cache_refuses_second_request_on_shared_session() {
+        let served = AtomicBool::new(false);
+        // First request runs on a fresh, empty cache — allowed.
+        assert!(admit_fresh_kv_session(KvCacheReset::Retained, &served).is_ok());
+        // Second request would reuse the prior request's retained KV state —
+        // must be refused (fail-closed) instead of serving contaminated output.
+        let err = admit_fresh_kv_session(KvCacheReset::Retained, &served)
+            .expect_err("second retained-cache generation must be refused");
+        assert!(
+            err.to_string().contains("cross-request contamination"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn clearable_cache_allows_repeated_requests() {
+        let served = AtomicBool::new(false);
+        // A family whose cache is genuinely cleared may serve many requests.
+        assert!(admit_fresh_kv_session(KvCacheReset::Cleared, &served).is_ok());
+        assert!(admit_fresh_kv_session(KvCacheReset::Cleared, &served).is_ok());
     }
 }

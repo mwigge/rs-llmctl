@@ -181,6 +181,37 @@ fn rewrites_chat_completion_model_for_upstream_route() {
     assert_eq!(value["messages"], json!([]));
 }
 
+// Regression for the proxy-path redaction drop: content flagged for redaction
+// must be redacted in the body actually forwarded upstream, not just in the
+// parsed request struct — otherwise the worker/upstream receives the original
+// secret while the audit reports `redacted: true`.
+#[test]
+fn proxy_body_carries_redacted_content_not_the_original_secret() {
+    let body =
+        br#"{"model":"light","messages":[{"role":"user","content":"my ssn is 123-45-6789"}],"temperature":0.7}"#;
+    let redactions = vec![(0usize, "my ssn is [REDACTED]".to_string())];
+
+    let redacted = apply_message_redactions(body, &redactions).unwrap();
+    let outbound = String::from_utf8(redacted.to_vec()).unwrap();
+
+    assert!(
+        !outbound.contains("123-45-6789"),
+        "outbound body still contains the original secret: {outbound}"
+    );
+    let value: Value = serde_json::from_slice(&redacted).unwrap();
+    assert_eq!(value["messages"][0]["content"], "my ssn is [REDACTED]");
+    // Unrelated request fields must be preserved verbatim.
+    assert_eq!(value["temperature"], json!(0.7));
+    assert_eq!(value["model"], "light");
+}
+
+#[test]
+fn apply_message_redactions_is_a_noop_without_redactions() {
+    let body = br#"{"model":"light","messages":[{"role":"user","content":"hello"}]}"#;
+    let out = apply_message_redactions(body, &[]).unwrap();
+    assert_eq!(out.as_ref(), body.as_slice());
+}
+
 fn config_with_models(mode: Mode, models: Vec<ModelConfig>) -> Config {
     Config {
         mode,
