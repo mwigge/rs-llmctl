@@ -251,7 +251,7 @@ pattern from the real codebase, applied to the right place.
 
 ## What This Setup Costs
 
-The honest numbers from the run:
+The measured numbers from the run:
 
 | Metric | Value | Notes |
 |---|---|---|

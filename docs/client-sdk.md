@@ -228,7 +228,7 @@ use Candle support where the architecture and artifact format are exposed.
 DeepSeek GGUF, Kimi, and MiniMax are tracked native product targets but fail
 closed until reviewed Candle-compatible decoders are wired and verified.
 Kimi is tracked as a product target but fails closed, which keeps the runtime
-contract honest for operators planning native capacity.
+contract accurate for operators planning native capacity.
 
 The native scheduler now has an implemented FIFO queue for chat requests with
 bounded per-engine concurrency and observable queue/admission wait metadata.

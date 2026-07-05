@@ -45,9 +45,9 @@ The default resource budget is 80%. It is conservative on purpose. A model
 server that leaves no room for the operating system or neighboring services is
 not really production-ready.
 
-## Hot Swap, Cold Swap, And Honest Routing
+## Hot Swap, Cold Swap, And Routing That Reflects Reality
 
-Model swap support is useful only if routing is honest. The selected model must
+Model swap support is useful only if routing reflects reality. The selected model must
 go to the selected worker. Weighted, fallback, hot-swap, and cold-swap modes all
 need visible plans and predictable behavior.
 
