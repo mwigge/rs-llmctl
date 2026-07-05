@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::audit::{AuditEvent, ObservationEvent, UsageEvent};
 use crate::config::Config;

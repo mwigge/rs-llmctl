@@ -30,8 +30,14 @@ mod placement;
 pub use placement::*;
 mod families;
 pub use families::*;
+mod families_validation;
+pub use families_validation::*;
 mod decoder;
 pub use decoder::*;
+mod candle_engine;
+pub use candle_engine::*;
+mod candle_loader;
+pub use candle_loader::*;
 
 const STARTER_ROLES: &[&str] = &["query", "recommendation", "thinking", "coding"];
 
@@ -300,6 +306,9 @@ fn normalize_role(role: &str) -> &str {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod candle_decoder_tests;
 
 #[cfg(all(feature = "native-candle", feature = "native-tokenizers", test))]
 mod gguf_tokenizer_tests;
